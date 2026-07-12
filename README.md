@@ -12,6 +12,32 @@ The mount side talks the AM5's serial protocol directly (LX200-derived, see
 and testable against a mock mount/camera before it ever touches real
 hardware — see [Development against a mock](#development-against-a-mock).
 
+## Screenshots
+
+Passes tab, a real upcoming ISS pass selected (live TLE, real sky track):
+
+![Passes tab](assets/screenshots/passes_tab.png)
+
+Transit tab during an armed pass — tracking controls, along/cross-track
+error plot, live camera preview:
+
+![Transit tab](assets/screenshots/transit_tab.png)
+
+Calibration tab — axis directions, mount response lag, clock sync, and
+camera-to-sky calibration in one place:
+
+![Calibration tab](assets/screenshots/calibration_tab.png)
+
+Exposure calculator — simulated framing at closest approach from the
+selected pass's real geometry:
+
+![Exposure calc tab](assets/screenshots/exposure_tab.png)
+
+Connection tab — site picked from a map or city search, sent to both the
+mount and the pass predictor:
+
+![Connection tab](assets/screenshots/connection_tab.png)
+
 ## Features
 
 - **Pass prediction** — fetches a live TLE (Celestrak) for the ISS or any
