@@ -1,0 +1,70 @@
+import numpy as np
+import pytest
+
+from camera.guiding import GuidingCalibration, calibrate_from_nudges, detect_brightest_blob
+
+
+def _synthetic_frame(cx: float, cy: float, width: int = 200, height: int = 150, peak: float = 200.0, sigma: float = 3.0) -> np.ndarray:
+    yy, xx = np.mgrid[0:height, 0:width]
+    background = np.random.default_rng(1).normal(20.0, 3.0, size=(height, width))
+    blob = peak * np.exp(-(((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma**2)))
+    return np.clip(background + blob, 0, 255).astype(np.uint8)
+
+
+def test_detect_brightest_blob_finds_known_centroid():
+    frame = _synthetic_frame(cx=120.0, cy=60.0)
+    blob = detect_brightest_blob(frame)
+    assert blob.found is True
+    assert blob.centroid_x == pytest.approx(120.0, abs=1.0)
+    assert blob.centroid_y == pytest.approx(60.0, abs=1.0)
+
+
+def test_detect_brightest_blob_not_found_on_pure_noise():
+    rng = np.random.default_rng(2)
+    frame = np.clip(rng.normal(20.0, 3.0, size=(150, 200)), 0, 255).astype(np.uint8)
+    blob = detect_brightest_blob(frame)
+    assert blob.found is False
+
+
+def test_detect_brightest_blob_rejects_single_hot_pixel():
+    frame = _synthetic_frame(cx=50.0, cy=50.0, peak=0.0)  # no real blob, just background
+    frame = frame.copy()
+    frame[10, 10] = 255  # one stray hot pixel
+    blob = detect_brightest_blob(frame, min_pixels=5)
+    assert blob.found is False
+
+
+def test_calibrate_from_nudges_pure_x_and_y_axes():
+    # RA nudge moves the blob purely in +x; DEC nudge purely in +y
+    calib = calibrate_from_nudges(
+        d_ra_arcsec=10.0, ra_nudge_dx_px=50.0, ra_nudge_dy_px=0.0,
+        d_dec_arcsec=10.0, dec_nudge_dx_px=0.0, dec_nudge_dy_px=30.0,
+    )
+    dx, dy = calib.sky_to_pixel(d_ra_arcsec=2.0, d_dec_arcsec=1.0)
+    assert dx == pytest.approx(10.0)  # 2 * (50/10)
+    assert dy == pytest.approx(3.0)  # 1 * (30/10)
+
+
+def test_calibrate_from_nudges_roundtrip_pixel_to_sky():
+    calib = calibrate_from_nudges(
+        d_ra_arcsec=10.0, ra_nudge_dx_px=40.0, ra_nudge_dy_px=15.0,
+        d_dec_arcsec=8.0, dec_nudge_dx_px=-12.0, dec_nudge_dy_px=25.0,
+    )
+    d_ra, d_dec = 3.5, -2.1
+    dx, dy = calib.sky_to_pixel(d_ra, d_dec)
+    d_ra_rt, d_dec_rt = calib.pixel_to_sky(dx, dy)
+    assert d_ra_rt == pytest.approx(d_ra)
+    assert d_dec_rt == pytest.approx(d_dec)
+
+
+def test_calibrate_from_nudges_raises_on_zero_sky_motion():
+    with pytest.raises(ValueError):
+        calibrate_from_nudges(d_ra_arcsec=0.0, ra_nudge_dx_px=10.0, ra_nudge_dy_px=0.0,
+                               d_dec_arcsec=10.0, dec_nudge_dx_px=0.0, dec_nudge_dy_px=10.0)
+
+
+def test_pixel_to_sky_raises_on_degenerate_matrix():
+    # both nudges produced the same pixel direction -- matrix isn't invertible
+    calib = GuidingCalibration(px_per_ra_arcsec_x=1.0, px_per_ra_arcsec_y=1.0, px_per_dec_arcsec_x=2.0, px_per_dec_arcsec_y=2.0)
+    with pytest.raises(ValueError):
+        calib.pixel_to_sky(5.0, 5.0)

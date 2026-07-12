@@ -1,0 +1,11 @@
+numpy>=2.0
+matplotlib>=3.8
+skyfield>=1.49
+astropy>=6.0
+pyserial>=3.5
+geopy>=2.4
+tkintermapview>=1.29
+zwoasi>=0.2
+
+# dev / tests
+pytest>=8.0

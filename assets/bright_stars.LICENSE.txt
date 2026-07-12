@@ -1,0 +1,14 @@
+Source: ESA Hipparcos star catalogue (HIP), fetched via skyfield's
+built-in loader (skyfield.data.hipparcos, hip_main.dat).
+Public domain / freely redistributable ESA mission data.
+
+bright_stars.npz is a derived, filtered extract: every Hipparcos star with
+a valid RA/DEC/magnitude and Vmag < 9.5 (near the faint end of Hipparcos'
+own completeness -- beyond this the catalogue itself gets sparse, so
+going deeper wouldn't add much real data), 98653 stars, stored as three
+float32 arrays (ra_deg, dec_deg, magnitude). Used by camera/mock_camera.py
+to render a realistic background star field around the simulated ISS,
+keyed to the mount's actual RA/DEC pointing -- the deeper cutoff (was
+Vmag < 6.5, the naked-eye limit, 8785 stars) means a longer simulated
+exposure now has real fainter stars to actually reveal, matching how a
+real camera integrates more signal over time.

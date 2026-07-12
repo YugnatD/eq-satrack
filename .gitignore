@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime output (tracking-pass CSV telemetry, one directory per run)
+logs/
+
+# Large downloaded catalog data -- see README "Star catalog" section for
+# how to regenerate assets/bright_stars.npz (the derived file actually
+# used at runtime, which IS committed) from this raw ~50MB source file.
+hip_main.dat
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

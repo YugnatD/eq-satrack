@@ -1,0 +1,11 @@
+Source: NASA (JSC2021-E-064211), "The station pictured from the SpaceX Crew Dragon"
+Taken by the Expedition 66 crew during the Crew Dragon flyaround, 8 Nov 2021.
+Original: https://commons.wikimedia.org/wiki/File:The_station_pictured_from_the_SpaceX_Crew_Dragon_5.jpg
+License: Public domain (U.S. work, 17 U.S.C. § 105 -- created solely by NASA).
+
+iss_reference.jpg is the original NASA image with the black letterboxing
+borders cropped off (bounding box of non-near-black content), used as-is
+otherwise -- no other edits. Cropped size: 7347x4035px. The ISS's solar
+array tip-to-tip span (~109m, its widest real-world dimension) fills the
+full cropped width, which is the calibration am5/optics.py's
+render_iss_photo() relies on (meters_per_pixel = 109 / 7347).
