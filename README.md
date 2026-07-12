@@ -1,5 +1,7 @@
 # eq-satrack
 
+[![CI](https://github.com/YugnatD/eq-satrack/actions/workflows/ci.yml/badge.svg)](https://github.com/YugnatD/eq-satrack/actions/workflows/ci.yml)
+
 Real-time satellite tracking for a ZWO AM3/AM5/AM7 equatorial mount and a
 ZWO ASI-series planetary camera. Built to catch the ISS (and, via NORAD ID,
 any other satellite with a published TLE) crossing the sky in the ~30-90
