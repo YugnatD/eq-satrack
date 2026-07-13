@@ -24,6 +24,13 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt pytest-rerunfailures
 
+      # Fails fast, before spending time on the test jobs below. Only the
+      # default rule set (unused imports/variables, undefined names,
+      # syntax errors) -- see pyproject.toml for why line-length isn't
+      # enforced.
+      - name: Lint (ruff)
+        run: ruff check .
+
       # Split into a few separate `pytest` processes rather than one big
       # run: the GUI/mount tests spin up a lot of real threads (per-mock
       # sim loops, MountWorker/CameraWorker/SafetyGuard threads, response
@@ -39,7 +46,7 @@ jobs:
           pytest tests/test_angles.py tests/test_constellations.py
           tests/test_ephemeris.py tests/test_optics.py tests/test_protocol.py
           tests/test_clock_sync.py tests/test_guiding.py
-          tests/test_ser_writer.py tests/test_fits_writer.py
+          tests/test_ser_writer.py tests/test_ser_reader.py tests/test_fits_writer.py
           tests/test_live_input.py tests/test_mock_camera.py
           tests/test_camera_worker.py -v
 
@@ -51,4 +58,4 @@ jobs:
           xvfb-run -a pytest --reruns 1 --reruns-delay 2
           tests/test_gui_worker.py tests/test_gui_panels.py
           tests/test_gui_app.py tests/test_jog_window.py
-          tests/test_gui_dialogs.py -v
+          tests/test_gui_dialogs.py tests/test_gui_ser_player.py -v

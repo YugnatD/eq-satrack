@@ -32,7 +32,6 @@ from am5.angles import circular_diff_hours, equatorial_series_to_altaz, equatori
 from am5.clock_sync import ClockSyncStatus, check_clock_sync
 from am5.constellations import constellations_altaz
 from am5.ephemeris import PassWindow, Trajectory, compute_trajectory, find_passes, load_satellite_tle, meridian_crossings
-from am5.named_stars import NAMED_STARS, NAMED_STARS_BY_NAME
 from am5.optics import (
     DEFAULT_FULL_WELL_ELECTRONS,
     OpticalTrain,

@@ -10,3 +10,4 @@ zwoasi>=0.2
 # dev / tests
 pytest>=8.0
 pytest-rerunfailures>=14.0
+ruff>=0.15

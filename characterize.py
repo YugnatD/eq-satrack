@@ -357,7 +357,7 @@ def test_e_max_speed(mount: Mount, safety: SafetyGuard, out_dir: Path) -> None:
         mount.set_rate(1440.0)
         mount.move("e")
         safety.notify_command(movement_active=True)
-        settle_samples = poll_radec(mount, duration_s=2.5, hz=30.0, csv_writer=csv_writer, tag="settling")
+        poll_radec(mount, duration_s=2.5, hz=30.0, csv_writer=csv_writer, tag="settling")
         samples = poll_radec(mount, duration_s=1.5, hz=30.0, csv_writer=csv_writer, tag="max_speed")
     finally:
         mount.stop("e")

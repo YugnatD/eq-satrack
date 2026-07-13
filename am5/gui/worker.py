@@ -14,7 +14,6 @@ from any thread — originally built for signal handlers).
 from __future__ import annotations
 
 import csv as csv_module
-import math
 import queue
 import threading
 import time
