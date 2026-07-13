@@ -2,6 +2,7 @@ numpy>=2.0
 matplotlib>=3.8
 skyfield>=1.49
 astropy>=6.0
+astroquery>=0.4.7  # spectro/catalog.py -- SIMBAD lookups
 pyserial>=3.5
 geopy>=2.4
 tkintermapview>=1.29
