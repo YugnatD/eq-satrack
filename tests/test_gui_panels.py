@@ -490,6 +490,24 @@ def test_two_recordings_of_the_same_pass_share_one_folder(panel):
     assert paths[0] != paths[1]
 
 
+def test_pass_info_and_skymap_are_only_written_once_per_pass(panel):
+    # Regression test: _write_skymap does a synchronous matplotlib
+    # savefig() on the Tk main thread (no worker involved) -- redoing it
+    # on every single recording/snapshot click during the same pass was a
+    # real, avoidable UI stutter risk right when starting a recording
+    # during a live, time-critical pass.
+    _select_a_pass(panel)
+    panel._camera_worker.start_recording = lambda path, **kw: None
+    panel._camera_worker.save_fits_snapshot = lambda path, **kw: None
+
+    with patch.object(panel, "_write_pass_info") as write_info, patch.object(panel, "_write_skymap") as write_map:
+        panel._on_toggle_recording()  # first call -- must write both
+        panel._on_snapshot_click()  # same pass, second call -- must NOT rewrite
+        panel._on_toggle_recording()  # third call -- still must not rewrite
+        assert write_info.call_count == 1
+        assert write_map.call_count == 1
+
+
 def test_snapshot_with_a_pass_selected_lands_in_the_pass_folder(panel, tmp_path):
     window = _select_a_pass(panel)
     captured = {}
@@ -540,6 +558,49 @@ def test_rehearsal_redraw_aligns_rise_marker_with_a_goto_to_the_same_radec(panel
     # small tolerance: _redraw_sky_map and _update_mount_marker each call
     # datetime.now() independently, a fraction of a millisecond apart
     assert telescope_r == pytest.approx(rise_marker_r, abs=1e-3)
+
+
+def test_jog_goto_click_disables_start_and_simulate_until_it_completes(panel):
+    # Regression test for a real incident: Start/Simulate weren't gated on
+    # jog_goto's own in-progress state, so clicking one while a jog_goto
+    # was still converging queued a start_tracking command that only
+    # began once jog_goto finally finished (MountWorker runs one command
+    # at a time) -- but Simulate's "start now" time-shift is computed at
+    # CLICK time, so tracking began with a large, silent along-track
+    # error baked in (~1.36 deg measured on real hardware -- well under
+    # the runaway guard's 10 deg threshold, but easily enough to put a
+    # narrow-FOV target outside the frame for the whole pass).
+    _select_a_pass(panel)
+    panel.set_mount_connected(True)
+    panel._on_arm_click()
+    assert str(panel._start_button["state"]) == "normal"
+    assert str(panel._simulate_button["state"]) == "normal"
+
+    panel._mount_worker.jog_goto = lambda *a, **kw: None
+    panel._on_jog_goto_click()
+    assert str(panel._jog_goto_button["state"]) == "disabled"
+    assert str(panel._arm_button["state"]) == "disabled"
+    assert str(panel._start_button["state"]) == "disabled"
+    assert str(panel._simulate_button["state"]) == "disabled"
+
+    panel.handle_mount_event(WorkerEvent("jog_goto_result", {"arrived": True}))
+    assert str(panel._jog_goto_button["state"]) == "normal"
+    assert str(panel._arm_button["state"]) == "normal"
+    assert str(panel._simulate_button["state"]) == "normal"
+    # Was armed before the jog_goto -- must come back enabled, not left
+    # disabled just because jog_goto touched it.
+    assert str(panel._start_button["state"]) == "normal"
+
+
+def test_jog_goto_click_does_not_re_enable_start_if_never_armed(panel):
+    _select_a_pass(panel)
+    panel.set_mount_connected(True)
+    assert str(panel._start_button["state"]) == "disabled"  # never armed
+
+    panel._mount_worker.jog_goto = lambda *a, **kw: None
+    panel._on_jog_goto_click()
+    panel.handle_mount_event(WorkerEvent("jog_goto_result", {"arrived": True}))
+    assert str(panel._start_button["state"]) == "disabled"
 
 
 @pytest.fixture

@@ -98,6 +98,50 @@ def test_recording_produces_a_valid_ser_file(worker, tmp_path):
     assert len(remaining) == expected
 
 
+def test_stop_recording_does_not_hang_when_the_write_buffer_is_full(worker, tmp_path, monkeypatch):
+    # Regression test: _stop_write_thread used to signal the write thread
+    # via a sentinel pushed through a blocking queue.put(), which could
+    # stall the entire camera worker (frame reads AND all further
+    # commands) if the write-behind queue was full at exactly the moment
+    # recording was stopped -- precisely the slow-disk scenario the
+    # buffer exists to protect against, and exactly when an operator is
+    # most likely to be clicking Stop. Force a tiny queue and a slow
+    # writer to reliably fill it, then confirm stop still completes
+    # promptly (signaled via a threading.Event now, not a queued sentinel).
+    import camera.worker as worker_module
+    from camera.ser_writer import SerWriter
+
+    monkeypatch.setattr(worker_module, "WRITE_BUFFER_MIN_FRAMES", 2)
+    monkeypatch.setattr(worker_module, "WRITE_BUFFER_TARGET_BYTES", 1)  # forces the 2-frame floor above
+
+    real_add_frame = SerWriter.add_frame
+
+    def slow_add_frame(self, frame, timestamp=None):
+        time.sleep(0.3)
+        real_add_frame(self, frame, timestamp=timestamp)
+
+    monkeypatch.setattr(SerWriter, "add_frame", slow_add_frame)
+
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    worker.set_exposure_us(1000)  # fast frame production, easily fills a 2-frame queue
+
+    path = tmp_path / "slow.ser"
+    worker.start_recording(path)
+    _wait_for(worker, "recording_started")
+    time.sleep(0.5)  # let frames pile up past the tiny queue capacity
+
+    t0 = time.monotonic()
+    worker.stop_recording()
+    stopped = _wait_for(worker, "recording_stopped", timeout=5.0)
+    elapsed = time.monotonic() - t0
+
+    assert stopped.payload["frame_count"] > 0
+    # Bounded by draining a handful of slow add_frame calls, not stuck
+    # waiting indefinitely for queue space the way a blocking put() would.
+    assert elapsed < 3.0
+
+
 def test_recording_stopped_reports_buffer_dropped_frames(worker, tmp_path):
     # The write-behind buffer (see CameraWorker._write_loop) decouples
     # disk I/O from the capture loop -- this field must always be present

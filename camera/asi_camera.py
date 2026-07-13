@@ -129,17 +129,23 @@ class AsiCamera:
         recording and FITS snapshots -- both just read whatever this
         produces) between RAW8 and RAW16. Same stop/restart bracket as
         set_roi -- a format change while capture_video_frame() is in
-        flight is the class of bug fixed there."""
+        flight is the class of bug fixed there. The try/finally matters
+        here too, for the same reason it does in set_roi: if
+        set_image_type() itself raised, the stream would otherwise be
+        left stopped forever with no restart, and the worker's read loop
+        would then time out on every subsequent read."""
         assert self._camera is not None
         if bit_depth not in _BIT_DEPTH_TO_IMG_TYPE:
             raise ValueError(f"unsupported bit depth {bit_depth!r} (must be 8 or 16)")
         was_streaming = self._streaming
         if was_streaming:
             self._camera.stop_video_capture()
-        self._camera.set_image_type(_BIT_DEPTH_TO_IMG_TYPE[bit_depth])
-        self._bit_depth = bit_depth
-        if was_streaming:
-            self._camera.start_video_capture()
+        try:
+            self._camera.set_image_type(_BIT_DEPTH_TO_IMG_TYPE[bit_depth])
+            self._bit_depth = bit_depth
+        finally:
+            if was_streaming:
+                self._camera.start_video_capture()
 
     def set_exposure_us(self, microseconds: int) -> None:
         assert self._camera is not None

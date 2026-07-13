@@ -541,7 +541,7 @@ def run_tracking_loop(
                 print(f"[warn] bad :GMEQ# reply during error-log poll: {exc}", file=sys.stderr)
 
         if tick % status_every == 0:
-            _check_limits(mount, axis_signs)
+            _check_limits(mount)
 
         csv_writer.writerow({
             "t_mono": time.monotonic(), "t_utc": utc_now_iso(),
@@ -558,7 +558,16 @@ def run_tracking_loop(
             time.sleep(sleep_s)
 
 
-def _check_limits(mount: Mount, axis_signs: AxisSigns) -> None:
+def _check_limits(mount: Mount) -> None:
+    # Used to also auto-correct axis_signs.dec here from a live :Gm#
+    # pier-side read -- tried and reverted, see AxisSigns' docstring in
+    # this file for the full account. A real incident: this fired during
+    # live ISS tracking and the resulting DEC sign flip caused a genuine
+    # ~35 deg divergence (correctly caught by the runaway guard below,
+    # but the flip is what caused it, not a real calibration or mount
+    # problem). :Gm#'s relationship to true mechanical pier state during
+    # continuous tracking (as opposed to a discrete :MS# GOTO, confirmed
+    # correct) is unresolved.
     try:
         raw = mount.get_tracking_status()
     except ProtocolError as exc:
@@ -568,16 +577,6 @@ def _check_limits(mount: Mount, axis_signs: AxisSigns) -> None:
     if code in LIMIT_ERROR_CODES:
         print(f"[SAFETY] :GAT# reports error {code} (5=below horizon, 6=below altitude limit, "
               f"8=meridian crossed) — tracking may have silently stopped on the mount side", file=sys.stderr)
-
-    # Deliberately NOT calling axis_signs.update_pier_side() here anymore
-    # -- tried and reverted, see AxisSigns' docstring for the full
-    # account. A real incident: this fired during live ISS tracking and
-    # the resulting DEC sign flip caused a genuine ~35 deg divergence
-    # (correctly caught by the runaway guard below, but the flip is what
-    # caused it, not a real calibration or mount problem). :Gm#'s
-    # relationship to true mechanical pier state during continuous
-    # tracking (as opposed to a discrete :MS# GOTO, confirmed correct)
-    # is unresolved.
 
 
 TRACKING_CSV_FIELDS = [

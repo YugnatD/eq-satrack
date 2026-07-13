@@ -833,6 +833,7 @@ class TransitPanel(ttk.Frame):
         self._site: GeographicPosition | None = None
         self._crossings: list = []
         self._satellite_name = ""
+        self._capture_dir_prepared: Path | None = None  # see _prepare_capture_dir
         # Shared with JogWindow (same instance, owned by App) when passed --
         # set_axis_signs() below mutates it in place so both stay in sync
         # regardless of which one triggered a (re)calibration.
@@ -1225,7 +1226,22 @@ class TransitPanel(ttk.Frame):
             return
         self._redraw_sky_map(rehearsal_now=datetime.now(timezone.utc))
         start_ra, start_dec, _, _ = self._trajectory.interpolate(float(self._trajectory.t_unix[0]))
+        # Disable everything that could start tracking while this runs,
+        # not just this button -- confirmed on real hardware: Start/
+        # Simulate aren't gated on jog_goto's own in-progress state, so
+        # clicking one while a jog_goto is still converging queues a
+        # start_tracking command that only actually begins once jog_goto
+        # finally finishes (MountWorker processes one command at a time).
+        # But the trajectory's "start now" time-shift is computed at CLICK
+        # time, not at whenever tracking actually begins -- so tracking
+        # started with a large, silent along-track error baked in (~1.36
+        # deg measured -- nowhere near enough to trip the runaway guard,
+        # but easily enough to put a narrow-FOV target outside the frame
+        # for the whole pass).
         self._jog_goto_button.configure(state="disabled")
+        self._arm_button.configure(state="disabled")
+        self._start_button.configure(state="disabled")
+        self._simulate_button.configure(state="disabled")
         self._mount_worker.jog_goto((start_ra % 360.0) / 15.0, start_dec, self._axis_signs)
 
     def _poll_delta_t_display(self) -> None:
@@ -1280,6 +1296,10 @@ class TransitPanel(ttk.Frame):
         elif event.kind == "jog_goto_result":
             if self._mount_connected and self._trajectory is not None:
                 self._jog_goto_button.configure(state="normal")
+                self._arm_button.configure(state="normal")
+                self._simulate_button.configure(state="normal")
+                if self._armed:
+                    self._start_button.configure(state="normal")
         elif event.kind in ("tracking_stopped", "tracking_error"):
             self._stop_button.configure(state="disabled")
             if self._mount_connected and self._trajectory is not None:
@@ -1499,8 +1519,16 @@ class TransitPanel(ttk.Frame):
             return self._out_dir
         capture_dir = self._out_dir / self._pass_folder_name()
         capture_dir.mkdir(parents=True, exist_ok=True)
-        self._write_pass_info(capture_dir)
-        self._write_skymap(capture_dir)
+        # pass_info.txt/skymap.png only need writing once per pass, not on
+        # every recording/snapshot click -- _write_skymap in particular is
+        # a synchronous matplotlib savefig() on the Tk main thread (no
+        # worker involved, unlike camera/mount I/O), so redoing it on
+        # every click risked a real, avoidable UI stutter right as the
+        # operator starts recording during a live, time-critical pass.
+        if self._capture_dir_prepared != capture_dir:
+            self._write_pass_info(capture_dir)
+            self._write_skymap(capture_dir)
+            self._capture_dir_prepared = capture_dir
         return capture_dir
 
     def _pass_folder_name(self) -> str:
@@ -1528,7 +1556,15 @@ class TransitPanel(ttk.Frame):
                 f"Site: {self._site.latitude.degrees:.5f}, {self._site.longitude.degrees:.5f}, "
                 f"{self._site.elevation.m:.0f} m"
             )
-        (capture_dir / "pass_info.txt").write_text("\n".join(lines) + "\n")
+        try:
+            (capture_dir / "pass_info.txt").write_text("\n".join(lines) + "\n")
+        except OSError as exc:
+            # Same "don't block the actual recording over a sidecar file"
+            # reasoning as _write_skymap's own try/except right below --
+            # this used to be uncaught, which would abort start_recording()
+            # entirely (an unhandled exception in a Tk button callback)
+            # over what should be a non-fatal write failure.
+            self._emit_log_line(f"[warn] could not save pass_info.txt: {exc}")
 
     def _write_skymap(self, capture_dir: Path) -> None:
         # Reuses this panel's own live sky-map figure (already rendered by

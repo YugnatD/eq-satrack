@@ -29,7 +29,6 @@ STATS_INTERVAL_S = 1.0
 WRITE_BUFFER_TARGET_BYTES = 200 * 1024 * 1024  # ~200MB RAM budget for the SER write-behind buffer
 WRITE_BUFFER_MIN_FRAMES = 8
 WRITE_BUFFER_MAX_FRAMES = 1000  # cap even for a tiny ROI -- no reason to buffer minutes of frames
-_STOP_WRITING = object()  # sentinel telling the write thread to drain and close
 
 
 @dataclass
@@ -76,8 +75,9 @@ class CameraWorker:
         # protect). Owned exclusively by the write thread once recording
         # starts; the main loop only ever puts onto the queue, never
         # touches self._ser_writer directly while a write thread is alive.
-        self._write_queue: "queue.Queue[object] | None" = None
+        self._write_queue: "queue.Queue[tuple] | None" = None
         self._write_thread: threading.Thread | None = None
+        self._write_stop_event = threading.Event()
         self._buffer_dropped_frames = 0
         self._shutdown = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -243,19 +243,28 @@ class CameraWorker:
 
         self._handle_disconnect({})
 
-    def _write_loop(self, writer: SerWriter, write_queue: "queue.Queue[object]") -> None:
+    def _write_loop(self, writer: SerWriter, write_queue: "queue.Queue[tuple]", stop_event: threading.Event) -> None:
         """Runs on its own thread once recording starts -- pulls
         (frame, timestamp) pairs off write_queue and does the actual disk
         write, so a slow disk stalls this thread, not the frame-read loop
-        in _run. Exits (after draining whatever's left in the queue, in
-        order) once it dequeues the _STOP_WRITING sentinel, then closes
-        the writer itself -- see _stop_write_thread, the only place that
-        sentinel is sent."""
+        in _run. Polls with a short timeout rather than blocking on
+        write_queue.get() forever, so stop_event (set by
+        _stop_write_thread) is noticed promptly; once set, drains
+        whatever's left in the queue (in order, non-blocking -- the main
+        loop is the only producer and it's synchronously inside
+        _stop_write_thread while this runs, so nothing new can appear)
+        before closing the writer."""
+        while not stop_event.is_set():
+            try:
+                frame, timestamp = write_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            writer.add_frame(frame, timestamp=timestamp)
         while True:
-            item = write_queue.get()
-            if item is _STOP_WRITING:
+            try:
+                frame, timestamp = write_queue.get_nowait()
+            except queue.Empty:
                 break
-            frame, timestamp = item
             writer.add_frame(frame, timestamp=timestamp)
         writer.close()
 
@@ -264,12 +273,20 @@ class CameraWorker:
         SerWriter, then waits for it -- must complete before anything
         else touches self._ser_writer/self._write_queue (start_recording
         with a fresh writer, disconnect, or a final frame_count read),
-        since the write thread is their exclusive owner while alive."""
+        since the write thread is their exclusive owner while alive.
+        Signaling via an Event rather than a sentinel value pushed onto
+        write_queue -- a bounded queue.put() here would BLOCK this
+        (single, shared) worker thread, potentially for as long as the
+        disk stays slow, if the queue happened to be full at exactly the
+        moment recording is stopped/restarted/disconnected -- precisely
+        the slow-disk scenario this buffer exists to protect against, and
+        exactly when a real operator is most likely to be clicking Stop."""
         if self._write_thread is None:
             return
-        self._write_queue.put(_STOP_WRITING)
+        self._write_stop_event.set()
         self._write_thread.join(timeout=10.0)
         self._write_thread = None
+        self._write_stop_event.clear()
 
     # -- command handlers -----------------------------------------------------
 
@@ -355,7 +372,9 @@ class CameraWorker:
         queue_len = max(WRITE_BUFFER_MIN_FRAMES, min(WRITE_BUFFER_MAX_FRAMES, WRITE_BUFFER_TARGET_BYTES // max(bytes_per_frame, 1)))
         self._write_queue = queue.Queue(maxsize=queue_len)
         self._buffer_dropped_frames = 0
-        self._write_thread = threading.Thread(target=self._write_loop, args=(self._ser_writer, self._write_queue), daemon=True)
+        self._write_thread = threading.Thread(
+            target=self._write_loop, args=(self._ser_writer, self._write_queue, self._write_stop_event), daemon=True,
+        )
         self._write_thread.start()
         self._recording_path = path
         self._emit("recording_started", path=str(path))
