@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from .angles import circular_diff_hours
+from .angles import angular_separation_deg, circular_diff_hours
 from .constants import SIDEREAL_DEG_PER_S
 from .ephemeris import Trajectory
 from .logging_utils import utc_now_iso
@@ -48,12 +48,28 @@ class AxisSigns:
     180 deg relative to the sky, while RA's axis (the polar axis) is
     unaffected. Measured directly: calibrating on pier side E gave
     dec=+1; immediately re-calibrating on side W (same session, same
-    mount, only the pier side changed via a GOTO) gave dec=-1, with ra
-    unchanged at +1. A pass that crosses the meridian can trigger this
-    flip mid-session (the firmware picks the side, see Mount.get_pier_side's
-    docstring) -- without update_pier_side() below, the tracking loop would
-    keep commanding DEC in the direction that was correct before the flip,
-    i.e. backwards, with no warning."""
+    mount, only the pier side changed via a discrete :MS# GOTO) gave
+    dec=-1, with ra unchanged at +1.
+
+    update_pier_side() below is right for THAT case (a real :MS# GOTO
+    landing on a different side). It is deliberately NOT wired into any
+    automatic call site anymore (run_tracking_loop's periodic check,
+    jog_goto's per-tick check, and the GUI's idle-poll handler all had it
+    and all had it removed) after two real incidents: it fired during a
+    plain jog_goto and during live ISS tracking -- neither involves a
+    real :MS# GOTO, and in both cases the resulting DEC sign flip was
+    WRONG, itself causing a real divergence (~35 deg during the tracking
+    incident, correctly caught by the runaway guard, but the auto-flip is
+    what caused it). Whether Mount.get_pier_side()'s :Gm# reading tracks
+    true mechanical pier state during continuous motion (jog or tracking)
+    the way it demonstrably does for a discrete GOTO is UNRESOLVED --
+    real-hardware testing so far neither confirms nor rules out that
+    :Gm# is "just" a computed hour-angle value that can read differently
+    without the DEC motor's actual sense having changed at all. Until
+    that's settled, the safe default is: recalibrate by hand
+    (CalibrationPanel's "Calibrate axis directions") after any deliberate
+    re-point, rather than trust an automatic correction that has twice
+    caused the exact problem it was meant to prevent."""
 
     ra: float  # +1 if 'e' increases RA, -1 if 'e' decreases RA
     dec: float  # +1 if 'n' increases DEC, -1 if 'n' decreases DEC
@@ -62,10 +78,16 @@ class AxisSigns:
     calibrated_pier_side: str | None = None
 
     def update_pier_side(self, current_side: str | None) -> bool:
-        """Call with a live :Gm# reading (Mount.get_pier_side()) whenever
-        one is cheaply available (idle poll, tracking-loop ticks,
-        jog_goto ticks). Flips dec in place and returns True if
-        `current_side` differs from the side dec was last known-correct
+        """Correct for a real, discrete :MS# GOTO landing on a different
+        pier side than dec was calibrated for (confirmed correct for that
+        case). NOT currently called automatically anywhere -- see this
+        class's own docstring for why (two real incidents from wiring it
+        into continuous-motion loops). Available for a deliberate,
+        explicit re-check after a real GOTO if a caller wants one.
+
+        Call with a live :Gm# reading (Mount.get_pier_side()). Flips dec
+        in place and returns True if `current_side` differs from the side
+        dec was last known-correct
         for. 'N' (home/zero position -- no direction, see get_pier_side's
         docstring) and None/unknown are ignored: they don't tell us which
         side we'd actually be tracking from, so recording them would risk
@@ -454,8 +476,16 @@ def run_tracking_loop(
                 actual_dec_deg = actual.dec_deg
                 d_ra = circular_diff_hours(actual.ra_hours, ra_deg / 15.0) * 15.0
                 d_dec = actual_dec_deg - dec_deg
-                # on-sky separation (RA scaled by cos(dec)), not raw d_ra
-                total_error_deg = math.hypot(d_ra * math.cos(math.radians(dec_deg)), d_dec)
+                # Real great-circle separation, not a tangent-plane
+                # hypot(d_ra*cos(dec), d_dec) approximation -- that
+                # approximation is only valid for small separations and
+                # actively misleads beyond a few degrees (confirmed on
+                # real hardware for jog_goto's own divergence guard, see
+                # angular_separation_deg's docstring; this runaway check
+                # is the same class of bug and matters most exactly when
+                # it's needed -- a real, large divergence, e.g. starting
+                # a tracking pass late without first slewing onto target).
+                total_error_deg = angular_separation_deg(actual.ra_hours * 15.0, actual_dec_deg, ra_deg, dec_deg)
                 if cfg.runaway_stop_deg > 0 and total_error_deg > cfg.runaway_stop_deg:
                     mount.stop()
                     raise TrackingRunaway(
@@ -539,13 +569,15 @@ def _check_limits(mount: Mount, axis_signs: AxisSigns) -> None:
         print(f"[SAFETY] :GAT# reports error {code} (5=below horizon, 6=below altitude limit, "
               f"8=meridian crossed) — tracking may have silently stopped on the mount side", file=sys.stderr)
 
-    # A meridian crossing can trigger an automatic pier flip mid-pass (see
-    # AxisSigns' docstring) -- without this, dec's commanded direction
-    # would stay correct for the side the pass STARTED on and silently
-    # drive the wrong way once the mount has physically flipped.
-    if axis_signs.update_pier_side(_get_pier_side_safe(mount)):
-        print(f"[SAFETY] pier side flip detected (now {axis_signs.calibrated_pier_side}) "
-              f"-- DEC axis sign auto-corrected to {axis_signs.dec:+.0f}", file=sys.stderr)
+    # Deliberately NOT calling axis_signs.update_pier_side() here anymore
+    # -- tried and reverted, see AxisSigns' docstring for the full
+    # account. A real incident: this fired during live ISS tracking and
+    # the resulting DEC sign flip caused a genuine ~35 deg divergence
+    # (correctly caught by the runaway guard below, but the flip is what
+    # caused it, not a real calibration or mount problem). :Gm#'s
+    # relationship to true mechanical pier state during continuous
+    # tracking (as opposed to a discrete :MS# GOTO, confirmed correct)
+    # is unresolved.
 
 
 TRACKING_CSV_FIELDS = [

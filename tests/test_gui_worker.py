@@ -6,6 +6,9 @@ import pytest
 
 from am5.clock_sync import ClockSyncStatus
 from am5.gui.worker import MountWorker, WorkerEvent
+from am5.mock_mount import MockConfig, MockMount
+from am5.mount import Mount
+from am5.safety import SafetyGuard
 from am5.tracker import AxisSigns
 
 
@@ -178,6 +181,33 @@ def test_jog_goto_aborts_on_divergence_from_wrong_axis_sign(worker):
     worker.jog_goto(ra_hours=3.0, dec_deg=60.0, axis_signs=AxisSigns(ra=1.0, dec=-1.0))
     result = _wait_for(worker, "jog_goto_result", timeout=20.0)
     assert result.payload["arrived"] is False
+
+
+def test_jog_goto_converges_over_a_large_initial_separation(worker):
+    # Real incident this session: a GOTO to Deneb (~57 deg away, from
+    # near the pole) tripped the divergence guard despite correct
+    # calibration and no pier flip. Root cause was two compounding bugs,
+    # both fixed together (see angular_separation_deg's docstring and the
+    # rate-synchronization comment in _handle_jog_goto): the guard's
+    # error metric was a small-angle approximation invalid at this
+    # distance, and independently rate-capping each axis let DEC (the
+    # smaller raw error, near the pole) race ahead of RA, visiting a
+    # temporarily-worse great-circle path.
+    mock = MockMount(MockConfig(rv_mode="per_axis", tracking_adds=True, start_ra_deg=196.5, start_dec_deg=70.59))
+    mount = Mount(mock)
+    safety = SafetyGuard(mount, watchdog_timeout=5.0, install_signal_handlers=False)
+    worker._mount = mount
+    worker._safety = safety
+    axis_signs = AxisSigns(ra=1.0, dec=1.0, calibrated_pier_side=mount.get_pier_side())
+
+    try:
+        worker._handle_jog_goto({"ra_hours": 310.357973 / 15.0, "dec_deg": 45.280334, "axis_signs": axis_signs})
+    finally:
+        mount.stop()
+        safety.shutdown()
+
+    result = _wait_for(worker, "jog_goto_result", timeout=1.0)
+    assert result.payload["arrived"] is True
 
 
 def test_jog_goto_converges_without_using_ms(worker):

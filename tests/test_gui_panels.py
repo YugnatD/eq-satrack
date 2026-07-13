@@ -26,6 +26,7 @@ from am5.gui.panels import (
     TransitPanel,
     _local_and_utc,
     _meridian_detail_line,
+    _sanitize_filename,
 )
 from am5.gui.worker import MountWorker, WorkerEvent
 from am5.optics import OpticalTrain
@@ -428,6 +429,86 @@ def test_transit_panel_set_trajectory_draws_sky_map_and_tracks_mount(panel):
     assert panel._sky_map._mount_marker is marker
     second_xy = (float(marker.get_data()[0][0]), float(marker.get_data()[1][0]))
     assert second_xy != first_xy
+
+
+def test_sanitize_filename_collapses_unsafe_characters():
+    assert _sanitize_filename("ISS (ZARYA)") == "ISS_ZARYA"
+    assert _sanitize_filename("  leading/trailing  ") == "leading_trailing"
+    assert _sanitize_filename("a//b") == "a_b"
+
+
+def _select_a_pass(panel):
+    ts = load.timescale()
+    satellite = EarthSatellite(_TLE_LINE1, _TLE_LINE2, "ISS (ZARYA)", ts)
+    site = wgs84.latlon(46.18, 6.14)
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    window = find_next_pass(satellite, site, t0=t0, horizon_deg=10.0, lookahead_hours=48.0)
+    trajectory = compute_trajectory(satellite, site, window.t_rise, window.t_set, step_s=0.2)
+    crossings = meridian_crossings(trajectory)
+    panel.set_trajectory(trajectory, window, crossings, site, satellite.name)
+    return window
+
+
+def test_recording_with_no_pass_selected_uses_the_flat_out_dir(panel, tmp_path):
+    assert panel._window is None
+    captured = {}
+    panel._camera_worker.start_recording = lambda path, **kw: captured.update(path=path)
+    panel._on_toggle_recording()
+    assert captured["path"].parent == tmp_path.resolve()
+
+
+def test_recording_with_a_pass_selected_creates_a_dedicated_folder(panel, tmp_path):
+    window = _select_a_pass(panel)
+    captured = {}
+    panel._camera_worker.start_recording = lambda path, **kw: captured.update(path=path)
+    panel._on_toggle_recording()
+
+    expected_name = f"ISS_ZARYA_{window.t_rise.strftime('%Y%m%dT%H%M%S')}"
+    pass_dir = tmp_path / expected_name
+    assert captured["path"].parent == pass_dir.resolve()
+    assert (pass_dir / "pass_info.txt").exists()
+    assert "ISS (ZARYA)" in (pass_dir / "pass_info.txt").read_text()
+    assert (pass_dir / "skymap.png").exists()
+    assert (pass_dir / "skymap.png").stat().st_size > 0
+    # per-recording FireCapture-style settings sidecar, matching the .ser name
+    sidecar = captured["path"].with_suffix(".txt")
+    assert sidecar.exists()
+    text = sidecar.read_text()
+    assert "Gain:" in text and "Exposure:" in text and "ROI:" in text
+
+
+def test_two_recordings_of_the_same_pass_share_one_folder(panel):
+    _select_a_pass(panel)
+    paths = []
+    panel._camera_worker.start_recording = lambda path, **kw: paths.append(path)
+    panel._on_toggle_recording()
+    time.sleep(1.1)  # capture_<timestamp>.ser has 1s resolution -- ensure a distinct filename
+    panel._on_toggle_recording()
+
+    assert len(paths) == 2
+    assert paths[0].parent == paths[1].parent
+    assert paths[0] != paths[1]
+
+
+def test_snapshot_with_a_pass_selected_lands_in_the_pass_folder(panel, tmp_path):
+    window = _select_a_pass(panel)
+    captured = {}
+    panel._camera_worker.save_fits_snapshot = lambda path, **kw: captured.update(path=path)
+    panel._on_snapshot_click()
+
+    expected_name = f"ISS_ZARYA_{window.t_rise.strftime('%Y%m%dT%H%M%S')}"
+    assert captured["path"].parent == (tmp_path / expected_name).resolve()
+
+
+def test_capture_settings_sidecar_reflects_current_gain_and_exposure(panel, tmp_path):
+    panel._camera_vars.gain.set(250.0)
+    import math
+    panel._camera_vars.exposure_log.set(math.log10(5000))
+    sidecar = tmp_path / "settings.txt"
+    panel._write_capture_settings(sidecar)
+    text = sidecar.read_text()
+    assert "Gain: 250" in text
+    assert "5000" in text
 
 
 def test_rehearsal_redraw_aligns_rise_marker_with_a_goto_to_the_same_radec(panel):

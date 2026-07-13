@@ -86,6 +86,18 @@ class SerWriter:
     def frame_count(self) -> int:
         return self._frame_count
 
+    @property
+    def bytes_written(self) -> int:
+        """Size of the file on disk right now (header + frame data written
+        so far) -- not including the timestamp trailer, which close()
+        appends only at the very end, so this slightly undercounts the
+        eventual final file size by frame_count*8 bytes while still
+        recording. Computed from frame_count rather than querying the
+        file handle's position, so it's safe to read from a thread other
+        than the one actually writing (see camera/worker.py's write
+        thread -- this is read from the main worker thread for stats)."""
+        return HEADER_SIZE + self._frame_count * self.width * self.height * self._pixel_dtype.itemsize
+
     def _write_header(self, observer: str, instrument: str, telescope: str) -> None:
         now_ticks = to_dotnet_ticks(datetime.now(timezone.utc))
         self._fh.write(FILE_ID)

@@ -3,13 +3,12 @@ import io
 import math
 import threading
 import time
-from datetime import timezone, datetime as dt
 from unittest.mock import patch
 
 import numpy as np
 import pytest
 
-from am5.angles import gmst_deg
+from am5.angles import angular_separation_deg
 from am5.constants import SIDEREAL_DEG_PER_S
 from am5.ephemeris import Trajectory
 from am5.mock_mount import MockConfig, MockMount
@@ -364,6 +363,39 @@ def test_tracking_loop_auto_stops_on_runaway():
         mount.close()
 
 
+def test_tracking_loop_runaway_check_uses_great_circle_separation():
+    # Regression for the same class of bug fixed in jog_goto's divergence
+    # guard (see angular_separation_deg's docstring): the runaway check
+    # used to compute error via a tangent-plane hypot(d_ra*cos(dec), d_dec)
+    # approximation, only valid for small separations -- meaningless for
+    # a real, large divergence, which is exactly when this guard matters
+    # most (e.g. starting a tracking pass late without first slewing onto
+    # target -- a real incident this session). total_error_deg isn't
+    # itself exposed via on_tick, so confirm the wiring directly: the
+    # loop must call angular_separation_deg (not reimplement the old
+    # formula inline) to compute it.
+    start_ra, start_dec = 196.5, 80.0
+    trajectory = _make_constant_rate_trajectory(50.0, 2.0, start_ra, start_dec)
+    mock = MockMount(MockConfig(rv_mode="per_axis", tracking_adds=True, start_ra_deg=start_ra, start_dec_deg=start_dec))
+    mount = Mount(mock)
+    safety = SafetyGuard(mount, watchdog_timeout=5.0)
+    fh = io.StringIO()
+    writer = csv.DictWriter(fh, fieldnames=TRACKING_CSV_FIELDS)
+    writer.writeheader()
+    try:
+        with patch("am5.tracker.angular_separation_deg", wraps=angular_separation_deg) as spy:
+            run_tracking_loop(
+                mount, safety, trajectory, AxisSigns(ra=1.0, dec=1.0), LiveOffsets(), writer,
+                duration_s=1.0, config=TrackingConfig(loop_hz=20.0, error_log_hz=20.0),
+            )
+    finally:
+        mount.stop()
+        safety.shutdown()
+        mount.close()
+
+    assert spy.call_count > 0
+
+
 def test_tracking_loop_runaway_guard_disabled_with_zero():
     # runaway_stop_deg=0 disables the guard -- same 15deg offset must NOT raise.
     start_ra = 10.0
@@ -500,42 +532,3 @@ def test_tracking_loop_feedback_reduces_along_track_error_vs_feedforward_only():
     assert final_error_on < final_error_off - 5.0
 
 
-def test_tracking_loop_auto_corrects_dec_sign_on_a_pier_flip_mid_run():
-    # MockMount's :Gm# derives pier side from RA vs. local sidereal time
-    # (same formula real firmware uses -- see mock_mount.py), so a
-    # trajectory that sweeps RA across the meridian naturally flips it
-    # mid-run, exactly like a real meridian-crossing pass. Regression for
-    # the bug this session found on real AM3 hardware: dec's sign is only
-    # valid for the pier side it was calibrated on (confirmed: E gave
-    # dec=+1, W gave dec=-1, same mount, same session) -- without
-    # update_pier_side() wired into _check_limits, a flip mid-tracking
-    # would silently leave dec commanding the wrong direction.
-    longitude_deg = 6.14  # MockConfig's default
-    lst_deg_now = (gmst_deg(dt.now(timezone.utc)) + longitude_deg) % 360.0
-    start_ra = lst_deg_now - 0.5  # ha_deg > 0 -> "W" side of the formula
-    start_dec = 45.0
-    rate_x = 150.0  # fast sweep -- crosses the ~1 deg gap to "E" within a couple seconds
-    duration_s = 4.0
-    trajectory = _make_constant_rate_trajectory(rate_x, duration_s + 2.0, start_ra, start_dec)
-
-    mock = MockMount(MockConfig(rv_mode="per_axis", tracking_adds=True, start_ra_deg=start_ra, start_dec_deg=start_dec))
-    mount = Mount(mock)
-    axis_signs = AxisSigns(ra=1.0, dec=1.0, calibrated_pier_side=mount.get_pier_side())
-    assert axis_signs.calibrated_pier_side == "W"  # sanity-check the starting side matches the formula above
-
-    safety = SafetyGuard(mount, watchdog_timeout=5.0)
-    fh = io.StringIO()
-    writer = csv.DictWriter(fh, fieldnames=TRACKING_CSV_FIELDS)
-    writer.writeheader()
-    try:
-        run_tracking_loop(
-            mount, safety, trajectory, axis_signs, LiveOffsets(), writer,
-            duration_s=duration_s, config=TrackingConfig(loop_hz=20.0, status_check_hz=5.0, runaway_stop_deg=10.0),
-        )
-    finally:
-        mount.stop()
-        safety.shutdown()
-        mount.close()
-
-    assert axis_signs.calibrated_pier_side == "E"
-    assert axis_signs.dec == -1.0  # flipped in place from the +1.0 it started as

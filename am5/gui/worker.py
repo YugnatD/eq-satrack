@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from am5.angles import circular_diff_hours
+from am5.angles import angular_separation_deg, circular_diff_hours
 from am5.clock_sync import check_clock_sync
 from am5.ephemeris import Trajectory
 from am5.mock_mount import MockConfig, MockMount
@@ -424,6 +424,17 @@ class MountWorker:
             except ProtocolError:
                 continue
             self._emit("position", ra_hours=radec.ra_hours, dec_deg=radec.dec_deg)
+            # NOT auto-correcting axis_signs.dec from a live :Gm# read
+            # here anymore -- this was tried and reverted (see AxisSigns'
+            # docstring in tracker.py for the full account). Real
+            # incident: it fired mid-flight during a real GOTO where no
+            # actual mechanical flip should have happened, and the
+            # resulting sign flip was the wrong direction, itself causing
+            # a real divergence during live ISS tracking. Unresolved
+            # whether :Gm# tracks true mechanical pier state during
+            # continuous motion (jog/tracking) as opposed to a discrete
+            # :MS# GOTO (confirmed correct for that case) -- until that's
+            # settled, recalibrate by hand after any deliberate re-point.
             d_ra_deg = circular_diff_hours(radec.ra_hours, target_ra_hours) * 15.0  # actual - target
             d_dec_deg = radec.dec_deg - target_dec_deg
             if abs(d_ra_deg) * 3600.0 < JOG_GOTO_ARRIVED_ARCSEC and abs(d_dec_deg) * 3600.0 < JOG_GOTO_ARRIVED_ARCSEC:
@@ -432,14 +443,38 @@ class MountWorker:
             # Divergence guard: a wrong axis-sign calibration makes this
             # jog AWAY from the target -- error keeps growing instead of
             # shrinking. Bail out instead of jogging the wrong way for the
-            # full 180s timeout.
-            error_deg = math.hypot(d_ra_deg * math.cos(math.radians(radec.dec_deg)), d_dec_deg)
+            # full 180s timeout. Real great-circle separation, not a
+            # tangent-plane hypot(d_ra*cos(dec), d_dec) approximation --
+            # that approximation actively lies for a large initial
+            # separation (confirmed on real hardware: reported a GROWING
+            # error while both raw RA and DEC differences were shrinking,
+            # because cos(dec) grows as dec moves away from the pole --
+            # see angular_separation_deg's docstring).
+            error_deg = angular_separation_deg(radec.ra_hours * 15.0, radec.dec_deg, target_ra_hours * 15.0, target_dec_deg)
             best_error_deg = min(best_error_deg, error_deg)
             if error_deg > best_error_deg + JOG_GOTO_DIVERGENCE_DEG:
                 diverged = True
                 break
-            ra_rate = max(0.5, min(JOG_GOTO_MAX_RATE_X, abs(d_ra_deg) * JOG_GOTO_KP_RATE_X_PER_DEG))
-            dec_rate = max(0.5, min(JOG_GOTO_MAX_RATE_X, abs(d_dec_deg) * JOG_GOTO_KP_RATE_X_PER_DEG))
+            # Synchronized, not independently clamped: for a large initial
+            # separation (outside jog_goto's typical short-final-approach
+            # case, but the "GOTO a named star" button doesn't restrict
+            # it), independently capping each axis at JOG_GOTO_MAX_RATE_X
+            # lets whichever axis has the smaller raw error (e.g. DEC,
+            # near the pole) race ahead and finish while the other (e.g.
+            # RA, needing 100+ deg) is still saturated -- confirmed on
+            # real hardware that this visits a temporarily-WORSE
+            # great-circle path than a direct one, tripping the
+            # divergence guard above with correct calibration and no
+            # pier flip involved. Scaling both by the same factor (so
+            # whichever wants the higher rate lands exactly on the cap)
+            # keeps their ratio -- and so their estimated time-to-target
+            # -- matched, producing a much more direct path.
+            ra_rate_uncapped = abs(d_ra_deg) * JOG_GOTO_KP_RATE_X_PER_DEG
+            dec_rate_uncapped = abs(d_dec_deg) * JOG_GOTO_KP_RATE_X_PER_DEG
+            dominant_rate = max(ra_rate_uncapped, dec_rate_uncapped, 1e-9)
+            scale = min(1.0, JOG_GOTO_MAX_RATE_X / dominant_rate)
+            ra_rate = max(0.5, ra_rate_uncapped * scale)
+            dec_rate = max(0.5, dec_rate_uncapped * scale)
             ra_dir = _pick_direction(-d_ra_deg, axis_signs.ra, "e", "w")
             dec_dir = _pick_direction(-d_dec_deg, axis_signs.dec, "n", "s")
             self._mount.set_rate(ra_rate)

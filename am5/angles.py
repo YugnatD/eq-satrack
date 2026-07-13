@@ -25,6 +25,27 @@ def circular_diff_hours(a: float, b: float) -> float:
     return ((a - b + 12.0) % 24.0) - 12.0
 
 
+def angular_separation_deg(ra1_deg: float, dec1_deg: float, ra2_deg: float, dec2_deg: float) -> float:
+    """Great-circle angular separation between two RA/DEC points, in
+    degrees, via the haversine formula -- correct for any separation.
+
+    Not the same as hypot(d_ra*cos(dec), d_dec): that's a tangent-plane
+    (small-angle) approximation that only holds for separations of a few
+    degrees. Confirmed on real hardware to actively mislead beyond that --
+    a jog_goto's divergence guard using the tangent-plane formula for a
+    ~100+ deg initial separation (a GOTO to an arbitrary star, not the
+    short final-approach jog_goto is meant for) reported an INCREASING
+    error even while both raw RA and DEC differences were individually
+    shrinking, because cos(dec) grows as dec moves away from the pole --
+    tripping a false "diverged" abort with correct calibration and no
+    pier flip involved."""
+    ra1, dec1, ra2, dec2 = map(math.radians, (ra1_deg, dec1_deg, ra2_deg, dec2_deg))
+    sin_half_dec = math.sin((dec2 - dec1) / 2.0)
+    sin_half_ra = math.sin((ra2 - ra1) / 2.0)
+    a = sin_half_dec**2 + math.cos(dec1) * math.cos(dec2) * sin_half_ra**2
+    return math.degrees(2.0 * math.asin(min(1.0, math.sqrt(a))))
+
+
 def gmst_deg(when: datetime) -> float:
     """Greenwich Mean Sidereal Time, in degrees, good to a few arcsec --
     plenty for anything in this project that isn't sent over the wire to

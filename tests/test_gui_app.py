@@ -74,29 +74,6 @@ def test_calibration_done_event_carries_pier_side_into_axis_signs(app):
         app._pump_events()  # reset -- app fixture is module-scoped, shared with other tests
 
 
-def test_position_event_auto_corrects_dec_sign_on_pier_flip(app):
-    # Regression: dec's sign is only valid for the pier side it was
-    # calibrated on (a German equatorial mount's DEC axis physically
-    # rotates 180 deg on a flip -- confirmed on real AM3 hardware). Idle
-    # polling already carries pier_side on every "position" event; App
-    # must use it to keep axis_signs.dec correct even between passes, not
-    # just during an active tracking run (see run_tracking_loop's own
-    # _check_limits for the mid-pass counterpart).
-    app._pump_events()  # drain startup events first
-    try:
-        app.worker.events.put(WorkerEvent("calibration_done", {"ra_sign": 1.0, "dec_sign": 1.0, "pier_side": "E"}))
-        app._pump_events()
-        assert app.axis_signs.dec == 1.0
-
-        app.worker.events.put(WorkerEvent("position", {"ra_hours": 5.0, "dec_deg": 45.0, "pier_side": "W"}))
-        app._pump_events()
-        assert app.axis_signs.dec == -1.0
-        assert app.axis_signs.calibrated_pier_side == "W"
-    finally:
-        app.worker.events.put(WorkerEvent("calibration_done", {"ra_sign": -1.0, "dec_sign": 1.0, "pier_side": None}))
-        app._pump_events()  # reset -- app fixture is module-scoped, shared with other tests
-
-
 def test_connection_change_reaches_jog_window_and_calibration_panel(app):
     # Regression coverage for the parked-button-gating fix: both need to
     # know "connected" to grey their motion buttons out correctly, not

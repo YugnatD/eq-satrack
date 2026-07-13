@@ -167,6 +167,39 @@ def test_gain_increases_noise_and_signal():
     high.close()
 
 
+def test_set_bit_depth_16_switches_read_frame_to_uint16_full_range():
+    # Confirmed to behave the same way on a real ASI290MC: set_bit_depth(16)
+    # then read_frame() returns uint16 frames, SER recorded at PixelDepth=16.
+    cam = MockAsiCamera(seed=13)
+    cam.open()
+    cam.set_roi(0, 0, 100, 100)
+    cam.set_sky_context(45.0, 10.0, 45.0, 10.0)  # bright ISS dead center
+    cam.set_bit_depth(16)
+    cam.start_streaming()
+    frame = cam.read_frame()
+    assert frame.dtype == np.uint16
+    assert frame.max() > 255
+    assert frame.max() <= 4095
+    assert cam.bit_depth == 16
+    cam.close()
+
+
+def test_bit_depth_defaults_to_8_and_read_frame_matches():
+    cam = MockAsiCamera(seed=14)
+    assert cam.bit_depth == 8
+    cam.open()
+    cam.set_roi(0, 0, 100, 100)
+    cam.start_streaming()
+    frame = cam.read_frame()
+    assert frame.dtype == np.uint8
+
+
+def test_set_bit_depth_rejects_unsupported_values():
+    cam = MockAsiCamera(seed=15)
+    with pytest.raises(ValueError):
+        cam.set_bit_depth(12)
+
+
 def test_longer_exposure_reveals_a_fainter_star():
     # Previously exposure_us only paced frame timing and had zero effect on
     # brightness -- gain was the only way to reveal fainter stars. A longer

@@ -19,6 +19,7 @@ from am5.gui.panels import (
     ExposurePanel,
     CalibrationPanel,
     PassesPanel,
+    SerPlayerPanel,
     SiteVars,
     TransitPanel,
 )
@@ -48,7 +49,9 @@ class App:
         # theme automatically just by being created after this call.
         self.palette = apply_dark_theme(root)
         self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill="both", expand=True, padx=6, pady=(6, 0))
+        # Not packed yet -- deliberately deferred until after the jog
+        # button and log bar below are packed (see the comment there for
+        # why the order matters).
 
         # Shared with CalibrationPanel so a camera-detected correction lands in
         # the same offsets the active tracking loop is reading.
@@ -101,6 +104,10 @@ class App:
             on_calibration_ready=lambda: self.transit_panel.set_auto_guide_available(True),
             mount_lag_var=self.mount_lag_var, axis_signs=self.axis_signs,
         )
+        # Pure local file I/O, no worker/device -- doesn't need any of the
+        # constructor args above, and (unlike every other panel) needs no
+        # wiring into _pump_events below.
+        self.ser_player_panel = SerPlayerPanel(self.notebook)
 
         # Plain geometric-shape glyphs (Unicode "Geometric Shapes" block) --
         # unlike pictographic emoji, these render reliably in Tk without
@@ -110,6 +117,7 @@ class App:
         self.notebook.add(self.calibration_panel, text="⊙ Calibration")
         self.notebook.add(self.exposure_panel, text="▣ Exposure calc")
         self.notebook.add(self.transit_panel, text="◎ Transit")
+        self.notebook.add(self.ser_player_panel, text="▶ SER player")
 
         self._panels = [self.connection_panel]
 
@@ -119,12 +127,26 @@ class App:
         self.jog_window = JogWindow(root, self.worker, self.camera_worker, self.axis_signs, camera_vars=self.camera_vars)
         self.jog_window.withdraw()
 
+        # Packed BEFORE the notebook below, even though it's created after
+        # -- pack() gives space priority in packing order, not creation
+        # order, and the notebook's "expand=True" makes it greedy for any
+        # spare height. With the notebook packed first (the original
+        # order), a tab whose content grows tall enough (e.g. Passes'
+        # multi-line pass detail once a pass is selected) could starve
+        # these two of space, in one real case squeezing the log bar down
+        # to a sliver -- packing them first reserves their height up
+        # front, so the notebook is always the one that gives way.
         jog_button_frame = ttk.Frame(root)
         jog_button_frame.pack(fill="x", side="bottom")
         ttk.Button(jog_button_frame, text="◆ Jog control...", command=self._show_jog_window).pack(anchor="w", padx=10, pady=4)
 
         log_frame = ttk.LabelFrame(root, text="Log", padding=(6, 2))
         log_frame.pack(fill="x", side="bottom", padx=6, pady=(4, 6))
+        # Belt and suspenders on top of the packing-order fix above: pins
+        # this frame to a fixed height so it can never be compressed
+        # below a usable size regardless of what else is going on.
+        log_frame.pack_propagate(False)
+        log_frame.configure(height=90)
         # Raw tk.Text -- ttk has no themed text widget, so it needs the
         # palette's colors by hand (see am5/gui/theme.py's docstring).
         self._log_text = tk.Text(
@@ -132,7 +154,9 @@ class App:
             background=self.palette.bg_widget, foreground=self.palette.fg_dim,
             insertbackground=self.palette.fg, font=("monospace", 9), padx=6, pady=4,
         )
-        self._log_text.pack(fill="x")
+        self._log_text.pack(fill="both", expand=True)
+
+        self.notebook.pack(fill="both", expand=True, padx=6, pady=(6, 0))
 
         # (ra_deg, dec_deg) the camera preview treats as "centered", for the
         # idle/manual-jog training view -- see _push_camera_offset.
@@ -156,8 +180,8 @@ class App:
         self.calibration_panel.set_connected(connected)
         self.transit_panel.set_mount_connected(connected)
 
-    def _on_pass_selected(self, trajectory, window, crossings, site) -> None:
-        self.transit_panel.set_trajectory(trajectory, window, crossings, site)
+    def _on_pass_selected(self, trajectory, window, crossings, site, satellite_name) -> None:
+        self.transit_panel.set_trajectory(trajectory, window, crossings, site, satellite_name)
         self.exposure_panel.set_pass(trajectory, window)
         self.calibration_panel.set_trajectory(trajectory)
 
@@ -204,16 +228,11 @@ class App:
                 self._camera_target_radec = None
             elif event.kind == "position":
                 self._on_mount_position(event.payload["ra_hours"] * 15.0, event.payload["dec_deg"])
-                # Idle-time counterpart to run_tracking_loop's own check --
-                # catches a pier flip (manual GOTO, meridian crossing while
-                # unattended) between passes, not just mid-tracking. See
-                # AxisSigns.update_pier_side's docstring for why this
-                # matters (dec's sign is only valid for one pier side).
-                if self.axis_signs.update_pier_side(event.payload.get("pier_side")):
-                    self._log(
-                        f"[warn] pier side flip detected (now {self.axis_signs.calibrated_pier_side}) "
-                        f"-- DEC axis sign auto-corrected to {self.axis_signs.dec:+.0f}"
-                    )
+                # NOT auto-correcting axis_signs.dec from idle-poll :Gm#
+                # reads anymore -- tried and reverted along with the
+                # jog_goto/run_tracking_loop call sites, see AxisSigns'
+                # docstring in tracker.py for why. Recalibrate by hand
+                # after any deliberate re-point instead.
             elif event.kind == "tracking_tick" and event.payload["actual_ra_deg"] != "":
                 self.camera_worker.set_sky_context(
                     event.payload["actual_ra_deg"], event.payload["actual_dec_deg"],

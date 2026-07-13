@@ -86,6 +86,34 @@ def test_round_trip_header_and_pixels(tmp_path):
     assert timestamps[-1] == to_dotnet_ticks(base_time + timedelta(milliseconds=20))
 
 
+def test_bytes_written_tracks_header_plus_frames_written_so_far(tmp_path):
+    path = tmp_path / "size.ser"
+    writer = SerWriter(path, width=10, height=10, colour_id=0)  # 8-bit -- 100 bytes/frame
+    assert writer.bytes_written == HEADER_SIZE
+    writer.add_frame(np.zeros((10, 10), dtype=np.uint8))
+    assert writer.bytes_written == HEADER_SIZE + 100
+    writer.add_frame(np.zeros((10, 10), dtype=np.uint8))
+    assert writer.bytes_written == HEADER_SIZE + 200
+    writer.close()
+
+
+def test_bytes_written_matches_actual_file_size_before_the_trailer(tmp_path):
+    # close() appends the timestamp trailer (8 bytes/frame) after the last
+    # add_frame -- bytes_written deliberately excludes it (see its
+    # docstring), so it should match the real on-disk size while still
+    # recording, and undercount by frame_count*8 right after close().
+    import os
+
+    path = tmp_path / "size2.ser"
+    writer = SerWriter(path, width=4, height=4, colour_id=0)
+    writer.add_frame(np.zeros((4, 4), dtype=np.uint8))
+    writer.add_frame(np.zeros((4, 4), dtype=np.uint8))
+    writer._fh.flush()
+    assert writer.bytes_written == os.path.getsize(path)
+    writer.close()
+    assert os.path.getsize(path) == writer.bytes_written + 2 * 8
+
+
 def test_add_frame_rejects_wrong_shape(tmp_path):
     writer = SerWriter(tmp_path / "bad.ser", width=10, height=10, colour_id=0)
     with pytest.raises(ValueError):

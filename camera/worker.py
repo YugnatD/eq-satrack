@@ -26,6 +26,10 @@ from camera.ser_writer import SerWriter
 
 PREVIEW_INTERVAL_S = 0.1  # ~10Hz -- plenty for a framing/focus preview, well under the 100-200fps capture rate
 STATS_INTERVAL_S = 1.0
+WRITE_BUFFER_TARGET_BYTES = 200 * 1024 * 1024  # ~200MB RAM budget for the SER write-behind buffer
+WRITE_BUFFER_MIN_FRAMES = 8
+WRITE_BUFFER_MAX_FRAMES = 1000  # cap even for a tiny ROI -- no reason to buffer minutes of frames
+_STOP_WRITING = object()  # sentinel telling the write thread to drain and close
 
 
 @dataclass
@@ -63,6 +67,18 @@ class CameraWorker:
         self._streaming = threading.Event()
         self._ser_writer: SerWriter | None = None
         self._recording_path: Path | None = None
+        # Write-behind buffer: the disk write (add_frame -- disk I/O, can
+        # stall on a slow/contended disk) happens on its own thread, fed by
+        # this bounded queue, instead of inline in the frame-read loop
+        # below -- so a slow disk delays the SER file, not the next
+        # capture_video_frame() call (which would otherwise show up as
+        # sensor-side dropped_frames, exactly the metric this is meant to
+        # protect). Owned exclusively by the write thread once recording
+        # starts; the main loop only ever puts onto the queue, never
+        # touches self._ser_writer directly while a write thread is alive.
+        self._write_queue: "queue.Queue[object] | None" = None
+        self._write_thread: threading.Thread | None = None
+        self._buffer_dropped_frames = 0
         self._shutdown = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -71,11 +87,11 @@ class CameraWorker:
 
     def connect(
         self, kind: str, camera_id: int = 0, sdk_path: str | None = None, mock_seed: int | None = None,
-        plate_scale_arcsec_per_px: float | None = None,
+        plate_scale_arcsec_per_px: float | None = None, bit_depth: int = 8,
     ) -> None:
         self._commands.put(("connect", {
             "kind": kind, "camera_id": camera_id, "sdk_path": sdk_path, "mock_seed": mock_seed,
-            "plate_scale_arcsec_per_px": plate_scale_arcsec_per_px,
+            "plate_scale_arcsec_per_px": plate_scale_arcsec_per_px, "bit_depth": bit_depth,
         }))
 
     def disconnect(self) -> None:
@@ -83,6 +99,15 @@ class CameraWorker:
 
     def set_roi(self, x: int, y: int, width: int, height: int) -> None:
         self._commands.put(("set_roi", {"x": x, "y": y, "width": width, "height": height}))
+
+    def set_bit_depth(self, bit_depth: int) -> None:
+        """Switches the live video path between 8-bit (fast, default) and
+        16-bit (the sensor's real 12-bit ADC range, roughly 2x the
+        bandwidth per frame) -- governs both the preview/SER recording
+        AND save_fits_snapshot (which just reads whatever the stream is
+        currently producing), a single setting for both, not a per-action
+        choice."""
+        self._commands.put(("set_bit_depth", {"bit_depth": bit_depth}))
 
     def set_exposure_us(self, microseconds: int) -> None:
         self._commands.put(("set_exposure_us", {"microseconds": microseconds}))
@@ -127,6 +152,7 @@ class CameraWorker:
             "connect": self._handle_connect,
             "disconnect": self._handle_disconnect,
             "set_roi": self._handle_set_roi,
+            "set_bit_depth": self._handle_set_bit_depth,
             "set_exposure_us": self._handle_set_exposure_us,
             "set_gain": self._handle_set_gain,
             "set_sky_context": self._handle_set_sky_context,
@@ -137,6 +163,7 @@ class CameraWorker:
         last_preview = 0.0
         last_stats = time.monotonic()  # not 0.0: that reads as falsy below and the first fps report would be a fake 0.0
         frame_count_since_stats = 0
+        read_errors_since_stats = 0
         while not self._shutdown.is_set():
             try:
                 name, payload = self._commands.get_nowait()
@@ -157,37 +184,105 @@ class CameraWorker:
                 frame = self._camera.read_frame(timeout_ms=2000)
             except Exception as exc:  # noqa: BLE001 - a dropped/timed-out frame shouldn't kill the loop
                 self._emit("log", message=f"[warn] read_frame failed: {exc}")
+                read_errors_since_stats += 1
                 continue
 
             frame_count_since_stats += 1
             now_utc = datetime.now(timezone.utc)
-            if self._ser_writer is not None:
-                self._ser_writer.add_frame(frame, timestamp=now_utc)
+            write_queue = self._write_queue
+            # Sampled *before* this frame's own put below -- the backlog
+            # left over from all prior frames, i.e. the real steady-state
+            # occupancy. Sampling right after the put instead would almost
+            # always read >=1 (the frame just enqueued, still sitting
+            # there because the write thread hasn't been scheduled by the
+            # GIL yet to pop it) even when the writer is comfortably
+            # keeping up -- a measurement artifact, not a real backlog.
+            buffer_used = write_queue.qsize() if write_queue is not None else 0
+            buffer_capacity = write_queue.maxsize if write_queue is not None else 0
+            if write_queue is not None:
+                try:
+                    write_queue.put_nowait((frame, now_utc))
+                except queue.Full:
+                    # The write thread genuinely can't keep up with
+                    # sustained disk I/O -- drop the new frame rather than
+                    # block here (blocking would just turn this into the
+                    # same capture-side stall the buffer exists to avoid).
+                    self._buffer_dropped_frames += 1
 
             now = time.monotonic()
             if now - last_preview >= PREVIEW_INTERVAL_S:
                 last_preview = now
-                self._emit("preview_frame", pgm=frame_to_pgm(frame), width=frame.shape[1], height=frame.shape[0])
+                # Buffer occupancy piggybacks on the preview tick (~10Hz)
+                # rather than the 1Hz stats tick -- a fill/empty bar at 1Hz
+                # would look like it's jumping, not actually filling.
+                self._emit(
+                    "preview_frame", pgm=frame_to_pgm(frame), width=frame.shape[1], height=frame.shape[0],
+                    buffer_used=buffer_used, buffer_capacity=buffer_capacity,
+                )
             if now - last_stats >= STATS_INTERVAL_S:
                 fps = frame_count_since_stats / (now - last_stats)
+                # dropped_frames: the camera's own ring-buffer counter --
+                # frames the sensor produced but we didn't fetch in time
+                # (bandwidth/exposure mismatch). read_errors: our own
+                # read_frame() calls that raised/timed out outright -- a
+                # different symptom (comm dropout, USB hiccup), not
+                # reported by the SDK's counter (confirmed on real
+                # hardware: induced read timeouts left get_dropped_frames()
+                # at 0, while starving the read loop for 2s produced 326).
+                # buffer_dropped_frames: the write-behind queue was full --
+                # a slow disk, not a comm/sensor problem.
                 self._emit("stats", fps=fps, recording=self._ser_writer is not None,
-                            frames_recorded=self._ser_writer.frame_count if self._ser_writer else 0)
+                            frames_recorded=self._ser_writer.frame_count if self._ser_writer else 0,
+                            file_bytes=self._ser_writer.bytes_written if self._ser_writer else 0,
+                            dropped_frames=self._camera.get_dropped_frames(),
+                            read_errors=read_errors_since_stats,
+                            buffer_dropped_frames=self._buffer_dropped_frames)
                 last_stats = now
                 frame_count_since_stats = 0
+                read_errors_since_stats = 0
 
         self._handle_disconnect({})
+
+    def _write_loop(self, writer: SerWriter, write_queue: "queue.Queue[object]") -> None:
+        """Runs on its own thread once recording starts -- pulls
+        (frame, timestamp) pairs off write_queue and does the actual disk
+        write, so a slow disk stalls this thread, not the frame-read loop
+        in _run. Exits (after draining whatever's left in the queue, in
+        order) once it dequeues the _STOP_WRITING sentinel, then closes
+        the writer itself -- see _stop_write_thread, the only place that
+        sentinel is sent."""
+        while True:
+            item = write_queue.get()
+            if item is _STOP_WRITING:
+                break
+            frame, timestamp = item
+            writer.add_frame(frame, timestamp=timestamp)
+        writer.close()
+
+    def _stop_write_thread(self) -> None:
+        """Signals the write thread to drain its queue and close the
+        SerWriter, then waits for it -- must complete before anything
+        else touches self._ser_writer/self._write_queue (start_recording
+        with a fresh writer, disconnect, or a final frame_count read),
+        since the write thread is their exclusive owner while alive."""
+        if self._write_thread is None:
+            return
+        self._write_queue.put(_STOP_WRITING)
+        self._write_thread.join(timeout=10.0)
+        self._write_thread = None
 
     # -- command handlers -----------------------------------------------------
 
     def _handle_connect(self, payload: dict) -> None:
         kind = payload["kind"]
+        bit_depth = payload.get("bit_depth", 8)
         if kind == "mock":
-            mock_kwargs = {"seed": payload.get("mock_seed")}
+            mock_kwargs = {"seed": payload.get("mock_seed"), "bit_depth": bit_depth}
             if payload.get("plate_scale_arcsec_per_px") is not None:
                 mock_kwargs["plate_scale_arcsec_per_px"] = payload["plate_scale_arcsec_per_px"]
             camera = MockAsiCamera(**mock_kwargs)
         else:
-            camera = AsiCamera(payload["camera_id"], payload.get("sdk_path"))
+            camera = AsiCamera(payload["camera_id"], payload.get("sdk_path"), bit_depth=bit_depth)
         try:
             camera.open()
         except Exception as exc:  # noqa: BLE001
@@ -197,13 +292,14 @@ class CameraWorker:
         self._camera.start_streaming()
         self._streaming.set()
         self._emit("connected", width=camera.width, height=camera.height, is_color=camera.is_color,
-                    controls=camera.get_controls())
+                    controls=camera.get_controls(), bit_depth=camera.bit_depth,
+                    colour_id=camera.bayer_pattern_ser_colour_id())
 
     def _handle_disconnect(self, payload: dict) -> None:
         self._streaming.clear()
-        if self._ser_writer is not None:
-            self._ser_writer.close()
-            self._ser_writer = None
+        self._stop_write_thread()  # drains/closes any in-progress recording first
+        self._ser_writer = None
+        self._write_queue = None
         if self._camera is not None:
             self._camera.close()
             self._camera = None
@@ -213,6 +309,12 @@ class CameraWorker:
         if self._camera is None:
             return
         self._camera.set_roi(payload["x"], payload["y"], payload["width"], payload["height"])
+
+    def _handle_set_bit_depth(self, payload: dict) -> None:
+        if self._camera is None:
+            return
+        self._camera.set_bit_depth(payload["bit_depth"])
+        self._emit("bit_depth_changed", bit_depth=self._camera.bit_depth)
 
     def _handle_set_exposure_us(self, payload: dict) -> None:
         if self._camera is None:
@@ -236,8 +338,7 @@ class CameraWorker:
         if self._camera is None:
             self._emit("log", message="[error] can't start recording: not connected")
             return
-        if self._ser_writer is not None:
-            self._ser_writer.close()
+        self._stop_write_thread()  # in case a previous recording is still draining
         path = Path(payload["path"])
         path.parent.mkdir(parents=True, exist_ok=True)
         self._ser_writer = SerWriter(
@@ -246,24 +347,39 @@ class CameraWorker:
             observer=payload.get("observer", ""), instrument=payload.get("instrument", ""),
             telescope=payload.get("telescope", ""),
         )
+        # Queue sized off a fixed RAM budget rather than a fixed frame
+        # count -- a 16-bit full-sensor frame is ~20x the bytes of a small
+        # 8-bit ROI, so a frame-count cap alone would either waste RAM at
+        # small ROIs or barely buffer anything at full resolution.
+        bytes_per_frame = self._camera.width * self._camera.height * (2 if self._camera.bit_depth == 16 else 1)
+        queue_len = max(WRITE_BUFFER_MIN_FRAMES, min(WRITE_BUFFER_MAX_FRAMES, WRITE_BUFFER_TARGET_BYTES // max(bytes_per_frame, 1)))
+        self._write_queue = queue.Queue(maxsize=queue_len)
+        self._buffer_dropped_frames = 0
+        self._write_thread = threading.Thread(target=self._write_loop, args=(self._ser_writer, self._write_queue), daemon=True)
+        self._write_thread.start()
         self._recording_path = path
         self._emit("recording_started", path=str(path))
 
     def _handle_stop_recording(self, payload: dict) -> None:
         if self._ser_writer is None:
             return
+        self._stop_write_thread()  # drains whatever's still queued, in order, then closes the writer
         frame_count = self._ser_writer.frame_count
-        self._ser_writer.close()
         self._ser_writer = None
-        self._emit("recording_stopped", path=str(self._recording_path), frame_count=frame_count)
+        self._write_queue = None
+        self._emit("recording_stopped", path=str(self._recording_path), frame_count=frame_count,
+                    buffer_dropped_frames=self._buffer_dropped_frames)
         self._recording_path = None
 
     def _handle_save_fits_snapshot(self, payload: dict) -> None:
         if self._camera is None:
             self._emit("log", message="[error] can't save snapshot: not connected")
             return
+        # Same bit depth as whatever the live video path is currently
+        # running at (set_bit_depth) -- one setting governs both, no
+        # separate per-action choice.
         frame = self._camera.read_frame(timeout_ms=5000)
         path = Path(payload["path"])
         path.parent.mkdir(parents=True, exist_ok=True)
         write_fits(path, frame, header_extra={"INSTRUME": "ASI290MC"})
-        self._emit("fits_saved", path=str(path))
+        self._emit("fits_saved", path=str(path), bit_depth=self._camera.bit_depth)

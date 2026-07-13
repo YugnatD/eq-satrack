@@ -90,12 +90,16 @@ def _load_star_catalog() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 class MockAsiCamera:
     """Duck-type compatible with camera.asi_camera.AsiCamera."""
 
-    def __init__(self, seed: int | None = None, plate_scale_arcsec_per_px: float = DEFAULT_ARCSEC_PER_PIXEL):
+    def __init__(
+        self, seed: int | None = None, plate_scale_arcsec_per_px: float = DEFAULT_ARCSEC_PER_PIXEL,
+        bit_depth: int = 8,
+    ):
         self._rng = np.random.default_rng(seed)
         self._x, self._y = 0, 0
         self._width, self._height = 640, 480
         self._exposure_us = 1000
         self._gain = 300
+        self._bit_depth = bit_depth
         self._streaming = False
         self._t0 = 0.0
         self._opened = False
@@ -113,7 +117,17 @@ class MockAsiCamera:
         self._opened = False
 
     def set_roi(self, x: int, y: int, width: int, height: int) -> None:
+        # Mirrors the real ASI SDK's width-multiple-of-8/height-multiple-of-2
+        # rounding (see AsiCamera.set_roi) so ROI behavior matches real
+        # hardware even when developing against the mock.
+        width = max(8, (width // 8) * 8)
+        height = max(2, (height // 2) * 2)
         self._x, self._y, self._width, self._height = x, y, width, height
+
+    def set_bit_depth(self, bit_depth: int) -> None:
+        if bit_depth not in (8, 16):
+            raise ValueError(f"unsupported bit depth {bit_depth!r} (must be 8 or 16)")
+        self._bit_depth = bit_depth
 
     def set_exposure_us(self, microseconds: int) -> None:
         self._exposure_us = max(1, int(microseconds))
@@ -188,11 +202,11 @@ class MockAsiCamera:
         yy, xx = np.mgrid[y0:y1, x0:x1]
         frame[y0:y1, x0:x1] += peak * np.exp(-(((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma**2)))
 
-    def read_frame(self, timeout_ms: int = 2000) -> np.ndarray:
-        # Pace frames by the configured exposure, like a real sensor's frame
-        # interval — lets the worker measure a believable fps.
-        time.sleep(max(self._exposure_us / 1_000_000.0, 0.002))
-
+    def _render_float_frame(self) -> np.ndarray:
+        """Builds one frame of the synthetic scene at full float precision,
+        unclamped to any particular bit depth -- read_frame clamps this to
+        either 8-bit or the sensor's real 12-bit ADC range depending on
+        the currently configured bit_depth (see set_bit_depth)."""
         elapsed = time.monotonic() - self._t0
         # Both gain and exposure make faint stars visible, like a real
         # sensor -- previously only gain had any effect, which left
@@ -227,7 +241,22 @@ class MockAsiCamera:
             blob_y = self._height / 2.0
             self._draw_point(frame, blob_x, blob_y, ISS_PEAK_VALUE * gain_scale, ISS_SIGMA_PX, margin=20.0)
 
+        return frame
+
+    def read_frame(self, timeout_ms: int = 2000) -> np.ndarray:
+        # Pace frames by the configured exposure, like a real sensor's frame
+        # interval — lets the worker measure a believable fps.
+        time.sleep(max(self._exposure_us / 1_000_000.0, 0.002))
+        frame = self._render_float_frame()
+        if self._bit_depth == 16:
+            return np.clip(frame * (4095.0 / 255.0), 0, 4095).astype(np.uint16)
         return np.clip(frame, 0, 255).astype(np.uint8)
+
+    def get_dropped_frames(self) -> int:
+        # No real ring buffer to overflow -- read_frame() paces itself by
+        # sleeping for the configured exposure, so the mock can't fall
+        # behind its own frame source the way a real sensor can.
+        return 0
 
     def bayer_pattern_ser_colour_id(self) -> int:
         return 8  # pretend RGGB, matching the ASI290MC's colour sensor
@@ -246,4 +275,4 @@ class MockAsiCamera:
 
     @property
     def bit_depth(self) -> int:
-        return 8
+        return self._bit_depth

@@ -16,7 +16,7 @@ import time
 import tkinter as tk
 from datetime import datetime, timezone
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Callable
 
 import numpy as np
@@ -46,6 +46,7 @@ from am5.gui.theme import PALETTE, style_axes
 from am5.gui.worker import MountWorker, WorkerEvent
 from am5.tracker import AxisSigns, LiveOffsets, TrackingConfig, decompose_error
 from camera.guiding import BlobDetection, GuidingCalibration, calibrate_from_nudges, detect_brightest_blob
+from camera.ser_reader import SerReader
 from camera.worker import CameraEvent, CameraWorker, frame_to_pgm, pgm_to_array
 
 TLE_CACHE_DIR = Path("logs")
@@ -90,8 +91,8 @@ def _meridian_detail_line(crossings: list, window: PassWindow) -> str:
             f"{since_rise_s:.0f}s after tracking starts, {abs(from_culm_s):.0f}s {culm_word} culmination -- "
             f"pick a starting pier side that avoids a flip mid-pass")
 
-MAX_PREVIEW_DIM = 640  # cap the on-screen preview size; ROI drag-select maps
-# canvas coordinates back to full sensor pixels via the tracked display scale
+MAX_PREVIEW_ZOOM = 4  # cap how many display pixels one sensor pixel becomes when
+# magnifying a small ROI to fill the canvas -- avoids giant blocky pixels
 MAX_EXPOSURE_SLIDER_US = 1_000_000  # 1s -- the slider covers our actual use
 # case (sub-2ms ISS exposures) usefully; a real camera's nominal max can be
 # far higher (mock reports up to 2000s) but that's not worth compressing the
@@ -104,6 +105,63 @@ def format_exposure_us(microseconds: float) -> str:
     if microseconds >= 1000:
         return f"{microseconds / 1000:.2f} ms"
     return f"{microseconds:.0f} us"
+
+
+def format_bytes(n: int) -> str:
+    value = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024.0:
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} TB"
+
+
+def _sanitize_filename(text: str) -> str:
+    """Collapses a free-form string (e.g. a satellite name like "ISS
+    (ZARYA)") into something safe as a directory/file name component on
+    any common filesystem -- keeps alphanumerics, replaces everything
+    else with underscores, and collapses repeats so "ISS (ZARYA)" becomes
+    "ISS_ZARYA" rather than "ISS__ZARYA_"."""
+    cleaned = "".join(c if c.isalnum() else "_" for c in text.strip())
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned.strip("_")
+
+
+def fit_pgm_to_canvas(pgm: bytes, full_width: int, full_height: int, canvas: tk.Canvas) -> tk.PhotoImage:
+    """Scales a PGM frame to fit inside canvas without cropping, distorting
+    the aspect ratio, or ever combining a shrink with a subsequent magnify
+    in the same render. Shared by TransitPanel's live preview and
+    SerPlayerPanel's playback view -- both hit the exact same PhotoImage
+    limitations (integer-only subsample/zoom) and the exact same quality
+    trap if that constraint isn't respected, see the comment below."""
+    image = tk.PhotoImage(data=pgm)
+    canvas_w = canvas.winfo_width()
+    canvas_h = canvas.winfo_height()
+    if canvas_w <= 1 or canvas_h <= 1:
+        # Canvas not laid out yet (e.g. the very first frame) -- show
+        # at native size rather than divide by a meaningless 1x1 canvas.
+        canvas_w, canvas_h = full_width, full_height
+
+    # PhotoImage only supports integer subsample/zoom, and chaining both
+    # in the same render (subsample to shrink, then zoom back up) was
+    # tried and reverted -- it looks genuinely blurry/blocky: subsample
+    # throws away most pixels (nearest-neighbor, no averaging), then zoom
+    # replicates whatever's left into NxN blocks, compounding the loss
+    # (reported: full-sensor ROI looked "flouté" while an ROI close to but
+    # not exactly full size looked sharp -- that ROI just happened to need
+    # zoom=1, no compounding). So: shrink OR magnify, never both, even if
+    # that leaves an unused margin on one axis instead of filling the
+    # canvas exactly.
+    if full_width > canvas_w or full_height > canvas_h:
+        factor = max(1, -(-full_width // canvas_w), -(-full_height // canvas_h))  # ceil
+        if factor > 1:
+            image = image.subsample(factor, factor)
+    else:
+        zoom = max(1, min(canvas_w // full_width, canvas_h // full_height, MAX_PREVIEW_ZOOM))
+        if zoom > 1:
+            image = image.zoom(zoom, zoom)
+    return image
 
 
 @dataclasses.dataclass
@@ -428,13 +486,16 @@ class ConnectionPanel(ttk.Frame):
             train = self._get_optical_train()
             if train is not None:
                 plate_scale = train.plate_scale_arcsec_per_px
-        self._camera_worker.connect(self._camera_kind_var.get(), camera_id=camera_id, plate_scale_arcsec_per_px=plate_scale)
+        self._camera_worker.connect(
+            self._camera_kind_var.get(), camera_id=camera_id, plate_scale_arcsec_per_px=plate_scale,
+        )
 
     def handle_camera_event(self, event: CameraEvent) -> None:
         if event.kind == "connected":
             self._camera_status_var.set(
                 f"Connected — {event.payload['width']}x{event.payload['height']}"
                 f"{' colour' if event.payload['is_color'] else ' mono'}"
+                f", {event.payload.get('bit_depth', 8)}-bit"
             )
             self._camera_disconnect_button.configure(state="normal")
         elif event.kind == "connect_error":
@@ -548,7 +609,7 @@ class SkyMapWidget:
 
 class PassesPanel(ttk.Frame):
     def __init__(
-        self, parent: tk.Misc, on_pass_selected: Callable[[Trajectory, PassWindow, list, GeographicPosition], None],
+        self, parent: tk.Misc, on_pass_selected: Callable[[Trajectory, PassWindow, list, GeographicPosition, str], None],
         site_vars: SiteVars | None = None,
     ):
         super().__init__(parent, padding=10)
@@ -609,7 +670,12 @@ class PassesPanel(ttk.Frame):
         self._tree.bind("<<TreeviewSelect>>", self._on_row_selected)
 
         self._detail_var = tk.StringVar(value="")
-        ttk.Label(left, textvariable=self._detail_var, justify="left").pack(anchor="w", pady=(8, 0))
+        # wraplength: the meridian-crossing detail line is long enough
+        # unwrapped to blow out the whole window's width once a pass is
+        # selected (confirmed -- it also squeezed the log bar at the
+        # bottom of the window down to nothing, see app.py's packing
+        # order comment for the other half of that fix).
+        ttk.Label(left, textvariable=self._detail_var, justify="left", wraplength=820).pack(anchor="w", pady=(8, 0))
 
         ttk.Label(right, text="Sky track (N up, horizon at rim)").pack(anchor="w")
         self._sky_map = SkyMapWidget(right)
@@ -702,7 +768,8 @@ class PassesPanel(ttk.Frame):
                     self._draw_sky_map(trajectory, window, crossings)
                     if self._selected_iid is not None:
                         self._tree.set(self._selected_iid, "meridian", "Yes" if crossings else "No")
-                    self._on_pass_selected(trajectory, window, crossings, self._site)
+                    satellite_name = self._satellite.name if self._satellite is not None else ""
+                    self._on_pass_selected(trajectory, window, crossings, self._site, satellite_name)
                 elif kind == "error":
                     self._detail_var.set(f"Error: {payload}")
                     self._refresh_button.configure(state="normal")
@@ -766,6 +833,7 @@ class TransitPanel(ttk.Frame):
         self._window: PassWindow | None = None
         self._site: GeographicPosition | None = None
         self._crossings: list = []
+        self._satellite_name = ""
         # Shared with JogWindow (same instance, owned by App) when passed --
         # set_axis_signs() below mutates it in place so both stay in sync
         # regardless of which one triggered a (re)calibration.
@@ -793,6 +861,8 @@ class TransitPanel(ttk.Frame):
         # -- camera state --
         self._camera_interactive_widgets: list[tk.Widget] = []
         self._recording = False
+        self._colour_id = 0
+        self._is_color = False
         self._roi_x, self._roi_y, self._roi_w, self._roi_h = 0, 0, 640, 480
         self._sensor_width, self._sensor_height = 640, 480
         self._display_scale = 1
@@ -835,7 +905,9 @@ class TransitPanel(ttk.Frame):
 
     def _build_tracking_column(self, parent: tk.Misc) -> None:
         self._summary_var = tk.StringVar(value="No pass selected — pick one in the Passes tab")
-        ttk.Label(parent, textvariable=self._summary_var, justify="left").pack(anchor="w")
+        # wraplength: same long meridian-crossing line as PassesPanel's
+        # _detail_var -- see that label's comment.
+        ttk.Label(parent, textvariable=self._summary_var, justify="left", wraplength=620).pack(anchor="w")
         self._countdown_var = tk.StringVar(value="")
         ttk.Label(parent, textvariable=self._countdown_var, foreground=PALETTE.accent_warn, font=("", 10, "bold")).pack(anchor="w")
         self._mount_radec_var = tk.StringVar(value="RA: --  DEC: --")
@@ -983,11 +1055,15 @@ class TransitPanel(ttk.Frame):
             self._simulate_button.configure(state="normal")
             self._jog_goto_button.configure(state="normal")
 
-    def set_trajectory(self, trajectory: Trajectory, window: PassWindow, crossings: list, site: GeographicPosition) -> None:
+    def set_trajectory(
+        self, trajectory: Trajectory, window: PassWindow, crossings: list, site: GeographicPosition,
+        satellite_name: str = "",
+    ) -> None:
         self._trajectory = trajectory
         self._window = window
         self._site = site
         self._crossings = crossings
+        self._satellite_name = satellite_name
         duration = (window.t_set - window.t_rise).total_seconds()
         lines = [
             f"Rise {_local_and_utc(window.t_rise)}",
@@ -1282,9 +1358,35 @@ class TransitPanel(ttk.Frame):
         self._snapshot_button = ttk.Button(rec_frame, text="Save FITS snapshot", command=self._on_snapshot_click)
         self._snapshot_button.pack(side="left", padx=(4, 0))
         self._camera_interactive_widgets.append(self._snapshot_button)
+        ttk.Label(rec_frame, text="depth:").pack(side="left", padx=(8, 0))
+        # Single control for both the SER recording AND the FITS snapshot --
+        # no separate per-action bit depth, they always match (see
+        # _on_bit_depth_selected). 16-bit costs roughly 2x the USB
+        # bandwidth per frame (confirmed on a real ASI290MC: no fps hit at
+        # 640x480/5ms where exposure time was already the bottleneck, but
+        # expect a real hit at full sensor resolution or longer exposures).
+        self._bit_depth_var = tk.StringVar(value="8")
+        self._bit_depth_combo = ttk.Combobox(
+            rec_frame, textvariable=self._bit_depth_var, values=("8", "16"), width=4,
+            state="readonly",
+        )
+        self._bit_depth_combo.pack(side="left", padx=(4, 0))
+        self._bit_depth_combo.bind("<<ComboboxSelected>>", self._on_bit_depth_selected)
+        self._bit_depth_combo.configure(state="disabled")  # "readonly" once connected, not "normal" -- see _set_camera_controls_enabled
 
         self._stats_var = tk.StringVar(value="")
-        ttk.Label(parent, textvariable=self._stats_var).pack(anchor="w", pady=(4, 0))
+        self._stats_label = ttk.Label(parent, textvariable=self._stats_var)
+        self._stats_label.pack(anchor="w", pady=(4, 0))
+        buffer_row = ttk.Frame(parent)
+        buffer_row.pack(fill="x", pady=(2, 0))
+        ttk.Label(buffer_row, text="write buffer:").pack(side="left")
+        self._buffer_var = tk.DoubleVar(value=0.0)
+        self._buffer_bar = ttk.Progressbar(buffer_row, variable=self._buffer_var, maximum=100.0, length=140)
+        self._buffer_bar.pack(side="left", padx=(4, 0))
+        self._buffer_pct_var = tk.StringVar(value="")
+        ttk.Label(buffer_row, textvariable=self._buffer_pct_var).pack(side="left", padx=(4, 0))
+        self._file_size_var = tk.StringVar(value="")
+        ttk.Label(buffer_row, textvariable=self._file_size_var).pack(side="left", padx=(10, 0))
         self._path_var = tk.StringVar(value=f"Output folder: {self._out_dir.resolve()}")
         ttk.Label(parent, textvariable=self._path_var, foreground=PALETTE.accent_ok).pack(anchor="w", pady=(2, 0))
 
@@ -1293,6 +1395,12 @@ class TransitPanel(ttk.Frame):
         y = max(0, min(y, self._sensor_height - 1))
         w = max(8, min(w, self._sensor_width - x))
         h = max(8, min(h, self._sensor_height - y))
+        # Match the ASI SDK's own rounding (width multiple of 8, height
+        # multiple of 2 -- see AsiCamera.set_roi) so the displayed X/Y/W/H
+        # always reflects what was actually applied, not a value the
+        # camera silently rounded down from.
+        w = max(8, (w // 8) * 8)
+        h = max(2, (h // 2) * 2)
         self._roi_x, self._roi_y, self._roi_w, self._roi_h = x, y, w, h
         self._roi_x_var.set(str(x))
         self._roi_y_var.set(str(y))
@@ -1346,10 +1454,10 @@ class TransitPanel(ttk.Frame):
             return  # accidental click, not a real drag -- ignore
         left, right = sorted((x0, x1))
         top, bottom = sorted((y0, y1))
-        scale = self._display_scale
+        scale = self._display_scale  # now possibly fractional (< 1 when the preview is magnified)
         self._apply_roi(
-            self._roi_x + left * scale, self._roi_y + top * scale,
-            (right - left) * scale, (bottom - top) * scale,
+            round(self._roi_x + left * scale), round(self._roi_y + top * scale),
+            round((right - left) * scale), round((bottom - top) * scale),
         )
 
     # -- exposure / gain sliders ---------------------------------------------
@@ -1367,18 +1475,108 @@ class TransitPanel(ttk.Frame):
         if self._recording:
             self._camera_worker.stop_recording()
         else:
-            self._out_dir.mkdir(parents=True, exist_ok=True)
-            path = (self._out_dir / f"capture_{datetime.now().strftime('%Y%m%dT%H%M%S')}.ser").resolve()
+            capture_dir = self._prepare_capture_dir()
+            path = (capture_dir / f"capture_{datetime.now().strftime('%Y%m%dT%H%M%S')}.ser").resolve()
+            self._write_capture_settings(path.with_suffix(".txt"))
             self._camera_worker.start_recording(path, observer="", instrument="ASI290MC", telescope="")
 
     def _on_snapshot_click(self) -> None:
-        self._out_dir.mkdir(parents=True, exist_ok=True)
-        path = (self._out_dir / f"snapshot_{datetime.now().strftime('%Y%m%dT%H%M%S')}.fits").resolve()
+        capture_dir = self._prepare_capture_dir()
+        path = (capture_dir / f"snapshot_{datetime.now().strftime('%Y%m%dT%H%M%S')}.fits").resolve()
         self._camera_worker.save_fits_snapshot(path)
+
+    def _prepare_capture_dir(self) -> Path:
+        """Where the next recording/snapshot goes. With a pass selected
+        (self._window set, see set_trajectory), everything from that pass
+        -- every recording, every snapshot, plus pass_info.txt and
+        skymap.png -- lands together in one dedicated subfolder, named
+        from the pass identity (satellite + rise time) so re-arming or
+        multiple recordings of the SAME pass land in the SAME folder
+        rather than a fresh one per click. With no pass selected (e.g.
+        just testing camera settings), falls back to the flat --out-dir
+        behavior this app has always had."""
+        if self._window is None:
+            self._out_dir.mkdir(parents=True, exist_ok=True)
+            return self._out_dir
+        capture_dir = self._out_dir / self._pass_folder_name()
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        self._write_pass_info(capture_dir)
+        self._write_skymap(capture_dir)
+        return capture_dir
+
+    def _pass_folder_name(self) -> str:
+        assert self._window is not None
+        name = _sanitize_filename(self._satellite_name) or "satellite"
+        return f"{name}_{self._window.t_rise.strftime('%Y%m%dT%H%M%S')}"
+
+    def _write_pass_info(self, capture_dir: Path) -> None:
+        window = self._window
+        assert window is not None
+        lines = [
+            f"Satellite: {self._satellite_name or '(unknown)'}",
+            f"Rise:      {_local_and_utc(window.t_rise)}",
+            f"Culminate: {_local_and_utc(window.t_culminate)}",
+            f"Set:       {_local_and_utc(window.t_set)}",
+            f"Duration:  {(window.t_set - window.t_rise).total_seconds():.0f} s",
+            f"Max elevation: {window.max_elevation_deg:.1f} deg",
+            f"Distance at culmination: {window.distance_km:.1f} km",
+        ]
+        if window.magnitude_estimate == window.magnitude_estimate:  # excludes NaN (no magnitude_ref was available)
+            lines.append(f"Estimated magnitude: {window.magnitude_estimate:.1f}")
+        lines.append(_meridian_detail_line(self._crossings, window))
+        if self._site is not None:
+            lines.append(
+                f"Site: {self._site.latitude.degrees:.5f}, {self._site.longitude.degrees:.5f}, "
+                f"{self._site.elevation.m:.0f} m"
+            )
+        (capture_dir / "pass_info.txt").write_text("\n".join(lines) + "\n")
+
+    def _write_skymap(self, capture_dir: Path) -> None:
+        # Reuses this panel's own live sky-map figure (already rendered by
+        # set_trajectory/_redraw_sky_map for the currently selected pass)
+        # rather than building a second one -- just saves it.
+        try:
+            self._sky_map.figure.savefig(capture_dir / "skymap.png", dpi=100)
+        except Exception as exc:  # noqa: BLE001 - a plotting/IO hiccup here shouldn't block the actual recording
+            self._emit_log_line(f"[warn] could not save skymap.png: {exc}")
+
+    def _write_capture_settings(self, sidecar_path: Path) -> None:
+        # FireCapture-style per-capture sidecar: the settings that were
+        # actually in effect for THIS recording, not just whatever the
+        # current live values happen to be later (gain/exposure/ROI can
+        # change between recordings within the same pass).
+        exposure_us = round(10 ** self._camera_vars.exposure_log.get())
+        gain = round(self._camera_vars.gain.get())
+        lines = [
+            f"Time (UTC): {datetime.now(timezone.utc).isoformat()}",
+            f"Exposure: {format_exposure_us(exposure_us)} ({exposure_us} us)",
+            f"Gain: {gain}",
+            f"ROI: {self._roi_w}x{self._roi_h} at ({self._roi_x},{self._roi_y}) of {self._sensor_width}x{self._sensor_height}",
+            f"Bit depth: {self._bit_depth_var.get()}",
+            f"Colour: {'colour' if self._is_color else 'mono'} (SER ColourID {self._colour_id})",
+        ]
+        if self._window is not None:
+            lines.append(f"Pass: {self._satellite_name or '(unknown)'}, rise {_local_and_utc(self._window.t_rise)}")
+        sidecar_path.write_text("\n".join(lines) + "\n")
+
+    def _emit_log_line(self, message: str) -> None:
+        # No shared "log" widget on this panel to write into (unlike
+        # MountWorker's log events, which app.py routes to the main log
+        # box) -- surface via the same stats label used for dropped-frame
+        # warnings so a skymap-save failure isn't silently swallowed.
+        self._stats_var.set(message)
+        self._stats_label.configure(foreground=PALETTE.accent_warn)
+
+    def _on_bit_depth_selected(self, _event: tk.Event) -> None:
+        # One setting for both the live/recorded video AND the FITS
+        # snapshot -- save_fits_snapshot() just reads whatever depth the
+        # stream is currently running at, no separate per-action choice.
+        self._camera_worker.set_bit_depth(int(self._bit_depth_var.get()))
 
     def _set_camera_controls_enabled(self, connected: bool) -> None:
         for widget in self._camera_interactive_widgets:
             widget.configure(state="normal" if connected else "disabled")
+        self._bit_depth_combo.configure(state="readonly" if connected else "disabled")
 
     def focus_preview(self) -> None:
         """Called by app.py when this tab becomes the active one, so arrow
@@ -1390,10 +1588,16 @@ class TransitPanel(ttk.Frame):
             self._sensor_width = event.payload["width"]
             self._sensor_height = event.payload["height"]
             self._camera_status_var.set(f"Connected — {self._sensor_width}x{self._sensor_height}"
-                                         f"{' colour' if event.payload['is_color'] else ' mono'}")
+                                         f"{' colour' if event.payload['is_color'] else ' mono'}"
+                                         f", {event.payload.get('bit_depth', 8)}-bit capture")
+            self._bit_depth_var.set(str(event.payload.get("bit_depth", 8)))
+            self._colour_id = event.payload.get("colour_id", 0)
+            self._is_color = event.payload.get("is_color", False)
             self._set_camera_controls_enabled(True)
             self._apply_roi(0, 0, self._sensor_width, self._sensor_height)
             self._configure_control_bounds(event.payload.get("controls", {}))
+        elif event.kind == "bit_depth_changed":
+            self._bit_depth_var.set(str(event.payload["bit_depth"]))
         elif event.kind == "connect_error":
             self._camera_status_var.set(f"Connection failed: {event.payload['message']}")
         elif event.kind == "disconnected":
@@ -1401,11 +1605,34 @@ class TransitPanel(ttk.Frame):
             self._set_camera_controls_enabled(False)
             self._recording = False
             self._record_button.configure(text="Start recording (SER)")
+            self._buffer_var.set(0.0)
+            self._buffer_pct_var.set("")
+            self._file_size_var.set("")
         elif event.kind == "preview_frame":
             self._show_preview_frame(event.payload["pgm"], event.payload["width"], event.payload["height"])
+            capacity = event.payload.get("buffer_capacity", 0)
+            used = event.payload.get("buffer_used", 0)
+            pct = (used / capacity * 100.0) if capacity else 0.0
+            self._buffer_var.set(pct)
+            self._buffer_pct_var.set(f"{used}/{capacity}" if capacity else "idle")
         elif event.kind == "stats":
             rec = " [RECORDING]" if event.payload["recording"] else ""
-            self._stats_var.set(f"fps: {event.payload['fps']:.1f}   frames recorded: {event.payload['frames_recorded']}{rec}")
+            dropped = event.payload.get("dropped_frames", 0)
+            errors = event.payload.get("read_errors", 0)
+            buffer_dropped = event.payload.get("buffer_dropped_frames", 0)
+            self._stats_var.set(
+                f"fps: {event.payload['fps']:.1f}   frames recorded: {event.payload['frames_recorded']}"
+                f"   dropped: {dropped}   read errors: {errors}   buffer dropped: {buffer_dropped}{rec}"
+            )
+            # Dropped frames / read errors / buffer drops mean the host
+            # isn't keeping up with the sensor (USB bandwidth, exposure/fps
+            # mismatch, an actual comm dropout, or -- for buffer drops
+            # specifically -- a disk too slow for the write-behind queue
+            # to absorb) -- flag it, don't just log it quietly.
+            self._stats_label.configure(
+                foreground=PALETTE.accent_warn if (dropped or errors or buffer_dropped) else PALETTE.fg,
+            )
+            self._file_size_var.set(f"file: {format_bytes(event.payload['file_bytes'])}" if event.payload.get("recording") else "")
         elif event.kind == "recording_started":
             self._recording = True
             self._record_button.configure(text="Stop recording")
@@ -1413,9 +1640,12 @@ class TransitPanel(ttk.Frame):
         elif event.kind == "recording_stopped":
             self._recording = False
             self._record_button.configure(text="Start recording (SER)")
-            self._path_var.set(f"Saved: {event.payload['path']} ({event.payload['frame_count']} frames)")
+            self._file_size_var.set("")
+            buffer_dropped = event.payload.get("buffer_dropped_frames", 0)
+            note = f", {buffer_dropped} buffer-dropped" if buffer_dropped else ""
+            self._path_var.set(f"Saved: {event.payload['path']} ({event.payload['frame_count']} frames{note})")
         elif event.kind == "fits_saved":
-            self._path_var.set(f"Saved: {event.payload['path']}")
+            self._path_var.set(f"Saved ({event.payload.get('bit_depth', 8)}-bit): {event.payload['path']}")
 
     def _configure_control_bounds(self, controls: dict) -> None:
         # Only the widget-level from_/to (not a Variable) needs setting on
@@ -1435,13 +1665,10 @@ class TransitPanel(ttk.Frame):
             self._camera_vars.gain.set(default)
 
     def _show_preview_frame(self, pgm: bytes, full_width: int, full_height: int) -> None:
-        scale = max(1, -(-max(full_width, full_height) // MAX_PREVIEW_DIM))  # ceil division
-        image = tk.PhotoImage(data=pgm)
-        if scale > 1:
-            image = image.subsample(scale, scale)
+        image = fit_pgm_to_canvas(pgm, full_width, full_height, self._preview_canvas)
         self._preview_image = image  # keep a reference — Tk drops images with none
-        self._display_scale = scale
-        self._display_w, self._display_h = full_width // scale, full_height // scale
+        self._display_w, self._display_h = image.width(), image.height()
+        self._display_scale = full_width / self._display_w  # sensor px per displayed px, for ROI drag mapping
         if self._preview_canvas_image_id is None:
             self._preview_canvas_image_id = self._preview_canvas.create_image(0, 0, anchor="nw", image=self._preview_image)
         else:
@@ -1564,6 +1791,180 @@ class ExposurePanel(ttk.Frame):
             f"Closest approach: {closest_km:.0f} km  --  ISS solar array span: "
             f"{preview.angular_size_arcsec:.1f} arcsec = {preview.camera_px_span:.1f} camera px{truncation_note}"
         )
+
+
+def _normalize_to_8bit_for_preview(frame: np.ndarray) -> np.ndarray:
+    """frame_to_pgm hardcodes an 8-bit (maxval 255) PGM -- a 16-bit SER
+    frame needs scaling down first. Auto-stretched per frame (scaled by
+    that frame's own max, not a fixed 4095/12-bit assumption) since SER's
+    PixelDepth field can in principle be any value up to 16, not
+    necessarily always our own camera's 12-bit ADC range -- good enough
+    for a quick-look player, not a photometric tool."""
+    if frame.dtype == np.uint8:
+        return frame
+    max_val = int(frame.max())
+    if max_val <= 0:
+        return np.zeros_like(frame, dtype=np.uint8)
+    return (frame.astype(np.float32) * (255.0 / max_val)).astype(np.uint8)
+
+
+class SerPlayerPanel(ttk.Frame):
+    """Standalone SER file viewer -- open any .ser recording (from this
+    app's own camera tab or another tool) and scrub/play through its
+    frames. Pure local file I/O, no worker/device involved, so unlike
+    every other panel it needs no wiring into App._pump_events."""
+
+    def __init__(self, parent: tk.Misc):
+        super().__init__(parent, padding=10)
+        self._reader: SerReader | None = None
+        self._frame_index = 0
+        self._playing = False
+        self._play_after_id: str | None = None
+        self._preview_image: tk.PhotoImage | None = None  # keep a reference -- Tk drops images with none
+        self._preview_canvas_image_id: int | None = None
+
+        top = ttk.Frame(self)
+        top.pack(fill="x")
+        ttk.Button(top, text="Open SER file...", command=self._on_open_click).pack(side="left")
+        self._path_var = tk.StringVar(value="No file open")
+        ttk.Label(top, textvariable=self._path_var, foreground=PALETTE.fg_dim).pack(side="left", padx=(8, 0))
+
+        self._info_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self._info_var, justify="left").pack(anchor="w", pady=(6, 0))
+
+        preview_frame = ttk.LabelFrame(self, text="Frame preview (raw sensor, not debayered)", padding=8)
+        preview_frame.pack(fill="both", expand=True, pady=(8, 0))
+        self._preview_canvas = tk.Canvas(preview_frame, bg="black", highlightthickness=0)
+        self._preview_canvas.pack(fill="both", expand=True)
+
+        controls = ttk.Frame(self)
+        controls.pack(fill="x", pady=(8, 0))
+        self._play_button = ttk.Button(controls, text="Play", command=self._on_play_toggle, state="disabled")
+        self._play_button.pack(side="left")
+        self._prev_button = ttk.Button(controls, text="< Frame", command=lambda: self._step(-1), state="disabled")
+        self._prev_button.pack(side="left", padx=(4, 0))
+        self._next_button = ttk.Button(controls, text="Frame >", command=lambda: self._step(1), state="disabled")
+        self._next_button.pack(side="left", padx=(4, 0))
+        ttk.Label(controls, text="playback fps:").pack(side="left", padx=(10, 0))
+        self._fps_var = tk.StringVar(value="10")
+        self._fps_entry = ttk.Entry(controls, textvariable=self._fps_var, width=5, state="disabled")
+        self._fps_entry.pack(side="left", padx=(4, 0))
+
+        self._frame_var = tk.IntVar(value=0)
+        self._frame_scale = ttk.Scale(
+            self, from_=0, to=0, variable=self._frame_var, command=self._on_scale_moved, state="disabled",
+        )
+        self._frame_scale.pack(fill="x", pady=(6, 0))
+        self._frame_label_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self._frame_label_var).pack(anchor="w")
+
+    def _on_open_click(self) -> None:
+        path_str = filedialog.askopenfilename(
+            title="Open SER file", filetypes=[("SER video", "*.ser"), ("All files", "*.*")],
+        )
+        if not path_str:
+            return
+        self._open_file(Path(path_str))
+
+    def _open_file(self, path: Path) -> None:
+        self._stop_playback()
+        try:
+            reader = SerReader(path)
+        except Exception as exc:  # noqa: BLE001 - surface any parse/IO failure to the user, not a crash
+            messagebox.showerror("Open SER file", f"Could not open {path.name}:\n{exc}")
+            return
+        if self._reader is not None:
+            self._reader.close()
+        self._reader = reader
+        self._path_var.set(str(path))
+
+        h = reader.header
+        duration_note = ""
+        if reader.timestamps and len(reader.timestamps) > 1:
+            duration_s = (reader.timestamps[-1] - reader.timestamps[0]).total_seconds()
+            avg_fps = (len(reader.timestamps) - 1) / duration_s if duration_s > 0 else 0.0
+            duration_note = f"   duration: {duration_s:.1f}s   avg fps: {avg_fps:.1f}"
+        elif reader.frame_count > 0:
+            duration_note = "   (no timestamp trailer -- interrupted/truncated recording?)"
+        self._info_var.set(
+            f"{h.width}x{h.height}   {h.colour_name}   {h.pixel_depth}-bit   {h.frame_count} frames\n"
+            f"observer: {h.observer or '-'}   instrument: {h.instrument or '-'}   telescope: {h.telescope or '-'}\n"
+            f"recorded: {h.date_time_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC{duration_note}"
+        )
+
+        has_frames = h.frame_count > 0
+        self._frame_scale.configure(to=max(0, h.frame_count - 1), state="normal" if h.frame_count > 1 else "disabled")
+        for widget in (self._play_button, self._prev_button, self._next_button, self._fps_entry):
+            widget.configure(state="normal" if has_frames else "disabled")
+        self._frame_index = 0
+        self._frame_var.set(0)
+        if has_frames:
+            self._show_frame(0)
+
+    def _show_frame(self, index: int) -> None:
+        if self._reader is None or self._reader.frame_count == 0:
+            return
+        index = max(0, min(index, self._reader.frame_count - 1))
+        self._frame_index = index
+        frame = self._reader.read_frame(index)
+        pgm = frame_to_pgm(_normalize_to_8bit_for_preview(frame))
+        self._preview_image = fit_pgm_to_canvas(pgm, frame.shape[1], frame.shape[0], self._preview_canvas)
+        if self._preview_canvas_image_id is None:
+            self._preview_canvas_image_id = self._preview_canvas.create_image(0, 0, anchor="nw", image=self._preview_image)
+        else:
+            self._preview_canvas.itemconfigure(self._preview_canvas_image_id, image=self._preview_image)
+
+        ts_note = ""
+        if self._reader.timestamps is not None:
+            ts_note = f"   {self._reader.timestamps[index].strftime('%H:%M:%S.%f')[:-3]} UTC"
+        self._frame_label_var.set(f"frame {index + 1}/{self._reader.frame_count}{ts_note}")
+
+    def _on_scale_moved(self, _value: str) -> None:
+        if self._playing:
+            return  # scale is driven programmatically during playback -- ignore the resulting feedback event
+        self._show_frame(int(self._frame_var.get()))
+
+    def _step(self, delta: int) -> None:
+        self._stop_playback()
+        self._show_frame(self._frame_index + delta)
+        self._frame_var.set(self._frame_index)
+
+    def _on_play_toggle(self) -> None:
+        if self._playing:
+            self._stop_playback()
+        else:
+            self._start_playback()
+
+    def _start_playback(self) -> None:
+        if self._reader is None or self._reader.frame_count <= 1:
+            return
+        if self._frame_index >= self._reader.frame_count - 1:
+            self._frame_index = 0  # replay from the start if already at the end
+        self._playing = True
+        self._play_button.configure(text="Pause")
+        self._play_tick()
+
+    def _stop_playback(self) -> None:
+        self._playing = False
+        self._play_button.configure(text="Play")
+        if self._play_after_id is not None:
+            self.after_cancel(self._play_after_id)
+            self._play_after_id = None
+
+    def _play_tick(self) -> None:
+        if not self._playing or self._reader is None:
+            return
+        next_index = self._frame_index + 1
+        if next_index >= self._reader.frame_count:
+            self._stop_playback()
+            return
+        self._show_frame(next_index)
+        self._frame_var.set(next_index)
+        try:
+            fps = max(0.1, float(self._fps_var.get()))
+        except ValueError:
+            fps = 10.0
+        self._play_after_id = self.after(max(10, round(1000 / fps)), self._play_tick)
 
 
 class CalibrationPanel(ttk.Frame):

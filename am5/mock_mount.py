@@ -31,6 +31,8 @@ from .constants import SIDEREAL_DEG_PER_S
 from .transport import Transport
 
 _AXIS_OF_DIR = {"e": "ra", "w": "ra", "n": "dec", "s": "dec"}
+# Fixed regardless of simulated pier side, unlike real hardware's DEC axis
+# -- see the ":Gm#" dispatch handler below for why that's deliberate.
 _SIGN_OF_DIR = {"e": 1.0, "w": -1.0, "n": 1.0, "s": -1.0}
 
 
@@ -205,6 +207,18 @@ class MockMount(Transport):
             if cmd == ":GLC#":
                 return "1#", True
             if cmd == ":Gm#":
+                # NOTE this readout is intentionally NOT coupled to
+                # _SIGN_OF_DIR below: real hardware's DEC motor response
+                # actually flips sense with pier side (confirmed on real
+                # AM3 hardware -- see AxisSigns' docstring in tracker.py),
+                # but simulating that here would make DEC's sign depend on
+                # the real wall-clock time a test happens to run (since
+                # this is computed from real LST), silently flaking every
+                # test that jogs DEC from the default start position
+                # depending on time of day. Tests that specifically need a
+                # pier flip's effect on DEC sign patch Mount.get_pier_side
+                # directly instead (see test_gui_worker.py) rather than
+                # relying on a real crossing here.
                 if s.at_home:
                     return "N#", True
                 lst_deg = (gmst_deg(datetime.now(timezone.utc)) + self._cfg.longitude_deg) % 360.0
