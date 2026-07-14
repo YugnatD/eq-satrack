@@ -32,6 +32,7 @@ from matplotlib.patches import Rectangle
 from am5.angles import angular_separation_deg
 from am5.gui.theme import PALETTE, style_axes
 from am5.gui.worker import MountWorker, WorkerEvent
+from spectro.alignment import angle_from_points, extract_aligned_crop, paste_star_trail
 from spectro.avspec_export import AvspecExportError, write_avspec_fits
 from spectro.catalog import (
     REFERENCE_LINES,
@@ -96,13 +97,20 @@ _assumed_px_for_wavelength = px_for_wavelength
 _wavelength_for_px = wavelength_for_px
 _extract_profile = extract_profile
 
-# Where the star is assumed to sit once properly framed (roi_offset=0,0 in
-# _synthetic_trail_image), and how close is "close enough" -- shared by
-# AcquisitionPanel's centering check AND _draw_center_guide's on-image
-# target marker, so the guide always matches what actually counts as
-# centered rather than two numbers drifting apart.
+# Where the star is assumed to sit within a properly-identified local
+# working patch (_synthetic_trail_image's own fixed nominal anchor), and
+# the fixed shape spectro/reduction.py's own geometry constants (and
+# spectro.alignment.extract_aligned_crop's default local_anchor) assume --
+# single source of truth so nothing here can silently drift apart.
 _ROI_TARGET_X, _ROI_TARGET_Y = 55, _TRAIL_ROW
-_ROI_TOLERANCE_X, _ROI_TOLERANCE_Y = 8, 4
+
+# Typical amateur GOTO pointing accuracy, in arcmin -- used to simulate a
+# realistic initial pointing error (see AcquisitionPanel's _true_pan_x/y),
+# converted to pixels via ConnectionPanel.get_plate_scale_arcsec_per_px
+# (a real focal-length-dependent formula) instead of an arbitrary pixel
+# range. Roughly isotropic -- real GOTO error isn't meaningfully worse in
+# one axis than the other, so the same value is used for both.
+_TYPICAL_GOTO_ACCURACY_ARCMIN = 3.0
 
 # How often the live preview redraws itself with a fresh noise/jitter
 # frame -- ~7fps, plausible for a live view at these exposures and fast
@@ -152,8 +160,8 @@ def _synthetic_spectrum(seed: int, teff: float = 7200.0) -> tuple[np.ndarray, np
 
 def _synthetic_trail_image(
     seed: int, brightness_scale: float = 1.0, spectrum: tuple[np.ndarray, np.ndarray] | None = None,
-    frame_seed: int | None = None, roi_offset_x: float = 0.0, roi_offset_y: float = 0.0,
-    include_signal: bool = True,
+    frame_seed: int | None = None, include_signal: bool = True, dispersion_a: float | None = None,
+    angle_deg: float = 0.0,
 ) -> np.ndarray:
     """Order-0 star + order-1 spectral trail, shaped like a real CMOS
     frame rather than flat noise everywhere: a read-noise floor, shot
@@ -173,36 +181,54 @@ def _synthetic_trail_image(
     trembling star position, like real atmospheric seeing) instead of a
     perfectly frozen image between slider moves.
 
-    `roi_offset_x/y` shift BOTH the star blob and the trail together, as
-    real ROI panning would -- (0, 0) reproduces the "properly framed"
-    layout every other function here assumes (_TRAIL_START_PX etc.), a
-    nonzero offset simulates imperfect GOTO pointing: the star (and its
-    trail) sit off where they're assumed to be until the operator pans
-    the ROI to bring them back to (0, 0), see AcquisitionPanel's ROI
-    controls.
-
     `include_signal=False` skips the star blob AND the trail entirely --
     what a real DARK or OFFSET/BIAS frame looks like (cap on, no optical
     signal at all, only the sensor's own bias/read/shot noise) -- used by
     AcquisitionPanel's dark/offset capture instead of reusing a science
-    frame with the star just left in."""
+    frame with the star just left in.
+
+    `dispersion_a`, if given, is the real Å/px predicted from the
+    operator's actual grating + optical setup (see ConnectionPanel.
+    get_dispersion_a_per_px) -- painted onto the trail instead of the
+    fixed placeholder rate, so the mock's line spacing actually reflects
+    the chosen Star Analyser + distance.
+
+    `angle_deg` tilts the trail direction away from the image's own +x
+    axis, around the fixed nominal anchor (55, h/2) -- 0 reproduces the
+    original "properly framed AND perfectly horizontal" image every
+    other function here assumes (TRAIL_START_PX etc.); this function
+    always returns that same "already aligned" local coordinate system
+    regardless of angle_deg, panning/positioning within a larger sensor
+    is a separate concern handled by spectro.alignment.paste_star_trail,
+    not by this function -- see AcquisitionPanel's full-frame view for
+    where the two get composed."""
     noise_rng = np.random.default_rng(frame_seed if frame_seed is not None else seed)
     h, w = 90, 420
     bias, read_noise = 8.0, 3.0
     img = noise_rng.normal(bias, read_noise, size=(h, w))
 
     if include_signal:
-        order0_x = 55 + roi_offset_x + noise_rng.normal(0.0, 0.6)  # seeing/tracking jitter, a pixel or so
-        order0_y = h / 2.0 + roi_offset_y + noise_rng.normal(0.0, 0.5)
+        order0_x = 55 + noise_rng.normal(0.0, 0.6)  # seeing/tracking jitter, a pixel or so
+        order0_y = h / 2.0 + noise_rng.normal(0.0, 0.5)
         yy, xx = np.mgrid[0:h, 0:w]
         img += 220.0 * brightness_scale * np.exp(-(((xx - order0_x) ** 2 + (yy - order0_y) ** 2) / (2 * 3.5**2)))
 
         wl, flux = spectrum if spectrum is not None else _synthetic_spectrum(seed)
-        trail_wl = _wavelength_for_px(xx - roi_offset_x)
+        # Distance along/across the (possibly tilted) dispersion axis,
+        # measured from the FIXED nominal anchor (55, h/2) -- not the
+        # jittery blob position above, so the trail doesn't visibly
+        # wobble frame to frame the way the star's own seeing jitter does.
+        theta = np.radians(angle_deg)
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        dx, dy = xx - 55.0, yy - (h / 2.0)
+        along = dx * cos_t + dy * sin_t
+        perp = -dx * sin_t + dy * cos_t
+        px_along = 55.0 + along
+        trail_wl = _wavelength_for_px(px_along, dispersion_a)
         trail_flux = np.interp(trail_wl.ravel(), wl, flux, left=0.0, right=0.0).reshape(xx.shape)
         img += np.where(
-            xx >= _TRAIL_START_PX + roi_offset_x,
-            trail_flux * 150.0 * brightness_scale * np.exp(-((yy - order0_y) ** 2) / (2 * 4.0**2)),
+            px_along >= _TRAIL_START_PX,
+            trail_flux * 150.0 * brightness_scale * np.exp(-(perp**2) / (2 * 4.0**2)),
             0.0,
         )
 
@@ -216,6 +242,32 @@ def _synthetic_trail_image(
         img[hy, hx] = 255.0
 
     return np.clip(img, 0, 255)
+
+
+def _synthetic_full_frame(
+    seed: int, sensor_width: int, sensor_height: int, star_xy: tuple[float, float], angle_deg: float,
+    spectrum: tuple[np.ndarray, np.ndarray] | None = None, brightness_scale: float = 1.0,
+    frame_seed: int | None = None, dispersion_a: float | None = None,
+) -> np.ndarray:
+    """Full-sensor-sized mock frame -- what the operator actually sees in
+    a real live view before identifying anything, unlike
+    _synthetic_trail_image's small "already found and framed" patch.
+    Generates that same small patch (unchanged, still fast) and pastes it
+    into a full `(sensor_height, sensor_width)` canvas at `star_xy` (real
+    sensor pixel coordinates) and `angle_deg`, via spectro.alignment.
+    paste_star_trail -- ~200ms at a real 1936x1096 ASI290MC size. Too slow
+    for the fast (140ms) tick the small local patches use, so
+    AcquisitionPanel only calls this on-demand (button/GOTO triggered);
+    AlignmentPanel does tick it, but on its own much slower dedicated
+    interval (see its _LIVE_INTERVAL_MS) since it's a practice view, not
+    something exposure/gain tuning depends on being high-fps."""
+    background_rng = np.random.default_rng(frame_seed if frame_seed is not None else seed)
+    canvas = background_rng.normal(8.0, 3.0, size=(sensor_height, sensor_width))
+    patch = _synthetic_trail_image(
+        seed=seed, brightness_scale=brightness_scale, spectrum=spectrum, frame_seed=frame_seed,
+        dispersion_a=dispersion_a, angle_deg=angle_deg,
+    )
+    return np.clip(paste_star_trail(canvas, patch, star_xy, angle_deg), 0, 255)
 
 
 def _synthetic_flat_image(seed: int, brightness_pct: float, frame_seed: int | None = None) -> np.ndarray:
@@ -238,10 +290,11 @@ def _synthetic_flat_image(seed: int, brightness_pct: float, frame_seed: int | No
     return np.clip(img, 0, 255)
 
 
-def _draw_profile(ax, figure, image: np.ndarray) -> None:
+def _draw_profile(ax, figure, image: np.ndarray, dispersion_a: float | None = None) -> None:
     """Uncalibrated profile (raw pixel counts vs. pixel position) with the
     real reference lines marked at their ASSUMED pixel position (see
-    _assumed_px_for_wavelength) -- NOT a calibrated spectrum, just a live
+    _assumed_px_for_wavelength, using the real grating+distance dispersion
+    if dispersion_a is given) -- NOT a calibrated spectrum, just a live
     sanity check that the trail actually looks like a stellar spectrum
     (dips roughly where the Balmer series etc. should be) while framing/
     focusing, well before the real wavelength calibration step in the
@@ -251,7 +304,7 @@ def _draw_profile(ax, figure, image: np.ndarray) -> None:
     pixels = np.arange(len(profile))
     ax.plot(pixels[_TRAIL_START_PX:], profile[_TRAIL_START_PX:], color=PALETTE.accent, linewidth=1)
     for label, wl in REFERENCE_LINES:
-        px = _assumed_px_for_wavelength(wl)
+        px = _assumed_px_for_wavelength(wl, dispersion_a)
         if _TRAIL_START_PX <= px <= _TRAIL_END_PX:
             ax.axvline(px, color=PALETTE.border, linewidth=0.8)
             ax.text(
@@ -263,31 +316,11 @@ def _draw_profile(ax, figure, image: np.ndarray) -> None:
     style_axes(figure, ax)
 
 
-def _draw_center_guide(ax, centered: bool) -> None:
-    """Overlay on the live preview showing WHERE to put the star -- a
-    crosshair + tolerance box at the assumed-framing position
-    (_ROI_TARGET_X/Y) -- so "pan the ROI until it's centered" has an
-    actual visible target instead of the operator having to guess from
-    the (unreadable, once off) profile plot alone. Color follows the same
-    centered/not-centered state as the status label above it."""
-    color = PALETTE.accent_ok if centered else PALETTE.accent_warn
-    ax.plot(_ROI_TARGET_X, _ROI_TARGET_Y, marker="+", color=color, markersize=12, markeredgewidth=1.5)
-    ax.add_patch(
-        Rectangle(
-            (_ROI_TARGET_X - _ROI_TOLERANCE_X, _ROI_TARGET_Y - _ROI_TOLERANCE_Y),
-            2 * _ROI_TOLERANCE_X, 2 * _ROI_TOLERANCE_Y,
-            fill=False, edgecolor=color, linewidth=1, linestyle="--",
-        ),
-    )
-
-
 def _draw_extraction_band(ax, w: int) -> None:
     """Outlines exactly which rows get summed into the extracted profile
     (see _extract_profile) -- without this, it's not obvious the profile
     plot only reads a thin band around the trail rather than the whole
-    frame, which matters once the trail isn't sitting where it's assumed
-    to (see _draw_center_guide, same underlying problem: nothing on the
-    image itself showed where the "correct" position actually was)."""
+    frame."""
     y0, y1 = _TRAIL_ROW - _PROFILE_HALF_HEIGHT, _TRAIL_ROW + _PROFILE_HALF_HEIGHT
     ax.add_patch(Rectangle((0, y0), w, y1 - y0, fill=False, edgecolor=PALETTE.accent, linewidth=0.8, linestyle=":"))
 
@@ -381,6 +414,13 @@ class ConnectionPanel(ttk.Frame):
     MockDeviceRow) -- real camera wiring hasn't been requested for this
     app yet, only telescope movement."""
 
+    # Real Star Analyser groove densities -- keys double as the Grating
+    # combobox's own values, so there's one source of truth for both.
+    _GRATING_LINES_PER_MM = {
+        "Star Analyser SA-100 (100 l/mm)": 100.0,
+        "Star Analyser SA-200 (200 l/mm)": 200.0,
+    }
+
     def __init__(self, parent: tk.Misc, mount_worker: MountWorker, on_connection_change=None):
         super().__init__(parent, padding=10)
         self._mount_worker = mount_worker
@@ -410,13 +450,70 @@ class ConnectionPanel(ttk.Frame):
         grating_frame = ttk.LabelFrame(right, text="Instrument", padding=8)
         grating_frame.pack(fill="x", pady=(10, 0))
         ttk.Label(grating_frame, text="Grating").grid(row=0, column=0, sticky="w")
-        grating_var = tk.StringVar(value="Star Analyser SA-200 (200 l/mm)")
+        self._grating_var = tk.StringVar(value="Star Analyser SA-100 (100 l/mm)")
         ttk.Combobox(
-            grating_frame, textvariable=grating_var, state="readonly", width=28,
-            values=["Star Analyser SA-100 (100 l/mm)", "Star Analyser SA-200 (200 l/mm)"],
+            grating_frame, textvariable=self._grating_var, state="readonly", width=28,
+            values=list(self._GRATING_LINES_PER_MM),
         ).grid(row=0, column=1, sticky="w")
+        self._grating_var.trace_add("write", lambda *_a: self._update_dispersion_label())
         ttk.Label(grating_frame, text="Focal length (mm)").grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Entry(grating_frame, width=10).grid(row=1, column=1, sticky="w", pady=(4, 0))
+        # NOT part of get_dispersion_a_per_px -- that's driven by the
+        # grating-to-sensor distance below, not the telescope's focal
+        # length (confirmed against the Paton Hawksley Star Analyser
+        # manual's own formula). Focal length DOES drive plate scale/FOV
+        # below, and the simulated GOTO pointing error in AcquisitionPanel
+        # (see _true_pan_x/y there).
+        self._focal_length_var = tk.StringVar(value="1000")
+        ttk.Entry(grating_frame, textvariable=self._focal_length_var, width=10).grid(
+            row=1, column=1, sticky="w", pady=(4, 0),
+        )
+        self._focal_length_var.trace_add("write", lambda *_a: self._update_dispersion_label())
+
+        ttk.Label(grating_frame, text="Grating to sensor distance (mm)").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self._grating_distance_var = tk.StringVar(value="30")
+        distance_entry = ttk.Entry(grating_frame, textvariable=self._grating_distance_var, width=10)
+        distance_entry.grid(row=2, column=1, sticky="w", pady=(4, 0))
+        self._grating_distance_var.trace_add("write", lambda *_a: self._update_dispersion_label())
+
+        ttk.Label(grating_frame, text="Camera pixel size (µm)").grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self._pixel_size_var = tk.StringVar(value="2.9")
+        pixel_size_entry = ttk.Entry(grating_frame, textvariable=self._pixel_size_var, width=10)
+        pixel_size_entry.grid(row=3, column=1, sticky="w", pady=(4, 0))
+        self._pixel_size_var.trace_add("write", lambda *_a: self._update_dispersion_label())
+        ttk.Label(
+            grating_frame, text="2.9 by default (ASI290MC/MM) -- change if using a different camera or binning.",
+            foreground=PALETTE.fg_dim, wraplength=280, justify="left",
+        ).grid(row=4, column=0, columnspan=2, sticky="w")
+
+        ttk.Label(grating_frame, text="Sensor width x height (px)").grid(row=5, column=0, sticky="w", pady=(4, 0))
+        sensor_row = ttk.Frame(grating_frame)
+        sensor_row.grid(row=5, column=1, sticky="w", pady=(4, 0))
+        self._sensor_width_var = tk.StringVar(value="1936")
+        self._sensor_height_var = tk.StringVar(value="1096")
+        ttk.Entry(sensor_row, textvariable=self._sensor_width_var, width=6).pack(side="left")
+        ttk.Label(sensor_row, text="x").pack(side="left", padx=2)
+        ttk.Entry(sensor_row, textvariable=self._sensor_height_var, width=6).pack(side="left")
+        self._sensor_width_var.trace_add("write", lambda *_a: self._update_dispersion_label())
+        self._sensor_height_var.trace_add("write", lambda *_a: self._update_dispersion_label())
+
+        self._dispersion_label_var = tk.StringVar(value="")
+        ttk.Label(grating_frame, textvariable=self._dispersion_label_var, foreground=PALETTE.fg_dim).grid(
+            row=6, column=0, columnspan=2, sticky="w", pady=(4, 0),
+        )
+        self._plate_scale_label_var = tk.StringVar(value="")
+        ttk.Label(grating_frame, textvariable=self._plate_scale_label_var, foreground=PALETTE.fg_dim).grid(
+            row=7, column=0, columnspan=2, sticky="w",
+        )
+        ttk.Label(
+            grating_frame, foreground=PALETTE.fg_dim, wraplength=280, justify="left",
+            text=(
+                "Dispersion drives line markers/search windows and the live "
+                "preview mock (Paton Hawksley Star Analyser manual's formula). "
+                "Plate scale/FOV drive the simulated GOTO pointing error in "
+                "the Reference star/Target tabs' ROI framing."
+            ),
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        self._update_dispersion_label()
 
     def _build_mount_control(self, parent: tk.Misc) -> None:
         frame = ttk.LabelFrame(parent, text="Mount (AM3/AM5)", padding=8)
@@ -481,6 +578,86 @@ class ConnectionPanel(ttk.Frame):
     def get_site_elevation_m(self) -> float:
         return float(self._site_elevation_var.get())
 
+    def get_dispersion_a_per_px(self) -> float | None:
+        """Predicted Å/pixel for the currently selected Grating, Grating-
+        to-sensor distance, and camera pixel size -- real formula from the
+        Paton Hawksley Star Analyser 100 manual (Wavelength Calibration
+        section): dispersion(Å/px) = 10000 * pixel_size(um) /
+        [grating_lines_per_mm * grating_to_sensor_distance(mm)]. Feeds
+        spectro/reduction.py's REAL pipeline (line-search windows,
+        response calibration fallback), not just the live-preview mock --
+        pixel size is a field, not a hardcoded camera assumption, since
+        that pipeline is meant to run unchanged on real captured frames
+        from whatever camera/binning is actually in use. None if the
+        distance or pixel size fields are empty/invalid/non-positive --
+        see spectro.reduction.assumed_dispersion for the placeholder
+        fallback used everywhere this feeds into."""
+        lines_per_mm = self._GRATING_LINES_PER_MM.get(self._grating_var.get())
+        try:
+            distance_mm = float(self._grating_distance_var.get())
+            pixel_size_um = float(self._pixel_size_var.get())
+        except ValueError:
+            return None
+        if lines_per_mm is None or distance_mm <= 0 or pixel_size_um <= 0:
+            return None
+        return 10000.0 * pixel_size_um / (lines_per_mm * distance_mm)
+
+    def get_plate_scale_arcsec_per_px(self) -> float | None:
+        """Standard plate-scale formula: 206265 * pixel_size(mm) /
+        focal_length(mm) -- how many arcsec of sky one pixel covers.
+        Unrelated to spectral dispersion (that's the grating+distance
+        formula above); this is what actually depends on the telescope's
+        focal length. None if focal length or pixel size are empty/
+        invalid/non-positive."""
+        try:
+            focal_length_mm = float(self._focal_length_var.get())
+            pixel_size_um = float(self._pixel_size_var.get())
+        except ValueError:
+            return None
+        if focal_length_mm <= 0 or pixel_size_um <= 0:
+            return None
+        return 206265.0 * (pixel_size_um / 1000.0) / focal_length_mm
+
+    def get_fov_arcmin(self) -> tuple[float, float] | None:
+        """(width, height) field of view in arcmin, from plate scale and
+        sensor resolution. None if plate scale or sensor dimensions
+        aren't available/valid."""
+        plate_scale = self.get_plate_scale_arcsec_per_px()
+        dimensions = self.get_sensor_dimensions()
+        if plate_scale is None or dimensions is None:
+            return None
+        width_px, height_px = dimensions
+        return plate_scale * width_px / 60.0, plate_scale * height_px / 60.0
+
+    def get_sensor_dimensions(self) -> tuple[int, int] | None:
+        """(width, height) in pixels, from the Sensor width x height
+        field -- the single source of truth for how big the full-frame
+        mock/live view is (AcquisitionPanel, AlignmentPanel), not just
+        FOV math, so a changed sensor size is consistent everywhere.
+        None if either field is empty/invalid/non-positive."""
+        try:
+            width_px = int(float(self._sensor_width_var.get()))
+            height_px = int(float(self._sensor_height_var.get()))
+        except ValueError:
+            return None
+        if width_px <= 0 or height_px <= 0:
+            return None
+        return width_px, height_px
+
+    def _update_dispersion_label(self) -> None:
+        dispersion_a = self.get_dispersion_a_per_px()
+        if dispersion_a is None:
+            self._dispersion_label_var.set("Predicted dispersion: -- (enter a valid distance)")
+        else:
+            self._dispersion_label_var.set(f"Predicted dispersion: {dispersion_a:.2f} Å/px")
+
+        plate_scale = self.get_plate_scale_arcsec_per_px()
+        fov = self.get_fov_arcmin()
+        if plate_scale is None or fov is None:
+            self._plate_scale_label_var.set("Plate scale: -- (enter a valid focal length)")
+        else:
+            self._plate_scale_label_var.set(f"Plate scale: {plate_scale:.2f} arcsec/px   FOV: {fov[0]:.1f} x {fov[1]:.1f} arcmin")
+
     def is_mock(self) -> bool:
         """True if EITHER device is set to Mock -- used to refuse exports
         meant for real submission (see SpectrumPanel's AVSpec export),
@@ -506,6 +683,303 @@ class ConnectionPanel(ttk.Frame):
             self._mount_disconnect_button.configure(state="disabled")
             if self._on_connection_change is not None:
                 self._on_connection_change(False)
+
+
+# -- Shared full-frame scroll-to-zoom -----------------------------------------------------
+#
+# Used by both AlignmentPanel and AcquisitionPanel's full-frame views --
+# the same "click to mark a real sensor-pixel coordinate" interaction
+# benefits from the same zoom in both places, and the math (zoom around
+# the cursor, clamped so the view can't pan off the sensor) doesn't
+# depend on anything panel-specific.
+
+
+def _clamp_span(lo: float, hi: float, bound_lo: float, bound_hi: float) -> tuple[float, float]:
+    """Shifts (lo, hi) -- a span already known to fit within bound_hi -
+    bound_lo -- so both ends land inside [bound_lo, bound_hi], without
+    changing its width. Keeps a zoomed view from panning off the edge of
+    the sensor."""
+    span = hi - lo
+    if lo < bound_lo:
+        lo, hi = bound_lo, bound_lo + span
+    if hi > bound_hi:
+        hi, lo = bound_hi, bound_hi - span
+    return lo, hi
+
+
+def _zoomed_view(
+    event: object, cur_xlim: tuple[float, float], cur_ylim: tuple[float, float], width: int, height: int,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """New (xlim, ylim) after a scroll-wheel zoom step around the cursor,
+    or None if `event` isn't a real in-axes scroll (nothing to do). Zooms
+    in/out around (event.xdata, event.ydata) -- data coordinates, which
+    are always real sensor pixels regardless of the current zoom (see
+    each caller's own imshow extent=), so marking stays accurate at any
+    zoom level. Clamped via _clamp_span so the view never exceeds or
+    pans outside the full (0, width) x (0, height) sensor extent."""
+    if event.xdata is None or event.ydata is None:  # type: ignore[attr-defined]
+        return None
+    if event.button == "up":  # type: ignore[attr-defined]
+        factor = 0.8  # scroll up -- zoom in, standard map-style convention
+    elif event.button == "down":  # type: ignore[attr-defined]
+        factor = 1.25  # zoom out
+    else:
+        return None
+    x0, x1 = cur_xlim
+    y_bottom, y_top = cur_ylim  # bottom > top -- matches extent=(0,w,h,0)
+    span_x = x1 - x0
+    span_y = y_bottom - y_top
+    new_span_x = min(float(width), max(width * 0.02, span_x * factor))
+    new_span_y = min(float(height), max(height * 0.02, span_y * factor))
+    fx = (event.xdata - x0) / span_x  # type: ignore[attr-defined]
+    fy = (event.ydata - y_top) / span_y  # type: ignore[attr-defined]
+    new_x0 = event.xdata - fx * new_span_x  # type: ignore[attr-defined]
+    new_y_top = event.ydata - fy * new_span_y  # type: ignore[attr-defined]
+    new_x0, new_x1 = _clamp_span(new_x0, new_x0 + new_span_x, 0.0, float(width))
+    new_y_top, new_y_bottom = _clamp_span(new_y_top, new_y_top + new_span_y, 0.0, float(height))
+    return (new_x0, new_x1), (new_y_bottom, new_y_top)
+
+
+# -- Alignment tab ---------------------------------------------------------------
+
+
+class AlignmentPanel(ttk.Frame):
+    """Once per session -- not once per star, see AcquisitionPanel's own
+    docstring for that split -- find out how far the Star Analyser's
+    dispersion axis actually is from the sensor's own horizontal, by
+    looking at a full raw frame and tracing it by hand: mark order 0,
+    then click-drag-release a line along the trail. This angle is a
+    property of the physical rig (however the grating happens to sit in
+    its nosepiece), not of any particular target, so it's measured here
+    once and reused by every AcquisitionPanel tab -- the same "shared,
+    not per-star" split this app already uses for flats vs. darks.
+
+    The demo star/trail shown here always has SOME small random tilt
+    (a fixed seed, not zero) so there's always something real to trace --
+    a perfectly horizontal demo would defeat the entire point."""
+
+    _DEMO_SEED = 101
+    _DEMO_ANGLE_RANGE_DEG = 8.0
+    _LARGE_ANGLE_WARNING_DEG = 5.0
+    # Much slower than the module-level _LIVE_INTERVAL_MS (140ms) the
+    # small local patches elsewhere tick at -- _synthetic_full_frame costs
+    # ~200ms at a real 1936x1096 size (see its own docstring), too slow
+    # for that cadence. This view is just a practice demo, not something
+    # exposure/gain tuning depends on being high-fps, so a slower dedicated
+    # tick is fine and still reads as a live feed rather than a photo.
+    _LIVE_INTERVAL_MS = 800
+
+    def __init__(self, parent: tk.Misc, connection_panel: ConnectionPanel):
+        super().__init__(parent, padding=10)
+        self._connection_panel = connection_panel
+        self._mode: str | None = None  # None, "order0", or "trace"
+        self._order0_xy: tuple[float, float] | None = None
+        self._trace_points: tuple[tuple[float, float], tuple[float, float]] | None = None
+        self._drag_start: tuple[float, float] | None = None
+        self._measured_angle_deg: float | None = None
+        self._demo_star_xy = (0.0, 0.0)
+        self._demo_true_angle_deg = 0.0
+        self._sensor_width = 1936
+        self._sensor_height = 1096
+        self._last_frame: np.ndarray | None = None
+        self._live_frame_count = 0
+        # None means "full sensor extent" -- see _redraw_current, which
+        # fills these in the first time a frame is shown so _on_scroll
+        # always has a real window to zoom from.
+        self._view_xlim: tuple[float, float] | None = None
+        self._view_ylim: tuple[float, float] | None = None
+
+        ttk.Label(
+            self, foreground=PALETTE.fg_dim, wraplength=1000, justify="left",
+            text=(
+                "Do this once per session (not once per star) -- it measures how the Star Analyser is "
+                "physically rotated relative to the sensor, which doesn't change between targets unless "
+                "you touch the camera/grating orientation. 1) Click \"Mark order 0\", then click the star "
+                "in the frame below. 2) Click \"Draw trace\", then click-drag-release along the spectrum. "
+                "The measured angle then feeds every Reference star/Target tab. Scroll the mouse wheel over "
+                "the frame to zoom in/out around the cursor for more precise marking -- this only changes "
+                "the view, not what gets captured."
+            ),
+        ).pack(anchor="w")
+
+        button_row = ttk.Frame(self)
+        button_row.pack(fill="x", pady=(8, 0))
+        self._order0_button = ttk.Button(button_row, text="Mark order 0", command=self._on_toggle_order0_mode)
+        self._order0_button.pack(side="left")
+        self._trace_button = ttk.Button(button_row, text="Draw trace", command=self._on_toggle_trace_mode)
+        self._trace_button.pack(side="left", padx=(6, 0))
+        ttk.Button(button_row, text="Reset", command=self._on_reset).pack(side="left", padx=(6, 0))
+        ttk.Button(button_row, text="New demo frame", command=self._on_new_demo_frame).pack(side="left", padx=(6, 0))
+
+        frame_box = ttk.LabelFrame(self, text="Full-frame live view (demo star)", padding=8)
+        frame_box.pack(fill="both", expand=True, pady=(8, 0))
+        self._figure = Figure(figsize=(9, 3.3), dpi=100)
+        self._figure.patch.set_facecolor(PALETTE.bg)
+        self._ax = self._figure.add_subplot(111)
+        self._canvas = FigureCanvasTkAgg(self._figure, master=frame_box)
+        self._canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._canvas.mpl_connect("button_press_event", self._on_canvas_press)
+        self._canvas.mpl_connect("button_release_event", self._on_canvas_release)
+        self._canvas.mpl_connect("scroll_event", self._on_scroll)
+
+        self._status_var = tk.StringVar(value="")
+        self._status_label = ttk.Label(self, textvariable=self._status_var, wraplength=1000, justify="left")
+        self._status_label.pack(anchor="w", pady=(8, 0))
+
+        self._on_new_demo_frame()
+        self._live_tick()
+
+    def _on_new_demo_frame(self) -> None:
+        rng = np.random.default_rng()  # genuinely random each click -- a fresh practice tilt, not reproducible on purpose
+        dims = self._connection_panel.get_sensor_dimensions() if self._connection_panel is not None else None
+        width, height = dims if dims is not None else (1936, 1096)
+        self._sensor_width, self._sensor_height = width, height
+        self._demo_star_xy = (width * 0.4 + float(rng.uniform(-80, 80)), height * 0.5 + float(rng.uniform(-80, 80)))
+        # Never exactly 0 -- a perfectly horizontal demo would defeat the
+        # point of practicing on one that isn't.
+        sign = 1.0 if rng.random() < 0.5 else -1.0
+        self._demo_true_angle_deg = sign * float(rng.uniform(1.5, self._DEMO_ANGLE_RANGE_DEG))
+        self._order0_xy = None
+        self._trace_points = None
+        self._measured_angle_deg = None
+        self._mode = None
+        self._view_xlim = None
+        self._view_ylim = None
+        self._render_frame()
+
+    def _render_frame(self, frame_seed: int | None = None) -> None:
+        self._last_frame = _synthetic_full_frame(
+            seed=self._DEMO_SEED, sensor_width=self._sensor_width, sensor_height=self._sensor_height,
+            star_xy=self._demo_star_xy, angle_deg=self._demo_true_angle_deg, brightness_scale=1.3,
+            frame_seed=frame_seed,
+        )
+        self._redraw_current()
+
+    def _live_tick(self) -> None:
+        # Same self-paced idiom as AcquisitionPanel/FlatsPanel's own
+        # _live_tick -- only redraws while the tab is actually visible, and
+        # only the noise draw changes (star position/angle/marks/zoom are
+        # untouched), so this looks like a live noisy feed rather than
+        # generating a new practice frame on every tick.
+        if self.winfo_ismapped():
+            self._live_frame_count += 1
+            self._render_frame(frame_seed=self._DEMO_SEED * 100_003 + self._live_frame_count)
+        self.after(self._LIVE_INTERVAL_MS, self._live_tick)
+
+    def _on_toggle_order0_mode(self) -> None:
+        self._mode = None if self._mode == "order0" else "order0"
+        self._update_status()
+
+    def _on_toggle_trace_mode(self) -> None:
+        self._mode = None if self._mode == "trace" else "trace"
+        self._update_status()
+
+    def _on_canvas_press(self, event) -> None:
+        if event.xdata is None or event.ydata is None:
+            return
+        if self._mode == "order0":
+            self._order0_xy = (event.xdata, event.ydata)
+            self._mode = None
+            self._redraw_current()
+        elif self._mode == "trace":
+            self._drag_start = (event.xdata, event.ydata)
+
+    def _on_canvas_release(self, event) -> None:
+        if self._mode != "trace" or self._drag_start is None:
+            return
+        if event.xdata is None or event.ydata is None:
+            self._drag_start = None
+            return
+        p0, p1 = self._drag_start, (event.xdata, event.ydata)
+        self._drag_start = None
+        if math.hypot(p1[0] - p0[0], p1[1] - p0[1]) < 5:
+            return  # a click, not a drag -- too short to be a meaningful trace
+        self._trace_points = (p0, p1)
+        self._measured_angle_deg = angle_from_points(p0, p1)
+        self._mode = None
+        self._redraw_current()
+
+    def _redraw_current(self) -> None:
+        if self._last_frame is None:
+            return
+        height, width = self._last_frame.shape
+        self._ax.clear()
+        self._ax.imshow(self._last_frame, cmap="inferno", aspect="auto", extent=(0, width, height, 0))
+        if self._order0_xy is not None:
+            self._ax.plot(*self._order0_xy, marker="+", color=PALETTE.accent_ok, markersize=14, markeredgewidth=2)
+        if self._trace_points is not None:
+            (x0, y0), (x1, y1) = self._trace_points
+            self._ax.plot([x0, x1], [y0, y1], color=PALETTE.accent_warn, linewidth=1.5)
+        # Preserves whatever zoom _on_scroll last set, rather than
+        # snapping back to the full frame on every mark/trace redraw --
+        # only _on_new_demo_frame resets these to None (full extent).
+        if self._view_xlim is None or self._view_ylim is None:
+            self._view_xlim = (0.0, float(width))
+            self._view_ylim = (float(height), 0.0)
+        self._ax.set_xlim(*self._view_xlim)
+        self._ax.set_ylim(*self._view_ylim)
+        self._ax.set_xticks([])
+        self._ax.set_yticks([])
+        for spine in self._ax.spines.values():
+            spine.set_visible(False)
+        self._canvas.draw()
+        self._update_status()
+
+    def _on_scroll(self, event) -> None:
+        """Zoom the view in/out around the cursor -- view-only, doesn't
+        touch _last_frame or any mark/trace coordinates, which are always
+        in real sensor-pixel data space regardless of the current zoom
+        (see imshow's own extent= above), so marking stays accurate at
+        any zoom level. See _zoomed_view for the shared math."""
+        if self._last_frame is None:
+            return
+        height, width = self._last_frame.shape
+        result = _zoomed_view(event, self._ax.get_xlim(), self._ax.get_ylim(), width, height)
+        if result is None:
+            return
+        self._view_xlim, self._view_ylim = result
+        self._ax.set_xlim(*self._view_xlim)
+        self._ax.set_ylim(*self._view_ylim)
+        self._canvas.draw_idle()
+
+    def _on_reset(self) -> None:
+        self._order0_xy = None
+        self._trace_points = None
+        self._measured_angle_deg = None
+        self._mode = None
+        self._redraw_current()
+
+    def _update_status(self) -> None:
+        # ✅/⬜ prefixes match the same convention AcquisitionPanel/
+        # FlatsPanel use for their own session-status labels -- a glance
+        # at the leading icon says "done" or "not yet" before reading any
+        # of the text.
+        self._order0_button.configure(text="Mark order 0 (click the frame)" if self._mode == "order0" else "Mark order 0")
+        self._trace_button.configure(text="Draw trace (drag on the frame)" if self._mode == "trace" else "Draw trace")
+        order0_note = (
+            f"✅ Order 0 marked at ({self._order0_xy[0]:.0f}, {self._order0_xy[1]:.0f}). "
+            if self._order0_xy is not None else "⬜ Order 0 not marked yet. "
+        )
+        if self._measured_angle_deg is None:
+            trace_note = "⬜ 2. Click \"Draw trace\", then click-drag-release along the spectrum trail."
+            self._status_var.set(order0_note + trace_note if self._order0_xy is not None else "⬜ 1. Click \"Mark order 0\", then click the star below.")
+            self._status_label.configure(foreground=PALETTE.fg_dim)
+            return
+        angle = self._measured_angle_deg
+        if abs(angle) > self._LARGE_ANGLE_WARNING_DEG:
+            self._status_var.set(
+                f"{order0_note}✅ Measured angle: {angle:+.1f}° -- fairly tilted. Consider re-rotating the Star "
+                "Analyser in its locking ring for a more accurate spectrum (see its manual's own advice on this).",
+            )
+            self._status_label.configure(foreground=PALETTE.accent_warn)
+        else:
+            self._status_var.set(
+                f"{order0_note}✅ Measured angle: {angle:+.1f}° -- feeds every Reference star/Target tab from here.",
+            )
+            self._status_label.configure(foreground=PALETTE.accent_ok)
+
+    def get_trail_angle_deg(self) -> float | None:
+        return self._measured_angle_deg
 
 
 # -- Target / standard star tab ---------------------------------------------------------------
@@ -888,11 +1362,23 @@ class AcquisitionPanel(ttk.Frame):
     Flats are deliberately NOT here: they correct the optical train/
     sensor (vignetting, pixel response), not a specific star, so they
     only need doing once per setup rather than once per reference/target
-    -- see FlatsPanel."""
+    -- see FlatsPanel.
+
+    Framing is two stages, matching real practice: a FULL raw-sensor live
+    view (real ASI290MC-sized, not a suspiciously pre-cropped little
+    rectangle) to find the star and mark order 0 by hand -- reset
+    whenever a new GOTO is issued, since the star lands somewhere new
+    each time -- and, once marked, the small "already found" local
+    preview this tab always showed, used for exposure/gain tuning, the
+    uncalibrated profile, and capture. The trail's own tilt is measured
+    ONCE in AlignmentPanel and shared here (and with the other
+    AcquisitionPanel), not remeasured per star -- same "shared setup
+    property, not per-star" split as flats vs. darks."""
 
     def __init__(
         self, parent: tk.Misc, role: str, seed: int, get_star, get_spectrum=None,
-        mount_worker: MountWorker | None = None,
+        mount_worker: MountWorker | None = None, connection_panel: ConnectionPanel | None = None,
+        alignment_panel: AlignmentPanel | None = None,
     ):
         super().__init__(parent, padding=10)
         self._role = role  # "reference" or "target"
@@ -901,6 +1387,8 @@ class AcquisitionPanel(ttk.Frame):
         self._get_star = get_star
         self._get_spectrum = get_spectrum
         self._mount_worker = mount_worker
+        self._connection_panel = connection_panel
+        self._alignment_panel = alignment_panel
         self._mount_connected = False
         self._goto_pending = False
         self._goto_target_ra_deg: float | None = None
@@ -916,13 +1404,32 @@ class AcquisitionPanel(ttk.Frame):
         self._dark_frames: list[np.ndarray] = []
         self._offset_frames: list[np.ndarray] = []
         self._capture_seed_counter = 0
+        self._order0_full_xy: tuple[float, float] | None = None
+        self._mark_mode = False
+        self._last_full_frame: np.ndarray | None = None
+        # None means "full sensor extent" -- see _redraw_full_frame, same
+        # scroll-to-zoom idiom as AlignmentPanel (see _zoomed_view).
+        self._full_frame_view_xlim: tuple[float, float] | None = None
+        self._full_frame_view_ylim: tuple[float, float] | None = None
 
         # Simulates imperfect GOTO pointing: the star doesn't land dead
-        # center in the frame in real life, so ROI panning starts away
-        # from it -- see _on_center_roi and _render_frame's status readout.
+        # center in the frame in real life -- where in the FULL sensor it
+        # actually lands, see _star_full_xy. Grounded in a real pointing-
+        # error magnitude (arcmin) converted to pixels via the real plate
+        # scale (ConnectionPanel.get_plate_scale_arcsec_per_px, itself
+        # from the real focal length) when available; falls back to an
+        # arbitrary pixel range if focal length/pixel size aren't set to
+        # something valid yet.
         pan_rng = np.random.default_rng(seed)
-        self._true_pan_x = float(pan_rng.uniform(-150.0, 150.0))
-        self._true_pan_y = float(pan_rng.uniform(-25.0, 25.0))
+        plate_scale = self._connection_panel.get_plate_scale_arcsec_per_px() if self._connection_panel is not None else None
+        if plate_scale is not None and plate_scale > 0:
+            error_x_arcmin = float(pan_rng.uniform(-_TYPICAL_GOTO_ACCURACY_ARCMIN, _TYPICAL_GOTO_ACCURACY_ARCMIN))
+            error_y_arcmin = float(pan_rng.uniform(-_TYPICAL_GOTO_ACCURACY_ARCMIN, _TYPICAL_GOTO_ACCURACY_ARCMIN))
+            self._true_pan_x = error_x_arcmin * 60.0 / plate_scale
+            self._true_pan_y = error_y_arcmin * 60.0 / plate_scale
+        else:
+            self._true_pan_x = float(pan_rng.uniform(-300.0, 300.0))
+            self._true_pan_y = float(pan_rng.uniform(-300.0, 300.0))
 
         self._header_var = tk.StringVar(value=f"{self._title}: (none selected yet)")
         ttk.Label(self, textvariable=self._header_var, font=("", 10, "bold")).pack(anchor="w")
@@ -934,25 +1441,26 @@ class AcquisitionPanel(ttk.Frame):
         right = ttk.Frame(columns)
         right.pack(side="left", fill="none", padx=(10, 0))
 
-        roi_frame = ttk.LabelFrame(left, text="ROI framing -- find & center the star before capturing", padding=8)
-        roi_frame.pack(fill="x")
-        ttk.Label(roi_frame, text="Pan X").grid(row=0, column=0, sticky="w")
-        self._roi_x_var = tk.DoubleVar(value=0.0)
-        ttk.Scale(roi_frame, from_=-200, to=200, variable=self._roi_x_var, command=self._on_settings_changed).grid(
-            row=0, column=1, sticky="we", padx=(8, 8),
+        framing_frame = ttk.LabelFrame(
+            left, text="Full-frame view -- find the star, then mark order 0 (scroll to zoom)", padding=8,
         )
-        ttk.Label(roi_frame, text="Pan Y").grid(row=1, column=0, sticky="w", pady=(4, 0))
-        self._roi_y_var = tk.DoubleVar(value=0.0)
-        ttk.Scale(roi_frame, from_=-40, to=40, variable=self._roi_y_var, command=self._on_settings_changed).grid(
-            row=1, column=1, sticky="we", padx=(8, 8), pady=(4, 0),
-        )
-        roi_frame.columnconfigure(1, weight=1)
-        self._roi_status_var = tk.StringVar(value="")
-        self._roi_status_label = ttk.Label(roi_frame, textvariable=self._roi_status_var)
-        self._roi_status_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Button(roi_frame, text="Center ROI (auto-detect)", command=self._on_center_roi).grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(6, 0),
-        )
+        framing_frame.pack(fill="both", expand=True)
+        self._full_frame_figure = Figure(figsize=(5.5, 2.4), dpi=100)
+        self._full_frame_ax = self._full_frame_figure.add_subplot(111)
+        self._full_frame_figure.patch.set_facecolor(PALETTE.bg)
+        self._full_frame_canvas = FigureCanvasTkAgg(self._full_frame_figure, master=framing_frame)
+        self._full_frame_canvas.get_tk_widget().pack(fill="both", expand=True)
+        self._full_frame_canvas.mpl_connect("button_press_event", self._on_full_frame_click)
+        self._full_frame_canvas.mpl_connect("scroll_event", self._on_full_frame_scroll)
+        framing_button_row = ttk.Frame(framing_frame)
+        framing_button_row.pack(fill="x", pady=(6, 0))
+        self._mark_button = ttk.Button(framing_button_row, text="Mark order 0", command=self._on_toggle_mark_mode)
+        self._mark_button.pack(side="left")
+        ttk.Button(framing_button_row, text="Refresh view", command=self._refresh_full_frame).pack(side="left", padx=(6, 0))
+        self._order0_status_var = tk.StringVar(value="")
+        ttk.Label(
+            framing_frame, textvariable=self._order0_status_var, foreground=PALETTE.fg_dim, wraplength=480, justify="left",
+        ).pack(anchor="w", pady=(4, 0))
 
         preview_frame = ttk.LabelFrame(left, text="Live preview -- order 0 (star) + order 1 (spectrum trail)", padding=8)
         preview_frame.pack(fill="both", expand=True, pady=(8, 0))
@@ -1042,8 +1550,10 @@ class AcquisitionPanel(ttk.Frame):
         self._hist_canvas.get_tk_widget().pack(anchor="w")
 
         self._live_frame_count = 0
+        self._update_order0_status()
         self._on_settings_changed()
         self._refresh_header()
+        self._refresh_full_frame()
         self._live_tick()
 
     def _refresh_header(self) -> None:
@@ -1067,6 +1577,16 @@ class AcquisitionPanel(ttk.Frame):
         self._goto_target_dec_deg = star.dec_deg
         self._goto_status_var.set(f"Slewing to {star.name}...")
         self._mount_worker.goto(star.ra_deg / 15.0, star.dec_deg)
+        # The star lands somewhere new after every GOTO -- any previous
+        # order-0 mark is stale, so make the operator re-find it rather
+        # than silently keep extracting from the old (now wrong) spot.
+        # The view is reset too, for the same reason a stale zoom window
+        # centered on the OLD position wouldn't even show the new one.
+        self._order0_full_xy = None
+        self._full_frame_view_xlim = None
+        self._full_frame_view_ylim = None
+        self._update_order0_status()
+        self._refresh_full_frame()
 
     def handle_mount_event(self, event: WorkerEvent) -> None:
         """Fed by App._pump_events -- every AcquisitionPanel sees every
@@ -1106,65 +1626,154 @@ class AcquisitionPanel(ttk.Frame):
         self._gain_label_var.set(str(self._gain_value()))
         self._dark_hint_var.set(f"Matches current settings: {self._exposure_label_var.get()}, gain {self._gain_label_var.get()}")
         self._offset_hint_var.set(f"Minimum exposure, gain {self._gain_label_var.get()} -- exposure length doesn't matter for bias")
-        self._render_frame(frame_seed=None)
-
-    def _on_center_roi(self) -> None:
-        self._roi_x_var.set(self._true_pan_x)
-        self._roi_y_var.set(self._true_pan_y)
-        self._on_settings_changed()
+        self._render_local_patch(frame_seed=None)
 
     def _live_tick(self) -> None:
-        # Redraws with a fresh noise/jitter draw every _LIVE_INTERVAL_MS,
-        # independent of any slider move -- see _synthetic_trail_image's
-        # docstring for why this is what actually reads as "live" rather
-        # than a plot that only ever changes when you touch a control.
+        # Redraws the LOCAL patch (not the full-frame view -- see this
+        # class's own docstring for why that one is on-demand only) with
+        # a fresh noise/jitter draw every _LIVE_INTERVAL_MS, independent
+        # of any control move -- see _synthetic_trail_image's docstring
+        # for why this is what actually reads as "live" rather than a
+        # plot that only ever changes when you touch a control.
         if self.winfo_ismapped():
             self._live_frame_count += 1
-            self._render_frame(frame_seed=self._seed * 100_003 + self._live_frame_count)
+            self._render_local_patch(frame_seed=self._seed * 100_003 + self._live_frame_count)
             self._stats_var.set(f"fps: {1000.0 / _LIVE_INTERVAL_MS:.1f}   frames: {self._live_frame_count}")
         self.after(_LIVE_INTERVAL_MS, self._live_tick)
 
-    def _current_capture_params(self) -> tuple[float, tuple[np.ndarray, np.ndarray] | None, float, float]:
-        """(brightness, spectrum, roi_offset_x, roi_offset_y) for whatever
-        the exposure/gain/ROI controls are set to RIGHT NOW -- the single
-        place both the live preview (_render_frame) and the actual frame
-        capture (_on_capture_science/_dark/_offset) read these from, so a
-        captured frame always matches what the operator was just looking
-        at when they clicked the button."""
+    def _current_capture_params(self) -> tuple[float, tuple[np.ndarray, np.ndarray] | None]:
+        """(brightness, spectrum) for whatever the exposure/gain controls
+        are set to RIGHT NOW -- the single place the live preview, the
+        full-frame view, and the actual frame capture all read these
+        from, so a captured frame always matches what the operator was
+        just looking at when they clicked the button."""
         brightness = 0.4 + 1.2 * (self._exposure_var.get() / 100.0) * (0.5 + self._gain_var.get() / 100.0)
         spectrum = self._get_spectrum() if self._get_spectrum is not None else None
-        # How far the star still is from where the trail/lines are assumed
-        # to sit (see _synthetic_trail_image) -- nonzero until the operator
-        # pans the ROI to match the star's actual (imperfect-GOTO) position.
-        offset_x = self._true_pan_x - self._roi_x_var.get()
-        offset_y = self._true_pan_y - self._roi_y_var.get()
-        return brightness, spectrum, offset_x, offset_y
+        return brightness, spectrum
 
     def _next_capture_seed(self) -> int:
         self._capture_seed_counter += 1
         return self._seed * 1_000_003 + self._capture_seed_counter
 
-    def _render_frame(self, frame_seed: int | None) -> None:
-        brightness, spectrum, offset_x, offset_y = self._current_capture_params()
+    def _current_dispersion_a(self) -> float | None:
+        return self._connection_panel.get_dispersion_a_per_px() if self._connection_panel is not None else None
+
+    def _current_angle_deg(self) -> float:
+        """The shared trail tilt from AlignmentPanel -- 0.0 (horizontal)
+        if that hasn't been measured yet, same "not wrong, just the
+        least-assuming fallback" spirit as spectro.reduction.
+        assumed_dispersion's own fallback."""
+        if self._alignment_panel is None:
+            return 0.0
+        angle = self._alignment_panel.get_trail_angle_deg()
+        return angle if angle is not None else 0.0
+
+    def _star_full_xy(self) -> tuple[float, float]:
+        """Where this star actually lands in the full sensor -- the
+        nominal GOTO aim point (frame center) plus this panel's own
+        simulated pointing error (_true_pan_x/y)."""
+        dimensions = self._connection_panel.get_sensor_dimensions() if self._connection_panel is not None else None
+        width, height = dimensions if dimensions is not None else (1936, 1096)
+        return width / 2.0 + self._true_pan_x, height / 2.0 + self._true_pan_y
+
+    def _refresh_full_frame(self) -> None:
+        dimensions = self._connection_panel.get_sensor_dimensions() if self._connection_panel is not None else None
+        width, height = dimensions if dimensions is not None else (1936, 1096)
+        brightness, spectrum = self._current_capture_params()
+        self._last_full_frame = _synthetic_full_frame(
+            seed=self._seed, sensor_width=width, sensor_height=height, star_xy=self._star_full_xy(),
+            angle_deg=self._current_angle_deg(), spectrum=spectrum, brightness_scale=brightness,
+            frame_seed=self._next_capture_seed(), dispersion_a=self._current_dispersion_a(),
+        )
+        self._redraw_full_frame()
+
+    def _redraw_full_frame(self) -> None:
+        if self._last_full_frame is None:
+            return
+        height, width = self._last_full_frame.shape
+        self._full_frame_ax.clear()
+        self._full_frame_ax.imshow(self._last_full_frame, cmap="inferno", aspect="auto", extent=(0, width, height, 0))
+        if self._order0_full_xy is not None:
+            self._full_frame_ax.plot(
+                *self._order0_full_xy, marker="+", color=PALETTE.accent_ok, markersize=14, markeredgewidth=2,
+            )
+        # Preserves whatever zoom _on_full_frame_scroll last set, same
+        # idiom as AlignmentPanel._redraw_current -- only _on_goto resets
+        # these to None (full extent), since that's the only time the
+        # star actually moves to somewhere a stale zoom wouldn't show.
+        if self._full_frame_view_xlim is None or self._full_frame_view_ylim is None:
+            self._full_frame_view_xlim = (0.0, float(width))
+            self._full_frame_view_ylim = (float(height), 0.0)
+        self._full_frame_ax.set_xlim(*self._full_frame_view_xlim)
+        self._full_frame_ax.set_ylim(*self._full_frame_view_ylim)
+        self._full_frame_ax.set_xticks([])
+        self._full_frame_ax.set_yticks([])
+        for spine in self._full_frame_ax.spines.values():
+            spine.set_visible(False)
+        self._full_frame_canvas.draw()
+
+    def _on_full_frame_scroll(self, event: object) -> None:
+        """Zoom the full-frame view in/out around the cursor -- see
+        AlignmentPanel._on_scroll and _zoomed_view for the shared math;
+        same reasoning applies here (view-only, marking stays accurate at
+        any zoom level since clicks are read in real data coordinates)."""
+        if self._last_full_frame is None:
+            return
+        height, width = self._last_full_frame.shape
+        result = _zoomed_view(event, self._full_frame_ax.get_xlim(), self._full_frame_ax.get_ylim(), width, height)
+        if result is None:
+            return
+        self._full_frame_view_xlim, self._full_frame_view_ylim = result
+        self._full_frame_ax.set_xlim(*self._full_frame_view_xlim)
+        self._full_frame_ax.set_ylim(*self._full_frame_view_ylim)
+        self._full_frame_canvas.draw_idle()
+
+    def _on_toggle_mark_mode(self) -> None:
+        self._mark_mode = not self._mark_mode
+        self._mark_button.configure(text="Click the star above..." if self._mark_mode else "Mark order 0")
+
+    def _on_full_frame_click(self, event: object) -> None:
+        if not self._mark_mode or event.xdata is None or event.ydata is None:  # type: ignore[attr-defined]
+            return
+        self._order0_full_xy = (event.xdata, event.ydata)  # type: ignore[attr-defined]
+        self._mark_mode = False
+        self._mark_button.configure(text="Mark order 0")
+        self._redraw_full_frame()
+        self._update_order0_status()
+        self._on_settings_changed()  # the local patch is only meaningful from here on -- refresh it now
+
+    def _update_order0_status(self) -> None:
+        if self._order0_full_xy is None:
+            self._order0_status_var.set(
+                "Not marked yet -- click \"Mark order 0\", then click the star in the frame above.",
+            )
+        else:
+            x, y = self._order0_full_xy
+            self._order0_status_var.set(f"Order 0 marked at ({x:.0f}, {y:.0f}) px.")
+
+    def _render_local_patch(self, frame_seed: int | None) -> None:
+        if self._order0_full_xy is None:
+            self._clear_local_patch()
+            return
+        brightness, spectrum = self._current_capture_params()
+        dispersion_a = self._current_dispersion_a()
+        # angle_deg=0.0, NOT self._current_angle_deg() -- this preview
+        # exists to judge exposure/gain from the extraction band + profile
+        # below (_draw_extraction_band/_draw_profile), both of which
+        # assume a horizontal trail (same TRAIL_ROW spectro/reduction.py
+        # uses). Showing it already straightened previews what the
+        # operator will actually get after ReductionPanel's own
+        # extract_aligned_crop step, rather than a tilted trail crossing a
+        # horizontal band that would misjudge SNR. The captured frames
+        # themselves (_on_capture_science etc.) still use the real
+        # measured angle -- only this display is straightened.
         image = _synthetic_trail_image(
             seed=self._seed, brightness_scale=brightness, spectrum=spectrum, frame_seed=frame_seed,
-            roi_offset_x=offset_x, roi_offset_y=offset_y,
+            dispersion_a=dispersion_a, angle_deg=0.0,
         )
-        centered = abs(offset_x) < _ROI_TOLERANCE_X and abs(offset_y) < _ROI_TOLERANCE_Y
-        if centered:
-            self._roi_status_var.set("Star centered -- ready to capture")
-            self._roi_status_label.configure(foreground=PALETTE.accent_ok)
-        else:
-            self._roi_status_var.set("Star not centered -- pan ROI to find it (or auto-center)")
-            self._roi_status_label.configure(foreground=PALETTE.accent_warn)
         self._preview_ax.clear()
         self._preview_ax.imshow(image, cmap="inferno", aspect="auto")
         _draw_extraction_band(self._preview_ax, image.shape[1])
-        _draw_center_guide(self._preview_ax, centered)
-        # The overlay patches above extend autoscale margins past the
-        # image's own extent (visible as a blank strip of the axes'
-        # default background past the right/top edge) -- pin the view
-        # back to exactly the image bounds now that everything's drawn.
         self._preview_ax.set_xlim(-0.5, image.shape[1] - 0.5)
         self._preview_ax.set_ylim(image.shape[0] - 0.5, -0.5)
         self._preview_ax.set_xticks([])
@@ -1172,32 +1781,55 @@ class AcquisitionPanel(ttk.Frame):
         for spine in self._preview_ax.spines.values():
             spine.set_visible(False)
         self._preview_canvas.draw()
-        _draw_profile(self._profile_ax, self._profile_figure, image)
+        _draw_profile(self._profile_ax, self._profile_figure, image, dispersion_a)
         self._profile_canvas.draw()
         _draw_histogram(self._hist_ax, self._hist_figure, image, compact=True)
         self._hist_canvas.draw()
 
+    def _clear_local_patch(self) -> None:
+        for ax, canvas in ((self._preview_ax, self._preview_canvas), (self._profile_ax, self._profile_canvas)):
+            ax.clear()
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            canvas.draw()
+        self._preview_ax.text(
+            0.5, 0.5, "Mark order 0 in the full-frame view above first", ha="center", va="center",
+            color=PALETTE.fg_dim, fontsize=8, transform=self._preview_ax.transAxes, wrap=True,
+        )
+        self._preview_canvas.draw()
+        self._hist_ax.clear()
+        for spine in self._hist_ax.spines.values():
+            spine.set_visible(False)
+        self._hist_canvas.draw()
+
     def _on_capture_science(self) -> None:
+        if self._order0_full_xy is None:
+            self._science_var.set("⚠ Mark order 0 in the full-frame view above first.")
+            return
         # Multiple REAL frames per click, not one -- each with its own
         # independent noise draw (a fresh frame_seed) so stacking them
         # later (see spectro/reduction.py's stack_frames) actually
         # improves SNR over a single frame, same reason darks/offset are
         # already batched.
         n = max(1, self._science_frames_var.get())
-        brightness, spectrum, offset_x, offset_y = self._current_capture_params()
+        brightness, spectrum = self._current_capture_params()
+        dispersion_a = self._current_dispersion_a()
+        angle_deg = self._current_angle_deg()
         for _ in range(n):
             frame = _synthetic_trail_image(
                 seed=self._seed, brightness_scale=brightness, spectrum=spectrum,
-                frame_seed=self._next_capture_seed(), roi_offset_x=offset_x, roi_offset_y=offset_y,
+                frame_seed=self._next_capture_seed(), dispersion_a=dispersion_a, angle_deg=angle_deg,
             )
             self._science_frames.append(frame)
         self._science_count += n
         self._science_var.set(f"✅ {self._title} spectrum ({self._science_count} frames)")
 
     def _on_capture_dark(self) -> None:
-        # No star signal at all (cap on) -- brightness_scale is
+        # No star signal at all (cap on) -- brightness_scale/angle are
         # irrelevant here since include_signal=False skips the only
-        # things it would have scaled.
+        # things they'd have affected.
         for _ in range(20):
             frame = _synthetic_trail_image(seed=self._seed, frame_seed=self._next_capture_seed(), include_signal=False)
             self._dark_frames.append(frame)
@@ -1380,13 +2012,16 @@ class ReductionPanel(ttk.Frame):
 
     def __init__(
         self, parent: tk.Misc, reference_panel: AcquisitionPanel, target_capture_panel: AcquisitionPanel,
-        flats_panel: FlatsPanel, target_panel: TargetPanel,
+        flats_panel: FlatsPanel, target_panel: TargetPanel, connection_panel: ConnectionPanel,
+        alignment_panel: AlignmentPanel,
     ):
         super().__init__(parent, padding=10)
         self._reference_panel = reference_panel
         self._target_capture_panel = target_capture_panel
         self._flats_panel = flats_panel
         self._target_panel = target_panel
+        self._connection_panel = connection_panel
+        self._alignment_panel = alignment_panel
 
         self._reference_master_dark: np.ndarray | None = None
         self._reference_master_offset: np.ndarray | None = None
@@ -1478,7 +2113,9 @@ class ReductionPanel(ttk.Frame):
             lines.append(f"Flats: master flat ready (mean {master_flat.mean():.1f} ADU).")
         self._set_status(self._step1_status_label, self._step1_status_var, "\n".join(lines), ok)
 
-    def _plot_profile_with_lines(self, ax, figure, canvas, profile: np.ndarray, detected: list) -> None:
+    def _plot_profile_with_lines(
+        self, ax, figure, canvas, profile: np.ndarray, detected: list, dispersion_a: float | None = None,
+    ) -> None:
         ax.clear()
         pixels = np.arange(len(profile))
         ax.plot(
@@ -1487,7 +2124,7 @@ class ReductionPanel(ttk.Frame):
         )
         detected_px = {label: px for label, _wl, px in detected}
         for label, wl in REFERENCE_LINES:
-            assumed_px = _assumed_px_for_wavelength(wl)
+            assumed_px = _assumed_px_for_wavelength(wl, dispersion_a)
             if _TRAIL_START_PX <= assumed_px <= _TRAIL_END_PX:
                 ax.axvline(assumed_px, color=PALETTE.fg_dim, linewidth=0.6, linestyle=":")
             if label in detected_px:
@@ -1520,24 +2157,44 @@ class ReductionPanel(ttk.Frame):
         except ReductionError as exc:
             self._set_status(self._step2_status_label, self._step2_status_var, f"Reduction failed: {exc}", False)
             return
+        # Straighten the trail's real tilt (see AlignmentPanel) BEFORE any
+        # of the pipeline below, which has always assumed a perfectly
+        # horizontal trail -- 0.0 (untouched) if alignment hasn't been
+        # measured yet, exactly matches identity so this is always safe
+        # to apply.
+        angle_deg = self._alignment_panel.get_trail_angle_deg() or 0.0
+        calibrated = extract_aligned_crop(
+            calibrated, (_ROI_TARGET_X, _ROI_TARGET_Y), angle_deg,
+            crop_shape=calibrated.shape, local_anchor=(_ROI_TARGET_X, _ROI_TARGET_Y),
+        )
         self._reference_calibrated = calibrated
         profile = extract_profile(calibrated)
-        detected = detect_line_pixels(profile)
+        assumed_dispersion_a = self._connection_panel.get_dispersion_a_per_px()
+        detected = detect_line_pixels(profile, dispersion_a=assumed_dispersion_a)
         self._dispersion = fit_dispersion(detected)
         gain = snr_gain(len(science))
+        angle_note = f" (trail straightened by {angle_deg:+.1f}°)" if abs(angle_deg) > 0.05 else ""
         if self._dispersion is not None:
             a, _b = self._dispersion
             msg = (
-                f"{len(science)} frames stacked (SNR x{gain:.1f}). Detected {len(detected)}/{len(REFERENCE_LINES)} "
+                f"{len(science)} frames stacked (SNR x{gain:.1f}){angle_note}. Detected {len(detected)}/{len(REFERENCE_LINES)} "
                 f"reference lines -- fitted dispersion {a:.3f} Å/px."
+            )
+        elif assumed_dispersion_a is not None:
+            msg = (
+                f"{len(science)} frames stacked (SNR x{gain:.1f}){angle_note}. Only {len(detected)} line(s) detected -- "
+                f"need at least 2 to fit a real dispersion, falling back to the Grating/distance-predicted "
+                f"{assumed_dispersion_a:.2f} Å/px."
             )
         else:
             msg = (
-                f"{len(science)} frames stacked (SNR x{gain:.1f}). Only {len(detected)} line(s) detected -- "
+                f"{len(science)} frames stacked (SNR x{gain:.1f}){angle_note}. Only {len(detected)} line(s) detected -- "
                 "need at least 2 to fit a real dispersion, falling back to the assumed one."
             )
         self._set_status(self._step2_status_label, self._step2_status_var, msg, True)
-        self._plot_profile_with_lines(self._step2_ax, self._step2_figure, self._step2_canvas, profile, detected)
+        self._plot_profile_with_lines(
+            self._step2_ax, self._step2_figure, self._step2_canvas, profile, detected, assumed_dispersion_a,
+        )
 
     def _on_reduce_target(self) -> None:
         if self._target_master_dark is None or self._target_master_offset is None:
@@ -1557,12 +2214,24 @@ class ReductionPanel(ttk.Frame):
         except ReductionError as exc:
             self._set_status(self._step3_status_label, self._step3_status_var, f"Reduction failed: {exc}", False)
             return
+        angle_deg = self._alignment_panel.get_trail_angle_deg() or 0.0
+        calibrated = extract_aligned_crop(
+            calibrated, (_ROI_TARGET_X, _ROI_TARGET_Y), angle_deg,
+            crop_shape=calibrated.shape, local_anchor=(_ROI_TARGET_X, _ROI_TARGET_Y),
+        )
         self._target_calibrated = calibrated
         profile = extract_profile(calibrated)
         gain = snr_gain(len(science))
-        msg = f"{len(science)} frames stacked (SNR x{gain:.1f}). Target's own lines are unknown -- nothing to detect yet."
+        angle_note = f" (trail straightened by {angle_deg:+.1f}°)" if abs(angle_deg) > 0.05 else ""
+        msg = (
+            f"{len(science)} frames stacked (SNR x{gain:.1f}){angle_note}. Target's own lines are unknown -- "
+            "nothing to detect yet."
+        )
         self._set_status(self._step3_status_label, self._step3_status_var, msg, True)
-        self._plot_profile_with_lines(self._step3_ax, self._step3_figure, self._step3_canvas, profile, [])
+        self._plot_profile_with_lines(
+            self._step3_ax, self._step3_figure, self._step3_canvas, profile, [],
+            self._connection_panel.get_dispersion_a_per_px(),
+        )
 
     def _on_calibrate_flux(self) -> None:
         if self._reference_calibrated is None:
@@ -1579,16 +2248,22 @@ class ReductionPanel(ttk.Frame):
             )
             return
         ref_wl, ref_flux = reference_spectrum
+        assumed_dispersion_a = self._connection_panel.get_dispersion_a_per_px()
         _pixels, _wavelengths, response, _measured = compute_response(
-            self._reference_calibrated, ref_wl, ref_flux, self._dispersion,
+            self._reference_calibrated, ref_wl, ref_flux, self._dispersion, assumed_dispersion_a,
         )
-        final_wl, final_flux = apply_response(self._target_calibrated, response, self._dispersion)
+        final_wl, final_flux = apply_response(self._target_calibrated, response, self._dispersion, assumed_dispersion_a)
         self._final_wl, self._final_flux = final_wl, final_flux
         self._result_version += 1
-        dispersion_note = (
-            f"real fitted dispersion ({self._dispersion[0]:.3f} Å/px)" if self._dispersion is not None
-            else "assumed linear dispersion (not enough lines detected in step 2 to refit)"
-        )
+        if self._dispersion is not None:
+            dispersion_note = f"real fitted dispersion ({self._dispersion[0]:.3f} Å/px)"
+        elif assumed_dispersion_a is not None:
+            dispersion_note = (
+                f"Grating/distance-predicted dispersion ({assumed_dispersion_a:.2f} Å/px, not enough "
+                "lines detected in step 2 to refit)"
+            )
+        else:
+            dispersion_note = "assumed linear dispersion (not enough lines detected in step 2 to refit)"
         reference_name = self._target_panel.get_reference_name() or "reference"
         target_name = self._target_panel.get_target_name() or "target"
         msg = f"Response derived from {reference_name}, applied to {target_name} -- using the {dispersion_note}."

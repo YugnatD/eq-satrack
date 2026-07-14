@@ -20,7 +20,15 @@ from tkinter import ttk
 from am5.gui.theme import apply_dark_theme
 from am5.gui.worker import MountWorker
 from spectro.gui.jog_window import JogWindow
-from spectro.gui.panels import AcquisitionPanel, ConnectionPanel, FlatsPanel, ReductionPanel, SpectrumPanel, TargetPanel
+from spectro.gui.panels import (
+    AcquisitionPanel,
+    AlignmentPanel,
+    ConnectionPanel,
+    FlatsPanel,
+    ReductionPanel,
+    SpectrumPanel,
+    TargetPanel,
+)
 
 EVENT_POLL_MS = 100
 
@@ -39,6 +47,11 @@ class App:
         self.connection_panel = ConnectionPanel(
             self.notebook, mount_worker=self.mount_worker, on_connection_change=self._on_connection_change,
         )
+        # Once per session, not once per star -- measures how the Star
+        # Analyser is physically rotated relative to the sensor, shared
+        # by both AcquisitionPanel tabs below and by ReductionPanel's own
+        # rotation-correction step, see AlignmentPanel's own docstring.
+        self.alignment_panel = AlignmentPanel(self.notebook, connection_panel=self.connection_panel)
         self.target_panel = TargetPanel(self.notebook)
         # Reference/Target: two acquisition tabs, not one shared Capture +
         # one shared Calibration tab -- darks must match each capture's
@@ -47,10 +60,12 @@ class App:
         self.reference_panel = AcquisitionPanel(
             self.notebook, role="reference", seed=7, get_star=self.target_panel.get_reference_star,
             get_spectrum=self.target_panel.get_reference_spectrum, mount_worker=self.mount_worker,
+            connection_panel=self.connection_panel, alignment_panel=self.alignment_panel,
         )
         self.target_capture_panel = AcquisitionPanel(
             self.notebook, role="target", seed=11, get_star=self.target_panel.get_target_star,
             get_spectrum=self.target_panel.get_target_spectrum_model, mount_worker=self.mount_worker,
+            connection_panel=self.connection_panel, alignment_panel=self.alignment_panel,
         )
         self.flats_panel = FlatsPanel(self.notebook)
         # Reduction runs the REAL pipeline (spectro/reduction.py) against
@@ -61,7 +76,8 @@ class App:
         # docstrings.
         self.reduction_panel = ReductionPanel(
             self.notebook, reference_panel=self.reference_panel, target_capture_panel=self.target_capture_panel,
-            flats_panel=self.flats_panel, target_panel=self.target_panel,
+            flats_panel=self.flats_panel, target_panel=self.target_panel, connection_panel=self.connection_panel,
+            alignment_panel=self.alignment_panel,
         )
         self.spectrum_panel = SpectrumPanel(
             self.notebook, reduction_panel=self.reduction_panel, target_panel=self.target_panel,
@@ -69,6 +85,7 @@ class App:
         )
 
         self.notebook.add(self.connection_panel, text="◆ Connection")
+        self.notebook.add(self.alignment_panel, text="↗ Alignment")
         self.notebook.add(self.target_panel, text="★ Target & standard")
         self.notebook.add(self.reference_panel, text="⊙ Reference star")
         self.notebook.add(self.target_capture_panel, text="◎ Target")

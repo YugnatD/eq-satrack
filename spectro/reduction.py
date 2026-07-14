@@ -37,18 +37,35 @@ class ReductionError(RuntimeError):
     pass
 
 
-def px_for_wavelength(wl: float) -> float:
+def assumed_dispersion(dispersion_a: float | None = None) -> tuple[float, float]:
+    """(a, b) for wl = a*px + b, anchored so wavelength == ASSUMED_WL_MIN
+    at TRAIL_START_PX -- the assumed mapping used before any REAL
+    wavelength calibration (fit_dispersion, from actually detected lines)
+    exists. `dispersion_a`, if given, is the real Å/px predicted from the
+    operator's actual grating + optical setup (see ConnectionPanel.
+    get_dispersion_a_per_px, computed from the Paton Hawksley Star
+    Analyser manual's own formula: 10000*pixel_size_um/(grating_lines_per_mm
+    * grating_to_sensor_distance_mm)) -- None falls back to a fixed
+    placeholder rate (this mockup's original assumed 3800-7200 Å span
+    across the trail), for when no real setup info is available yet."""
+    a = dispersion_a if dispersion_a is not None else (ASSUMED_WL_MAX - ASSUMED_WL_MIN) / (TRAIL_END_PX - TRAIL_START_PX)
+    b = ASSUMED_WL_MIN - a * TRAIL_START_PX
+    return a, b
+
+
+def px_for_wavelength(wl: float, dispersion_a: float | None = None) -> float:
     """Where a real line WOULD land on the trail under the assumed linear
     dispersion -- the starting guess later refined by fit_dispersion once
-    real lines have actually been detected."""
-    frac = (wl - ASSUMED_WL_MIN) / (ASSUMED_WL_MAX - ASSUMED_WL_MIN)
-    return TRAIL_START_PX + frac * (TRAIL_END_PX - TRAIL_START_PX)
+    real lines have actually been detected. See assumed_dispersion for
+    what dispersion_a does."""
+    a, b = assumed_dispersion(dispersion_a)
+    return (wl - b) / a
 
 
-def wavelength_for_px(px: np.ndarray) -> np.ndarray:
+def wavelength_for_px(px: np.ndarray, dispersion_a: float | None = None) -> np.ndarray:
     """Inverse of px_for_wavelength."""
-    frac = (px - TRAIL_START_PX) / (TRAIL_END_PX - TRAIL_START_PX)
-    return ASSUMED_WL_MIN + frac * (ASSUMED_WL_MAX - ASSUMED_WL_MIN)
+    a, b = assumed_dispersion(dispersion_a)
+    return a * px + b
 
 
 def extract_profile(image: np.ndarray, trail_row: int = TRAIL_ROW, half_height: int = PROFILE_HALF_HEIGHT) -> np.ndarray:
@@ -99,10 +116,14 @@ def calibrate_science(
 
 def detect_line_pixels(
     profile: np.ndarray, expected_lines: list[tuple[str, float]] = REFERENCE_LINES, search_half_width: int = 15,
+    dispersion_a: float | None = None,
 ) -> list[tuple[str, float, int]]:
     """For each known REFERENCE_LINES entry, looks for a local minimum
     (absorption dip) within search_half_width pixels of where it's
-    ASSUMED to sit (px_for_wavelength) -- a real, if simple, line-
+    ASSUMED to sit (px_for_wavelength, using the real optical setup's
+    dispersion if dispersion_a is given -- a much closer starting guess
+    than the fixed placeholder, so the search window is more likely to
+    actually contain the real line) -- a real, if simple, line-
     centroiding step, not just trusting the assumed linear dispersion.
     Returns (label, known_wl, detected_px) only for lines where a clear
     INTERIOR minimum was found -- skips lines whose search window runs
@@ -111,7 +132,7 @@ def detect_line_pixels(
     detected = []
     n = len(profile)
     for label, wl in expected_lines:
-        center_px = px_for_wavelength(wl)
+        center_px = px_for_wavelength(wl, dispersion_a)
         lo = int(round(center_px - search_half_width))
         hi = int(round(center_px + search_half_width))
         if lo < TRAIL_START_PX or hi >= min(n, TRAIL_END_PX):
@@ -144,6 +165,21 @@ def pixel_wavelength_array(pixels: np.ndarray, dispersion: tuple[float, float] |
     return a * pixels + b
 
 
+def resolve_dispersion(
+    fitted: tuple[float, float] | None, assumed_dispersion_a: float | None = None,
+) -> tuple[float, float]:
+    """The REAL fitted dispersion (from detect_line_pixels + fit_dispersion)
+    if available, else the assumed one computed from the real optical
+    setup (see assumed_dispersion) -- centralizes this fallback so
+    compute_response/apply_response don't each reimplement it slightly
+    differently, and so the SAME assumed rate feeds both the pre-
+    calibration line search (detect_line_pixels) and the post-calibration
+    flux math whenever no real fit exists yet."""
+    if fitted is not None:
+        return fitted
+    return assumed_dispersion(assumed_dispersion_a)
+
+
 def resolution_at(wl: float, dispersion_a: float, fwhm_px: float = 8.0) -> float:
     """R = lambda / delta_lambda, delta_lambda estimated from a typical
     line FWHM in pixels (~8px, matching the Balmer line widths used
@@ -158,17 +194,19 @@ def resolution_at(wl: float, dispersion_a: float, fwhm_px: float = 8.0) -> float
 
 def compute_response(
     reference_calibrated_image: np.ndarray, reference_wl: np.ndarray, reference_flux: np.ndarray,
-    dispersion: tuple[float, float] | None = None,
+    dispersion: tuple[float, float] | None = None, assumed_dispersion_a: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Instrument response = measured counts / known relative flux, at
     each pixel across the trail -- the correction that, divided out of a
     target's own measured counts (see apply_response), removes the
-    instrument's own wavelength-dependent sensitivity. Returns (pixels,
-    wavelengths, response, measured_profile)."""
+    instrument's own wavelength-dependent sensitivity. `dispersion` is
+    the REAL fitted one if available; `assumed_dispersion_a` is the
+    fallback used only when it isn't (see resolve_dispersion). Returns
+    (pixels, wavelengths, response, measured_profile)."""
     profile = extract_profile(reference_calibrated_image)
     pixels = np.arange(TRAIL_START_PX, TRAIL_END_PX)
     measured = profile[TRAIL_START_PX:TRAIL_END_PX].astype(float)
-    wavelengths = pixel_wavelength_array(pixels, dispersion)
+    wavelengths = pixel_wavelength_array(pixels, resolve_dispersion(dispersion, assumed_dispersion_a))
     known = np.interp(wavelengths, reference_wl, reference_flux, left=np.nan, right=np.nan)
     known = np.clip(known, 1e-3, None)
     response = measured / known
@@ -177,6 +215,7 @@ def compute_response(
 
 def apply_response(
     target_calibrated_image: np.ndarray, response: np.ndarray, dispersion: tuple[float, float] | None = None,
+    assumed_dispersion_a: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Divides the target's own measured profile by the reference-derived
     response, over the SAME pixel range compute_response used -- the
@@ -187,7 +226,7 @@ def apply_response(
     profile = extract_profile(target_calibrated_image)
     pixels = np.arange(TRAIL_START_PX, TRAIL_END_PX)
     measured = profile[TRAIL_START_PX:TRAIL_END_PX].astype(float)
-    wavelengths = pixel_wavelength_array(pixels, dispersion)
+    wavelengths = pixel_wavelength_array(pixels, resolve_dispersion(dispersion, assumed_dispersion_a))
     response_safe = np.where(np.abs(response) < 1e-6, np.nan, response)
     flux = measured / response_safe
     valid = np.isfinite(flux)
