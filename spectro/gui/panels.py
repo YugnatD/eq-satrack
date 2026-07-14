@@ -2,12 +2,19 @@
 
 TargetPanel is wired to a real star catalog (spectro/catalog.py, SIMBAD via
 astroquery) -- target search and standard-star candidates are real lookups,
-not demo data. AcquisitionPanel/FlatsPanel generate synthetic-but-realistic
-frames (no real camera connected yet -- see Connection tab, still a pure
-mock) but ReductionPanel and SpectrumPanel run the REAL reduction pipeline
-(spectro/reduction.py: stacking, dark/flat calibration, line detection,
-dispersion fitting, instrument-response flux calibration) on those frames,
-not a canned demo -- the same code would run unchanged on real captures.
+not demo data. Mount AND camera CONNECTION are real (ConnectionPanel owns a
+real am5.gui.worker.MountWorker and a real camera.worker.CameraWorker,
+unchanged from the ISS tracker -- same devices, same code). What's still
+synthetic is FRAME ACQUISITION: AcquisitionPanel/FlatsPanel/AlignmentPanel
+generate synthetic-but-realistic frames rather than reading live frames off
+a connected real camera -- wiring that up needs a physical ASI290MC to test
+against (the same reason the mount protocol itself was only trusted after
+characterize.py runs against real hardware, not written blind), so it's
+deliberately deferred rather than guessed at. ReductionPanel and
+SpectrumPanel run the REAL reduction pipeline (spectro/reduction.py:
+stacking, dark/flat calibration, line detection, dispersion fitting,
+instrument-response flux calibration) on those frames regardless -- the
+same code would run unchanged on real captures once that wiring exists.
 Reuses am5.gui.theme (PALETTE / style_axes) rather than the mount-specific
 panels, so the two apps look like one product without sharing any
 tracking-specific code.
@@ -32,7 +39,9 @@ from matplotlib.patches import Rectangle
 from am5.angles import angular_separation_deg
 from am5.gui.theme import PALETTE, style_axes
 from am5.gui.worker import MountWorker, WorkerEvent
+from camera.worker import CameraEvent, CameraWorker
 from spectro.alignment import angle_from_points, extract_aligned_crop, paste_star_trail
+from spectro.gui.live_camera import LiveCameraFeed, RealCaptureState, TabResyncTracker
 from spectro.avspec_export import AvspecExportError, write_avspec_fits
 from spectro.catalog import (
     REFERENCE_LINES,
@@ -46,6 +55,7 @@ from spectro.catalog import (
     resolve_target,
 )
 from spectro.pickles import FetchError, fetch_reference_spectrum
+from spectro.session import Session
 from spectro.reduction import (
     ASSUMED_WL_MAX,
     ASSUMED_WL_MIN,
@@ -348,71 +358,23 @@ def _draw_histogram(ax, figure, image: np.ndarray, compact: bool = False) -> Non
     style_axes(figure, ax)
 
 
-# -- shared bits ---------------------------------------------------------------
-
-
-class MockDeviceRow(ttk.Frame):
-    """One "Connect" row (mount or camera) -- pure UI state, no worker."""
-
-    def __init__(self, parent: tk.Misc, title: str, detail_lines: list[str]):
-        super().__init__(parent)
-        self._connected = False
-        frame = ttk.LabelFrame(self, text=title, padding=8)
-        frame.pack(fill="x")
-
-        self._kind_var = tk.StringVar(value="mock")
-        ttk.Radiobutton(frame, text="Mock", variable=self._kind_var, value="mock").grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(frame, text="Real", variable=self._kind_var, value="real").grid(row=0, column=1, sticky="w")
-
-        self._connect_button = ttk.Button(frame, text="Connect", command=self._on_connect)
-        self._connect_button.grid(row=1, column=0, pady=(6, 0))
-        self._disconnect_button = ttk.Button(frame, text="Disconnect", command=self._on_disconnect, state="disabled")
-        self._disconnect_button.grid(row=1, column=1, pady=(6, 0))
-
-        self._status_var = tk.StringVar(value="Not connected")
-        ttk.Label(frame, textvariable=self._status_var, foreground=PALETTE.fg_dim).grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(6, 0),
-        )
-        for line in detail_lines:
-            ttk.Label(frame, text=line, foreground=PALETTE.fg_dim).grid(
-                row=3 + detail_lines.index(line), column=0, columnspan=2, sticky="w",
-            )
-
-    def get_kind(self) -> str:
-        return self._kind_var.get()
-
-    def _on_connect(self) -> None:
-        self._connected = True
-        self._status_var.set(f"Connected ({self._kind_var.get()})")
-        self._status_var_color("ok")
-        self._connect_button.configure(state="disabled")
-        self._disconnect_button.configure(state="normal")
-
-    def _on_disconnect(self) -> None:
-        self._connected = False
-        self._status_var.set("Not connected")
-        self._connect_button.configure(state="normal")
-        self._disconnect_button.configure(state="disabled")
-
-    def _status_var_color(self, _kind: str) -> None:
-        pass  # placeholder hook -- real version would recolor the status label
-
-
 # -- Connection tab ---------------------------------------------------------------
 
 
 class ConnectionPanel(ttk.Frame):
-    """Mount connection is REAL -- this panel owns a real
-    am5.gui.worker.MountWorker (unchanged from the ISS tracker), talking
-    to either a MockMount or actual serial hardware exactly the way that
-    project's own ConnectionPanel does. Manual jog itself lives in a
-    separate floating window (spectro/gui/jog_window.py, owned by App,
-    same shown-not-destroyed pattern as the ISS tracker's own JogWindow)
-    rather than embedded here, so it's reachable from any tab -- see
+    """Mount AND camera connection are both REAL -- this panel owns a real
+    am5.gui.worker.MountWorker and a real camera.worker.CameraWorker
+    (unchanged from the ISS tracker), talking to either mock devices or
+    actual serial/USB hardware exactly the way that project's own
+    ConnectionPanel does. Manual jog itself lives in a separate floating
+    window (spectro/gui/jog_window.py, owned by App, same shown-not-
+    destroyed pattern as the ISS tracker's own JogWindow) rather than
+    embedded here, so it's reachable from any tab -- see
     on_connection_change, which App wires to that window's
-    set_connected(). Camera is still a pure visual mock (see
-    MockDeviceRow) -- real camera wiring hasn't been requested for this
-    app yet, only telescope movement."""
+    set_connected(). Connecting the camera here only opens the device
+    handle -- AcquisitionPanel/FlatsPanel/AlignmentPanel still generate
+    synthetic frames rather than reading live ones off it (see this
+    module's own docstring for why that's deliberately deferred)."""
 
     # Real Star Analyser groove densities -- keys double as the Grating
     # combobox's own values, so there's one source of truth for both.
@@ -421,10 +383,17 @@ class ConnectionPanel(ttk.Frame):
         "Star Analyser SA-200 (200 l/mm)": 200.0,
     }
 
-    def __init__(self, parent: tk.Misc, mount_worker: MountWorker, on_connection_change=None):
+    def __init__(
+        self, parent: tk.Misc, mount_worker: MountWorker, camera_worker: CameraWorker, on_connection_change=None,
+        live_camera_feed: LiveCameraFeed | None = None,
+    ):
         super().__init__(parent, padding=10)
         self._mount_worker = mount_worker
+        self._camera_worker = camera_worker
+        self._live_camera_feed = live_camera_feed
         self._on_connection_change = on_connection_change
+        self._mount_connected = False
+        self._camera_connected = False
         columns = ttk.Frame(self)
         columns.pack(fill="both", expand=True)
         left = ttk.Frame(columns)
@@ -433,8 +402,7 @@ class ConnectionPanel(ttk.Frame):
         right.pack(side="left", fill="both", expand=True, padx=(10, 0))
 
         self._build_mount_control(left)
-        self._camera_row = MockDeviceRow(left, "Camera (ASI290MC + Star Analyser)", ["Reuses camera/ -- unchanged"])
-        self._camera_row.pack(fill="x", pady=(10, 0))
+        self._build_camera_control(left)
 
         site_frame = ttk.LabelFrame(right, text="Observation site", padding=8)
         site_frame.pack(fill="x")
@@ -515,6 +483,18 @@ class ConnectionPanel(ttk.Frame):
         ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(2, 0))
         self._update_dispersion_label()
 
+    @staticmethod
+    def _set_radios_locked(radios: list[ttk.Radiobutton], locked: bool) -> None:
+        """Shared by the mount and camera Mock/Real(/Serial/TCP) radio
+        groups -- locked from the moment Connect is clicked (see
+        _on_mount_connect/_on_camera_connect) until disconnected or a
+        connect_error, so the kind var can't be flipped out from under an
+        in-flight or completed connection (see is_mock's own docstring
+        for why that would matter)."""
+        state = "disabled" if locked else "normal"
+        for radio in radios:
+            radio.configure(state=state)
+
     def _build_mount_control(self, parent: tk.Misc) -> None:
         frame = ttk.LabelFrame(parent, text="Mount (AM3/AM5)", padding=8)
         frame.pack(fill="x")
@@ -522,11 +502,14 @@ class ConnectionPanel(ttk.Frame):
         self._mount_kind_var = tk.StringVar(value="mock")
         self._mount_address_var = tk.StringVar(value="/dev/ttyACM0")
         self._mount_seed_var = tk.StringVar(value="")
+        self._mount_kind_radios: list[ttk.Radiobutton] = []
         for i, (label, value) in enumerate((("Mock", "mock"), ("Serial", "serial"), ("TCP", "tcp"))):
-            ttk.Radiobutton(
+            radio = ttk.Radiobutton(
                 frame, text=label, variable=self._mount_kind_var, value=value,
                 command=self._update_mount_address_state,
-            ).grid(row=0, column=i, sticky="w")
+            )
+            radio.grid(row=0, column=i, sticky="w")
+            self._mount_kind_radios.append(radio)
         self._mount_address_entry = ttk.Entry(frame, textvariable=self._mount_address_var, width=18)
         self._mount_address_entry.grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Label(frame, text="port / host:port", foreground=PALETTE.fg_dim).grid(
@@ -562,12 +545,102 @@ class ConnectionPanel(ttk.Frame):
             self._mount_status_var.set("Invalid site lat/lon")
             return
         self._mount_connect_button.configure(state="disabled")
+        # Locked from the click, not just once "connected" arrives -- a
+        # real serial/TCP connect can take a moment, and flipping the
+        # kind var during that window would have is_mock() read the NEW
+        # kind once "connected" fires even though the device that
+        # actually opened is whatever kind was selected at click time.
+        # Re-enabled on connect_error below (connection never happened)
+        # or on "disconnected" (see handle_mount_event).
+        self._set_radios_locked(self._mount_kind_radios, True)
         self._mount_status_var.set("Connecting...")
         self._mount_worker.connect(
             self._mount_kind_var.get(), address=self._mount_address_var.get(),
             mock_seed=int(seed_text) if seed_text else None,
             latitude_deg=latitude_deg, longitude_deg=longitude_deg,
         )
+
+    def _build_camera_control(self, parent: tk.Misc) -> None:
+        frame = ttk.LabelFrame(parent, text="Camera (ASI290MC + Star Analyser)", padding=8)
+        frame.pack(fill="x", pady=(10, 0))
+
+        self._camera_kind_var = tk.StringVar(value="mock")
+        self._camera_id_var = tk.StringVar(value="0")
+        self._camera_kind_radios: list[ttk.Radiobutton] = [
+            ttk.Radiobutton(frame, text="Mock", variable=self._camera_kind_var, value="mock"),
+            ttk.Radiobutton(frame, text="Real ASI camera", variable=self._camera_kind_var, value="real"),
+        ]
+        self._camera_kind_radios[0].grid(row=0, column=0, sticky="w")
+        self._camera_kind_radios[1].grid(row=0, column=1, sticky="w")
+        ttk.Label(frame, text="camera id", foreground=PALETTE.fg_dim).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Entry(frame, textvariable=self._camera_id_var, width=6).grid(row=1, column=1, sticky="w", pady=(4, 0))
+
+        self._camera_connect_button = ttk.Button(frame, text="Connect", command=self._on_camera_connect)
+        self._camera_connect_button.grid(row=2, column=0, pady=(8, 0))
+        self._camera_disconnect_button = ttk.Button(
+            frame, text="Disconnect", command=self._camera_worker.disconnect, state="disabled",
+        )
+        self._camera_disconnect_button.grid(row=2, column=1, pady=(8, 0))
+        self._camera_status_var = tk.StringVar(value="Not connected")
+        ttk.Label(frame, textvariable=self._camera_status_var, foreground=PALETTE.fg_dim).grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(6, 0),
+        )
+        ttk.Label(
+            frame, foreground=PALETTE.fg_dim, wraplength=280, justify="left",
+            text=(
+                "Real: Reference star/Target/Flats read live frames off this camera. Mock: they still "
+                "generate synthetic frames (see this module's docstring)."
+            ),
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+    def _on_camera_connect(self) -> None:
+        try:
+            camera_id = int(self._camera_id_var.get())
+        except ValueError:
+            self._camera_status_var.set("Invalid camera id")
+            return
+        self._camera_connect_button.configure(state="disabled")
+        # Locked from the click -- same race-window reasoning as the
+        # mount's own copy of this (see _on_mount_connect).
+        self._set_radios_locked(self._camera_kind_radios, True)
+        self._camera_status_var.set("Connecting...")
+        kind = self._camera_kind_var.get()
+        # Set BEFORE issuing connect -- the "connected" event payload
+        # itself carries no kind info (CameraWorker's mock backend
+        # connects exactly like a real one), so this is the only place
+        # that knows which was actually requested. See LiveCameraFeed.
+        # is_active, which reads this instead of `connected` alone.
+        if self._live_camera_feed is not None:
+            self._live_camera_feed.kind = kind
+        self._camera_worker.connect(
+            kind, camera_id=camera_id, plate_scale_arcsec_per_px=self.get_plate_scale_arcsec_per_px(),
+        )
+
+    def handle_camera_event(self, event: CameraEvent) -> None:
+        if event.kind == "connected":
+            self._camera_connected = True
+            colour = "colour" if event.payload["is_color"] else "mono"
+            self._camera_status_var.set(
+                f"Connected -- {event.payload['width']}x{event.payload['height']} {colour}, "
+                f"{event.payload.get('bit_depth', 8)}-bit",
+            )
+            # Already disabled from the click (see _on_camera_connect) --
+            # reasserted here too in case anything ever re-enables them
+            # out of band.
+            self._set_radios_locked(self._camera_kind_radios, True)
+            self._camera_disconnect_button.configure(state="normal")
+        elif event.kind == "connect_error":
+            self._camera_status_var.set(f"Connection failed: {event.payload['message']}")
+            self._camera_connect_button.configure(state="normal")
+            # Connection never actually happened -- undo the click-time
+            # lock so a different kind can be picked and retried.
+            self._set_radios_locked(self._camera_kind_radios, False)
+        elif event.kind == "disconnected":
+            self._camera_connected = False
+            self._camera_status_var.set("Not connected")
+            self._camera_connect_button.configure(state="normal")
+            self._camera_disconnect_button.configure(state="disabled")
+            self._set_radios_locked(self._camera_kind_radios, False)
 
     def get_site_lat_deg(self) -> float:
         return float(self._site_lat_var.get())
@@ -644,6 +717,25 @@ class ConnectionPanel(ttk.Frame):
             return None
         return width_px, height_px
 
+    def get_instrument_metadata(self) -> dict:
+        """Everything about the current optical/site/device setup worth
+        recording per session -- see Session.write_metadata, called once
+        from ReductionPanel._on_build_masters."""
+        return {
+            "grating": self._grating_var.get(),
+            "focal_length_mm": self._focal_length_var.get(),
+            "grating_to_sensor_distance_mm": self._grating_distance_var.get(),
+            "pixel_size_um": self._pixel_size_var.get(),
+            "sensor_dimensions_px": self.get_sensor_dimensions(),
+            "dispersion_a_per_px": self.get_dispersion_a_per_px(),
+            "plate_scale_arcsec_per_px": self.get_plate_scale_arcsec_per_px(),
+            "site_lat_deg": self._site_lat_var.get(),
+            "site_lon_deg": self._site_lon_var.get(),
+            "site_elevation_m": self._site_elevation_var.get(),
+            "mount_kind": self._mount_kind_var.get(),
+            "camera_kind": self._camera_kind_var.get(),
+        }
+
     def _update_dispersion_label(self) -> None:
         dispersion_a = self.get_dispersion_a_per_px()
         if dispersion_a is None:
@@ -659,28 +751,45 @@ class ConnectionPanel(ttk.Frame):
             self._plate_scale_label_var.set(f"Plate scale: {plate_scale:.2f} arcsec/px   FOV: {fov[0]:.1f} x {fov[1]:.1f} arcmin")
 
     def is_mock(self) -> bool:
-        """True if EITHER device is set to Mock -- used to refuse exports
-        meant for real submission (see SpectrumPanel's AVSpec export),
-        so a mock run can't produce a file that looks like a real
-        observation. Camera is always effectively mock right now (no real
-        CameraWorker exists yet, see this module's docstring), but the
-        radio button still reflects operator intent and is checked here
-        for when that changes."""
-        return self._mount_kind_var.get() == "mock" or self._camera_row.get_kind() == "mock"
+        """True unless BOTH mount and camera are set to Real AND actually,
+        currently connected -- used to refuse exports meant for real
+        submission (see SpectrumPanel's AVSpec export), so a synthetic run
+        can't produce a file that looks like a real observation. Requires
+        actual CONNECTION, not just the radio button selection, now that
+        AcquisitionPanel/FlatsPanel genuinely read live frames from the
+        camera once it's connected (see LiveCameraFeed/RealCaptureState)
+        -- selecting Real but not yet connecting must still count as mock.
+        Also checks the camera's own kind (not just "is something
+        connected"): CameraWorker's mock backend connects successfully
+        too (see _on_camera_connect), which must NOT count as real."""
+        mount_is_real = self._mount_kind_var.get() != "mock" and self._mount_connected
+        camera_is_real = self._camera_kind_var.get() == "real" and self._camera_connected
+        return not (mount_is_real and camera_is_real)
 
     def handle_mount_event(self, event: WorkerEvent) -> None:
         if event.kind == "connected":
+            self._mount_connected = True
             self._mount_status_var.set(f"Connected -- firmware {event.payload['firmware']}")
             self._mount_disconnect_button.configure(state="normal")
+            # Already disabled from the moment Connect was clicked (see
+            # _on_mount_connect) -- reasserted here too in case anything
+            # ever re-enables them out of band.
+            self._set_radios_locked(self._mount_kind_radios, True)
             if self._on_connection_change is not None:
                 self._on_connection_change(True)
         elif event.kind == "connect_error":
             self._mount_status_var.set(f"Connection failed: {event.payload['message']}")
             self._mount_connect_button.configure(state="normal")
+            # Connection never actually happened -- undo the click-time
+            # lock (see _on_mount_connect) so a different kind can be
+            # picked and retried.
+            self._set_radios_locked(self._mount_kind_radios, False)
         elif event.kind == "disconnected":
+            self._mount_connected = False
             self._mount_status_var.set("Not connected")
             self._mount_connect_button.configure(state="normal")
             self._mount_disconnect_button.configure(state="disabled")
+            self._set_radios_locked(self._mount_kind_radios, False)
             if self._on_connection_change is not None:
                 self._on_connection_change(False)
 
@@ -769,9 +878,10 @@ class AlignmentPanel(ttk.Frame):
     # tick is fine and still reads as a live feed rather than a photo.
     _LIVE_INTERVAL_MS = 800
 
-    def __init__(self, parent: tk.Misc, connection_panel: ConnectionPanel):
+    def __init__(self, parent: tk.Misc, connection_panel: ConnectionPanel, live_camera_feed: LiveCameraFeed | None = None):
         super().__init__(parent, padding=10)
         self._connection_panel = connection_panel
+        self._live_camera_feed = live_camera_feed
         self._mode: str | None = None  # None, "order0", or "trace"
         self._order0_xy: tuple[float, float] | None = None
         self._trace_points: tuple[tuple[float, float], tuple[float, float]] | None = None
@@ -788,6 +898,11 @@ class AlignmentPanel(ttk.Frame):
         # always has a real window to zoom from.
         self._view_xlim: tuple[float, float] | None = None
         self._view_ylim: tuple[float, float] | None = None
+        # Tracks the demo/real edge so _render_frame can clear stale
+        # marks/angle/zoom exactly once on the transition -- see its own
+        # comment for why a demo-measured angle must not silently survive
+        # into real captures.
+        self._live_mode_was_real = False
 
         ttk.Label(
             self, foreground=PALETTE.fg_dim, wraplength=1000, justify="left",
@@ -802,6 +917,9 @@ class AlignmentPanel(ttk.Frame):
             ),
         ).pack(anchor="w")
 
+        self._mode_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self._mode_var, foreground=PALETTE.fg_dim).pack(anchor="w", pady=(4, 0))
+
         button_row = ttk.Frame(self)
         button_row.pack(fill="x", pady=(8, 0))
         self._order0_button = ttk.Button(button_row, text="Mark order 0", command=self._on_toggle_order0_mode)
@@ -809,9 +927,10 @@ class AlignmentPanel(ttk.Frame):
         self._trace_button = ttk.Button(button_row, text="Draw trace", command=self._on_toggle_trace_mode)
         self._trace_button.pack(side="left", padx=(6, 0))
         ttk.Button(button_row, text="Reset", command=self._on_reset).pack(side="left", padx=(6, 0))
-        ttk.Button(button_row, text="New demo frame", command=self._on_new_demo_frame).pack(side="left", padx=(6, 0))
+        self._new_demo_button = ttk.Button(button_row, text="New demo frame", command=self._on_new_demo_frame)
+        self._new_demo_button.pack(side="left", padx=(6, 0))
 
-        frame_box = ttk.LabelFrame(self, text="Full-frame live view (demo star)", padding=8)
+        frame_box = ttk.LabelFrame(self, text="Full-frame live view", padding=8)
         frame_box.pack(fill="both", expand=True, pady=(8, 0))
         self._figure = Figure(figsize=(9, 3.3), dpi=100)
         self._figure.patch.set_facecolor(PALETTE.bg)
@@ -829,7 +948,12 @@ class AlignmentPanel(ttk.Frame):
         self._on_new_demo_frame()
         self._live_tick()
 
+    def _is_real(self) -> bool:
+        return self._live_camera_feed is not None and self._live_camera_feed.is_active
+
     def _on_new_demo_frame(self) -> None:
+        if self._is_real():
+            return  # no "demo" concept once a real camera is live -- button is disabled too, see _update_status
         rng = np.random.default_rng()  # genuinely random each click -- a fresh practice tilt, not reproducible on purpose
         dims = self._connection_panel.get_sensor_dimensions() if self._connection_panel is not None else None
         width, height = dims if dims is not None else (1936, 1096)
@@ -848,19 +972,45 @@ class AlignmentPanel(ttk.Frame):
         self._render_frame()
 
     def _render_frame(self, frame_seed: int | None = None) -> None:
-        self._last_frame = _synthetic_full_frame(
-            seed=self._DEMO_SEED, sensor_width=self._sensor_width, sensor_height=self._sensor_height,
-            star_xy=self._demo_star_xy, angle_deg=self._demo_true_angle_deg, brightness_scale=1.3,
-            frame_seed=frame_seed,
-        )
+        if self._is_real():
+            # Real frame from the connected camera (see LiveCameraFeed) --
+            # None until the first preview_frame event arrives, in which
+            # case there's nothing new to draw yet this tick.
+            feed = self._live_camera_feed
+            if feed.last_frame is None:
+                return
+            self._last_frame = feed.last_frame
+            self._sensor_width, self._sensor_height = feed.width, feed.height
+        else:
+            self._last_frame = _synthetic_full_frame(
+                seed=self._DEMO_SEED, sensor_width=self._sensor_width, sensor_height=self._sensor_height,
+                star_xy=self._demo_star_xy, angle_deg=self._demo_true_angle_deg, brightness_scale=1.3,
+                frame_seed=frame_seed,
+            )
         self._redraw_current()
 
     def _live_tick(self) -> None:
+        # Demo -> real edge checked EVERY tick, regardless of tab
+        # visibility below -- a demo-measured angle/order0/trace must not
+        # silently survive into real mode. get_trail_angle_deg() is read
+        # unconditionally by both AcquisitionPanel and ReductionPanel, so
+        # if this were gated behind winfo_ismapped() (like the redraw
+        # below legitimately is), connecting the real camera while never
+        # revisiting this tab would leave a stale demo angle baked into
+        # REAL captured frames' straightening. The stale zoom window
+        # (sized for the demo's sensor dims) is cleared too.
+        is_real_now = self._is_real()
+        if is_real_now and not self._live_mode_was_real:
+            self._clear_marks()
+            self._view_xlim = None
+            self._view_ylim = None
+        self._live_mode_was_real = is_real_now
         # Same self-paced idiom as AcquisitionPanel/FlatsPanel's own
-        # _live_tick -- only redraws while the tab is actually visible, and
-        # only the noise draw changes (star position/angle/marks/zoom are
-        # untouched), so this looks like a live noisy feed rather than
-        # generating a new practice frame on every tick.
+        # _live_tick -- only redraws while the tab is actually visible.
+        # In demo mode only the noise draw changes (star position/angle/
+        # marks/zoom are untouched); in real mode this just picks up
+        # whatever LiveCameraFeed currently holds (itself updated at
+        # ~10Hz by App._pump_events, independent of this slower tick).
         if self.winfo_ismapped():
             self._live_frame_count += 1
             self._render_frame(frame_seed=self._DEMO_SEED * 100_003 + self._live_frame_count)
@@ -942,14 +1092,23 @@ class AlignmentPanel(ttk.Frame):
         self._ax.set_ylim(*self._view_ylim)
         self._canvas.draw_idle()
 
-    def _on_reset(self) -> None:
+    def _clear_marks(self) -> None:
         self._order0_xy = None
         self._trace_points = None
         self._measured_angle_deg = None
         self._mode = None
+
+    def _on_reset(self) -> None:
+        self._clear_marks()
         self._redraw_current()
 
     def _update_status(self) -> None:
+        if self._is_real():
+            self._mode_var.set("Mode: LIVE -- real camera connected (Connection tab).")
+            self._new_demo_button.configure(state="disabled")
+        else:
+            self._mode_var.set("Mode: demo/practice -- a synthetic star, since no real camera is connected.")
+            self._new_demo_button.configure(state="normal")
         # ✅/⬜ prefixes match the same convention AcquisitionPanel/
         # FlatsPanel use for their own session-status labels -- a glance
         # at the leading icon says "done" or "not yet" before reading any
@@ -1378,7 +1537,8 @@ class AcquisitionPanel(ttk.Frame):
     def __init__(
         self, parent: tk.Misc, role: str, seed: int, get_star, get_spectrum=None,
         mount_worker: MountWorker | None = None, connection_panel: ConnectionPanel | None = None,
-        alignment_panel: AlignmentPanel | None = None,
+        alignment_panel: AlignmentPanel | None = None, live_camera_feed: LiveCameraFeed | None = None,
+        camera_worker: CameraWorker | None = None,
     ):
         super().__init__(parent, padding=10)
         self._role = role  # "reference" or "target"
@@ -1389,6 +1549,8 @@ class AcquisitionPanel(ttk.Frame):
         self._mount_worker = mount_worker
         self._connection_panel = connection_panel
         self._alignment_panel = alignment_panel
+        self._live_camera_feed = live_camera_feed
+        self._camera_worker = camera_worker
         self._mount_connected = False
         self._goto_pending = False
         self._goto_target_ra_deg: float | None = None
@@ -1399,7 +1561,11 @@ class AcquisitionPanel(ttk.Frame):
         # Real captured frames (not just counters) -- what the Reduction
         # tab actually stacks/calibrates, see get_science_frames() etc.
         # below and spectro/reduction.py for the pipeline that consumes
-        # them.
+        # them. Populated either by the synthetic generator (mock) or,
+        # frame by frame as they arrive, by RealCaptureState.consume
+        # (real camera, see self._real_capture) -- either way this is
+        # the single list Reduction
+        # reads from, so it doesn't need to know which one happened.
         self._science_frames: list[np.ndarray] = []
         self._dark_frames: list[np.ndarray] = []
         self._offset_frames: list[np.ndarray] = []
@@ -1411,6 +1577,10 @@ class AcquisitionPanel(ttk.Frame):
         # scroll-to-zoom idiom as AlignmentPanel (see _zoomed_view).
         self._full_frame_view_xlim: tuple[float, float] | None = None
         self._full_frame_view_ylim: tuple[float, float] | None = None
+        # Real-camera capture is asynchronous -- see RealCaptureState's own
+        # docstring for why (frames only arrive at ~10Hz, unlike the
+        # instant synthetic generator).
+        self._real_capture = RealCaptureState(live_camera_feed) if live_camera_feed is not None else None
 
         # Simulates imperfect GOTO pointing: the star doesn't land dead
         # center in the frame in real life -- where in the FULL sensor it
@@ -1550,6 +1720,10 @@ class AcquisitionPanel(ttk.Frame):
         self._hist_canvas.get_tk_widget().pack(anchor="w")
 
         self._live_frame_count = 0
+        # See TabResyncTracker's own docstring -- pushes this panel's own
+        # exposure/gain to the (shared) real camera on the right edges,
+        # never while a capture is running anywhere.
+        self._resync_tracker = TabResyncTracker()
         self._update_order0_status()
         self._on_settings_changed()
         self._refresh_header()
@@ -1567,6 +1741,14 @@ class AcquisitionPanel(ttk.Frame):
             return
         if not self._mount_connected:
             self._goto_status_var.set("Mount not connected -- connect it in the Connection tab first.")
+            return
+        if self._real_capture is not None and self._real_capture.active:
+            # A real capture crops each incoming frame around
+            # self._order0_full_xy (see RealCaptureState.consume's
+            # crop_fn) -- nulling it out from under an in-progress
+            # capture would crash the next tick (extract_aligned_crop on
+            # a None order0) and leave the capture stuck forever.
+            self._goto_status_var.set("A capture is still in progress -- wait for it to finish before GOTO.")
             return
         star = self._get_star()
         if star is None:
@@ -1615,29 +1797,62 @@ class AcquisitionPanel(ttk.Frame):
             else:
                 self._goto_status_var.set(f"Slewing... {separation_deg:.2f}° from target")
 
+    def _is_real(self) -> bool:
+        return self._live_camera_feed is not None and self._live_camera_feed.is_active
+
     def _exposure_ms(self) -> float:
-        return 10.0 + self._exposure_var.get() * 20.0  # 10-2010ms -- display/model only, not wired to a real camera
+        return 10.0 + self._exposure_var.get() * 20.0  # 10-2010ms -- display/model only, mock path
 
     def _gain_value(self) -> int:
         return round(self._gain_var.get() * 5.7)  # 0-570, matches this project's mock camera range
 
     def _on_settings_changed(self, _value: str | None = None) -> None:
-        self._exposure_label_var.set(format_exposure_us(self._exposure_ms() * 1000.0))
-        self._gain_label_var.set(str(self._gain_value()))
+        if self._is_real():
+            exposure_us = self._live_camera_feed.slider_to_exposure_us(self._exposure_var.get())
+            gain = self._live_camera_feed.slider_to_gain(self._gain_var.get())
+            self._exposure_label_var.set(format_exposure_us(exposure_us))
+            self._gain_label_var.set(str(gain))
+            if self._camera_worker is not None:
+                self._camera_worker.set_exposure_us(round(exposure_us))
+                self._camera_worker.set_gain(gain)
+        else:
+            self._exposure_label_var.set(format_exposure_us(self._exposure_ms() * 1000.0))
+            self._gain_label_var.set(str(self._gain_value()))
         self._dark_hint_var.set(f"Matches current settings: {self._exposure_label_var.get()}, gain {self._gain_label_var.get()}")
         self._offset_hint_var.set(f"Minimum exposure, gain {self._gain_label_var.get()} -- exposure length doesn't matter for bias")
         self._render_local_patch(frame_seed=None)
 
     def _live_tick(self) -> None:
+        # Real-capture consumption runs regardless of tab visibility --
+        # unlike the redraws below (purely cosmetic, fine to skip while
+        # not looking at this tab), an in-progress capture must keep
+        # collecting frames even if the operator switches to another tab
+        # mid-capture, same as the synthetic capture path (which finishes
+        # instantly and was never visibility-gated either).
+        if self._real_capture is not None:
+            self._real_capture.consume()
         # Redraws the LOCAL patch (not the full-frame view -- see this
-        # class's own docstring for why that one is on-demand only) with
-        # a fresh noise/jitter draw every _LIVE_INTERVAL_MS, independent
-        # of any control move -- see _synthetic_trail_image's docstring
-        # for why this is what actually reads as "live" rather than a
-        # plot that only ever changes when you touch a control.
+        # class's own docstring for why that one is on-demand only IN
+        # MOCK MODE, where synthesizing a full 1936x1096 frame costs
+        # ~200ms, see _synthetic_full_frame's own docstring) with a fresh
+        # noise/jitter draw every _LIVE_INTERVAL_MS, independent of any
+        # control move -- see _synthetic_trail_image's docstring for why
+        # this is what actually reads as "live" rather than a plot that
+        # only ever changes when you touch a control. In REAL mode the
+        # full-frame view is cheap to refresh too (just redrawing whatever
+        # LiveCameraFeed already decoded, no generation cost), so it
+        # live-updates here as well, unlike the mock's on-demand-only
+        # full-frame view.
+        is_real_now = self._is_real()
+        active_count = self._live_camera_feed.active_capture_count if self._live_camera_feed is not None else 0
+        if self._resync_tracker.update(self.winfo_ismapped(), is_real_now, active_count):
+            self._on_settings_changed()
         if self.winfo_ismapped():
             self._live_frame_count += 1
+            if is_real_now:
+                self._refresh_full_frame()
             self._render_local_patch(frame_seed=self._seed * 100_003 + self._live_frame_count)
+            self._update_order0_status()
             self._stats_var.set(f"fps: {1000.0 / _LIVE_INTERVAL_MS:.1f}   frames: {self._live_frame_count}")
         self.after(_LIVE_INTERVAL_MS, self._live_tick)
 
@@ -1677,6 +1892,17 @@ class AcquisitionPanel(ttk.Frame):
         return width / 2.0 + self._true_pan_x, height / 2.0 + self._true_pan_y
 
     def _refresh_full_frame(self) -> None:
+        if self._is_real():
+            # The real camera's own preview stream (see LiveCameraFeed) --
+            # nothing to do yet if no frame has arrived since connecting;
+            # the next tick of whatever called this (e.g. _live_tick, or
+            # App's own periodic pump) will pick it up once one does.
+            last_frame = self._live_camera_feed.last_frame
+            if last_frame is None:
+                return
+            self._last_full_frame = last_frame
+            self._redraw_full_frame()
+            return
         dimensions = self._connection_panel.get_sensor_dimensions() if self._connection_panel is not None else None
         width, height = dimensions if dimensions is not None else (1936, 1096)
         brightness, spectrum = self._current_capture_params()
@@ -1729,12 +1955,22 @@ class AcquisitionPanel(ttk.Frame):
         self._full_frame_canvas.draw_idle()
 
     def _on_toggle_mark_mode(self) -> None:
+        if not self._mark_mode and self._real_capture is not None and self._real_capture.active:
+            # Re-marking mid-capture would silently mix crop anchors
+            # within one batch -- frames collected before and after the
+            # re-mark would be stacked together as if pixel-aligned, with
+            # no error (see RealCaptureState.consume's crop_fn, which
+            # re-reads self._order0_full_xy fresh on every tick).
+            self._order0_status_var.set("⚠ A capture is still in progress -- wait for it to finish before re-marking order 0.")
+            return
         self._mark_mode = not self._mark_mode
         self._mark_button.configure(text="Click the star above..." if self._mark_mode else "Mark order 0")
 
     def _on_full_frame_click(self, event: object) -> None:
         if not self._mark_mode or event.xdata is None or event.ydata is None:  # type: ignore[attr-defined]
             return
+        if self._real_capture is not None and self._real_capture.active:
+            return  # same guard as _on_toggle_mark_mode -- shouldn't be reachable, but don't mark if it is
         self._order0_full_xy = (event.xdata, event.ydata)  # type: ignore[attr-defined]
         self._mark_mode = False
         self._mark_button.configure(text="Mark order 0")
@@ -1743,34 +1979,54 @@ class AcquisitionPanel(ttk.Frame):
         self._on_settings_changed()  # the local patch is only meaningful from here on -- refresh it now
 
     def _update_order0_status(self) -> None:
+        mode_note = "LIVE, real camera. " if self._is_real() else "Mock/synthetic. "
         if self._order0_full_xy is None:
             self._order0_status_var.set(
-                "Not marked yet -- click \"Mark order 0\", then click the star in the frame above.",
+                mode_note + "Not marked yet -- click \"Mark order 0\", then click the star in the frame above.",
             )
         else:
             x, y = self._order0_full_xy
-            self._order0_status_var.set(f"Order 0 marked at ({x:.0f}, {y:.0f}) px.")
+            self._order0_status_var.set(f"{mode_note}Order 0 marked at ({x:.0f}, {y:.0f}) px.")
 
     def _render_local_patch(self, frame_seed: int | None) -> None:
         if self._order0_full_xy is None:
             self._clear_local_patch()
             return
-        brightness, spectrum = self._current_capture_params()
         dispersion_a = self._current_dispersion_a()
-        # angle_deg=0.0, NOT self._current_angle_deg() -- this preview
-        # exists to judge exposure/gain from the extraction band + profile
-        # below (_draw_extraction_band/_draw_profile), both of which
-        # assume a horizontal trail (same TRAIL_ROW spectro/reduction.py
-        # uses). Showing it already straightened previews what the
-        # operator will actually get after ReductionPanel's own
-        # extract_aligned_crop step, rather than a tilted trail crossing a
-        # horizontal band that would misjudge SNR. The captured frames
-        # themselves (_on_capture_science etc.) still use the real
-        # measured angle -- only this display is straightened.
-        image = _synthetic_trail_image(
-            seed=self._seed, brightness_scale=brightness, spectrum=spectrum, frame_seed=frame_seed,
-            dispersion_a=dispersion_a, angle_deg=0.0,
-        )
+        if self._is_real():
+            full_frame = self._live_camera_feed.last_frame
+            if full_frame is None:
+                self._clear_local_patch()
+                return
+            # Crops around order0 AND straightens by the real measured
+            # angle (extract_aligned_crop derotates BY angle_deg, unlike
+            # the synthetic generator below where angle_deg=0.0 means
+            # "paint it already straight") -- same reasoning as the mock
+            # branch's own comment: the extraction band/profile below
+            # assume a horizontal trail, so this previews what the
+            # operator gets after ReductionPanel's own correction step,
+            # not the real (still tilted) raw view. The captured frames
+            # themselves (_on_capture_science etc., via RealCaptureState)
+            # crop WITHOUT derotating -- tilt preserved, corrected once
+            # during Reduction, not per frame -- see those methods' own
+            # comments.
+            image = extract_aligned_crop(full_frame, self._order0_full_xy, self._current_angle_deg())
+        else:
+            brightness, spectrum = self._current_capture_params()
+            # angle_deg=0.0, NOT self._current_angle_deg() -- this preview
+            # exists to judge exposure/gain from the extraction band + profile
+            # below (_draw_extraction_band/_draw_profile), both of which
+            # assume a horizontal trail (same TRAIL_ROW spectro/reduction.py
+            # uses). Showing it already straightened previews what the
+            # operator will actually get after ReductionPanel's own
+            # extract_aligned_crop step, rather than a tilted trail crossing a
+            # horizontal band that would misjudge SNR. The captured frames
+            # themselves (_on_capture_science etc.) still use the real
+            # measured angle -- only this display is straightened.
+            image = _synthetic_trail_image(
+                seed=self._seed, brightness_scale=brightness, spectrum=spectrum, frame_seed=frame_seed,
+                dispersion_a=dispersion_a, angle_deg=0.0,
+            )
         self._preview_ax.clear()
         self._preview_ax.imshow(image, cmap="inferno", aspect="auto")
         _draw_extraction_band(self._preview_ax, image.shape[1])
@@ -1814,6 +2070,22 @@ class AcquisitionPanel(ttk.Frame):
         # improves SNR over a single frame, same reason darks/offset are
         # already batched.
         n = max(1, self._science_frames_var.get())
+        if self._is_real():
+            def finalize() -> None:
+                self._science_count += n
+                self._science_var.set(f"✅ {self._title} spectrum ({self._science_count} frames)")
+            # Cropped around order0 but NOT derotated (angle_deg=0.0,
+            # unlike the live-preview branch in _render_local_patch) --
+            # the real tilt is preserved here, corrected once during
+            # Reduction, not per captured frame, same "correct once, not
+            # per-frame" design the synthetic path below already follows.
+            started = self._real_capture.start(
+                self._science_frames, n, self._science_var, f"{self._title.lower()} spectrum",
+                lambda frame: extract_aligned_crop(frame, self._order0_full_xy, 0.0), finalize,
+            )
+            if not started:
+                self._science_var.set("⚠ A capture is already in progress -- wait for it to finish.")
+            return
         brightness, spectrum = self._current_capture_params()
         dispersion_a = self._current_dispersion_a()
         angle_deg = self._current_angle_deg()
@@ -1827,6 +2099,25 @@ class AcquisitionPanel(ttk.Frame):
         self._science_var.set(f"✅ {self._title} spectrum ({self._science_count} frames)")
 
     def _on_capture_dark(self) -> None:
+        if self._is_real():
+            # Real darks still need cropping around order0 (so they align
+            # pixel-for-pixel with science for the science-dark subtraction
+            # in spectro/reduction.py's calibrate_science) -- unlike the
+            # synthetic path below, where an include_signal=False patch is
+            # position-independent uniform noise.
+            if self._order0_full_xy is None:
+                self._dark_var.set("⚠ Mark order 0 in the full-frame view above first.")
+                return
+            def finalize() -> None:
+                self._dark_count += 20
+                self._dark_var.set(f"✅ Darks ({self._dark_count} frames)")
+            started = self._real_capture.start(
+                self._dark_frames, 20, self._dark_var, "darks",
+                lambda frame: extract_aligned_crop(frame, self._order0_full_xy, 0.0), finalize,
+            )
+            if not started:
+                self._dark_var.set("⚠ A capture is already in progress -- wait for it to finish.")
+            return
         # No star signal at all (cap on) -- brightness_scale/angle are
         # irrelevant here since include_signal=False skips the only
         # things they'd have affected.
@@ -1837,6 +2128,47 @@ class AcquisitionPanel(ttk.Frame):
         self._dark_var.set(f"✅ Darks ({self._dark_count} frames)")
 
     def _on_capture_offset(self) -> None:
+        if self._is_real():
+            if self._order0_full_xy is None:
+                self._offset_var.set("⚠ Mark order 0 in the full-frame view above first.")
+                return
+            # previous_exposure_us is just a read (slider_to_exposure_us),
+            # not a hardware write -- safe to compute before knowing
+            # whether start() will actually arm the capture.
+            previous_exposure_us = self._live_camera_feed.slider_to_exposure_us(self._exposure_var.get())
+            def restore_exposure() -> None:
+                if self._camera_worker is not None:
+                    self._camera_worker.set_exposure_us(round(previous_exposure_us))
+            def finalize() -> None:
+                self._offset_count += 20
+                self._offset_var.set(f"✅ Offset/bias ({self._offset_count} frames)")
+                restore_exposure()
+            # Same started-bool pattern as science/dark/flats (RealCaptureState.
+            # start() already refuses if a capture is active) -- letting it be
+            # the single guard means minimum exposure is only ever forced
+            # below once a capture actually armed, not wasted on a refusal.
+            started = self._real_capture.start(
+                self._offset_frames, 20, self._offset_var, "offset/bias",
+                lambda frame: extract_aligned_crop(frame, self._order0_full_xy, 0.0), finalize,
+                on_abort=restore_exposure,
+            )
+            if not started:
+                self._offset_var.set("⚠ A capture is already in progress -- wait for it to finish.")
+                return
+            # Minimum exposure for a real bias/offset frame -- matches the
+            # hint text below ("exposure length doesn't matter for bias").
+            # Gain is left as-is (bias level depends mostly on gain, not
+            # exposure -- same assumption calibrate_science's own
+            # docstring already documents for the flat-bias approximation).
+            # The PREVIOUS (slider-implied) exposure is restored either
+            # way (finalize on success, on_abort if the camera disconnects
+            # mid-capture) -- without this, a science/dark capture right
+            # after would silently run at minimum exposure instead of what
+            # the UI still shows.
+            min_exposure_us, _ = self._live_camera_feed.get_control_range("Exposure", 32.0, 2_000_000_000.0)
+            if self._camera_worker is not None:
+                self._camera_worker.set_exposure_us(round(min_exposure_us))
+            return
         for _ in range(20):
             frame = _synthetic_trail_image(seed=self._seed, frame_seed=self._next_capture_seed(), include_signal=False)
             self._offset_frames.append(frame)
@@ -1852,6 +2184,13 @@ class AcquisitionPanel(ttk.Frame):
     def get_offset_frames(self) -> list[np.ndarray]:
         return self._offset_frames
 
+    def get_order0_full_xy(self) -> tuple[float, float] | None:
+        """Where THIS star's order0 was marked in full-sensor coordinates
+        -- used by ReductionPanel to crop a full-frame master flat (real
+        mode) to the same sensor region this panel's own science/dark/
+        offset frames were cropped from, see _flat_for_calibration."""
+        return self._order0_full_xy
+
 
 # -- Flats tab ---------------------------------------------------------------
 
@@ -1864,14 +2203,28 @@ class FlatsPanel(ttk.Frame):
     tuned so the histogram peak sits at ~2/3 of full well -- doing that
     from a plain "Capture 20" button with no live feedback (the previous
     single Calibration tab) isn't actually usable in practice, hence the
-    live preview + histogram here."""
+    live preview + histogram here.
 
-    def __init__(self, parent: tk.Misc):
+    Real-mode capture stores the FULL, uncropped sensor frame -- flats
+    have no star/order0 of their own to align to (taken against blank
+    twilight sky/panel), and reference/target stars can land at
+    different order0 positions on different GOTOs, so a single flat
+    fixed-cropped at capture time could never be pixel-aligned with both.
+    Instead each science/dark frame's own order0 crops the SAME master
+    flat again, freshly, at calibration time -- see ReductionPanel.
+    _flat_for_calibration -- so the flat that gets divided into a given
+    star's science frame always comes from the physically-correct sensor
+    region for THAT star, not a generic frame-center guess."""
+
+    def __init__(self, parent: tk.Misc, live_camera_feed: LiveCameraFeed | None = None, camera_worker: CameraWorker | None = None):
         super().__init__(parent, padding=10)
         self._flat_count = 0
         self._flat_frames: list[np.ndarray] = []
         self._master_flat: np.ndarray | None = None
         self._capture_seed_counter = 0
+        self._live_camera_feed = live_camera_feed
+        self._camera_worker = camera_worker
+        self._real_capture = RealCaptureState(live_camera_feed) if live_camera_feed is not None else None
 
         ttk.Label(
             self, foreground=PALETTE.fg_dim, wraplength=800, justify="left",
@@ -1927,24 +2280,53 @@ class FlatsPanel(ttk.Frame):
         )
 
         self._live_frame_count = 0
+        # See TabResyncTracker's own docstring, and AcquisitionPanel's
+        # copy of this -- resyncs this tab's own exposure to the shared
+        # real camera on the right edges, never mid-capture.
+        self._resync_tracker = TabResyncTracker()
         self._on_settings_changed()
         self._live_tick()
 
+    def _is_real(self) -> bool:
+        return self._live_camera_feed is not None and self._live_camera_feed.is_active
+
+    def _crop_from_center(self, full_frame: np.ndarray) -> np.ndarray:
+        height, width = full_frame.shape
+        return extract_aligned_crop(full_frame, (width / 2.0, height / 2.0), 0.0)
+
     def _on_settings_changed(self, _value: str | None = None) -> None:
+        if self._is_real() and self._camera_worker is not None:
+            self._camera_worker.set_exposure_us(round(self._live_camera_feed.slider_to_exposure_us(self._exposure_var.get())))
         self._render_frame(frame_seed=None)
 
     def _live_tick(self) -> None:
+        # Real-capture consumption runs regardless of tab visibility, same
+        # reasoning as AcquisitionPanel._live_tick's own copy of this --
+        # an in-progress capture must keep collecting frames even if the
+        # operator switches to another tab mid-capture.
+        if self._real_capture is not None:
+            self._real_capture.consume()
         # Same self-paced idiom as AcquisitionPanel._live_tick -- see its
         # docstring for why a periodic redraw (not just on slider moves)
         # is what actually reads as a live feed.
+        is_real_now = self._is_real()
+        active_count = self._live_camera_feed.active_capture_count if self._live_camera_feed is not None else 0
+        if self._resync_tracker.update(self.winfo_ismapped(), is_real_now, active_count):
+            self._on_settings_changed()
         if self.winfo_ismapped():
             self._live_frame_count += 1
             self._render_frame(frame_seed=3 * 100_003 + self._live_frame_count)
         self.after(_LIVE_INTERVAL_MS, self._live_tick)
 
     def _render_frame(self, frame_seed: int | None) -> None:
-        brightness_pct = self._exposure_var.get()
-        image = _synthetic_flat_image(seed=3, brightness_pct=brightness_pct, frame_seed=frame_seed)
+        if self._is_real():
+            full_frame = self._live_camera_feed.last_frame
+            if full_frame is None:
+                return
+            image = self._crop_from_center(full_frame)
+        else:
+            brightness_pct = self._exposure_var.get()
+            image = _synthetic_flat_image(seed=3, brightness_pct=brightness_pct, frame_seed=frame_seed)
         peak_pct = float(image.mean()) / 255.0 * 100.0
         note = "-- good" if 60.0 <= peak_pct <= 73.0 else ("-- too dim" if peak_pct < 60.0 else "-- too bright")
         self._level_var.set(f"{peak_pct:.0f}% {note}")
@@ -1958,7 +2340,39 @@ class FlatsPanel(ttk.Frame):
         _draw_histogram(self._hist_ax, self._hist_figure, image)
         self._hist_canvas.draw()
 
+    def _expected_flat_shape(self) -> tuple[int, int]:
+        if self._is_real():
+            return self._live_camera_feed.height, self._live_camera_feed.width
+        return 90, 420
+
     def _on_capture(self) -> None:
+        expected_shape = self._expected_flat_shape()
+        if self._flat_frames and self._flat_frames[0].shape != expected_shape:
+            # Switched mock<->real (or reconnected to a differently-sized
+            # real camera) since the last capture -- those old frames are
+            # a different shape/physical sensor region and can't be
+            # stacked with new ones (np.stack in stack_frames requires
+            # uniform shapes), so start this batch fresh rather than let
+            # "Build master flat" crash with an unhandled ValueError.
+            self._flat_frames = []
+            self._flat_count = 0
+            self._flat_var.set("⬜ Flats (0 frames) -- previous flats discarded (camera mode/size changed)")
+        if self._is_real():
+            def finalize() -> None:
+                self._flat_count += 20
+                self._flat_var.set(f"✅ Flats ({self._flat_count} frames)")
+            # Stores the FULL frame, uncropped (crop_fn is identity) --
+            # NOT _crop_from_center. A flat corrects per-pixel sensor
+            # sensitivity, so it must be cropped to match wherever a
+            # given science/dark frame's own order0 landed at calibration
+            # time (see ReductionPanel._flat_for_calibration), not to a
+            # fixed frame-center window that would silently misalign with
+            # order0 the moment it isn't literally at the sensor's
+            # center -- the normal case once a real GOTO is involved.
+            started = self._real_capture.start(self._flat_frames, 20, self._flat_var, "flats", lambda frame: frame, finalize)
+            if not started:
+                self._flat_var.set("⚠ A capture is already in progress -- wait for it to finish.")
+            return
         brightness_pct = self._exposure_var.get()
         for _ in range(20):
             self._capture_seed_counter += 1
@@ -2013,7 +2427,7 @@ class ReductionPanel(ttk.Frame):
     def __init__(
         self, parent: tk.Misc, reference_panel: AcquisitionPanel, target_capture_panel: AcquisitionPanel,
         flats_panel: FlatsPanel, target_panel: TargetPanel, connection_panel: ConnectionPanel,
-        alignment_panel: AlignmentPanel,
+        alignment_panel: AlignmentPanel, session: Session,
     ):
         super().__init__(parent, padding=10)
         self._reference_panel = reference_panel
@@ -2022,6 +2436,7 @@ class ReductionPanel(ttk.Frame):
         self._target_panel = target_panel
         self._connection_panel = connection_panel
         self._alignment_panel = alignment_panel
+        self._session = session
 
         self._reference_master_dark: np.ndarray | None = None
         self._reference_master_offset: np.ndarray | None = None
@@ -2085,8 +2500,51 @@ class ReductionPanel(ttk.Frame):
         var.set(message)
         label.configure(foreground=PALETTE.accent_ok if ok else PALETTE.accent_warn)
 
+    def _flat_for_calibration(
+        self, master_flat: np.ndarray, science_shape: tuple[int, int], order0_xy: tuple[float, float] | None,
+    ) -> np.ndarray:
+        """The flat to actually divide into THIS star's science/dark
+        stack -- as-is if it's already the same local-patch shape (mock
+        mode, or an already-matching real flat), or freshly cropped
+        around this star's own order0 if it's a full sensor frame (real
+        mode -- see FlatsPanel's own docstring for why flats are now
+        stored uncropped: a single fixed crop couldn't be pixel-aligned
+        with both the reference and target panels' own, potentially
+        different, order0 positions at once)."""
+        if master_flat.shape == science_shape:
+            return master_flat
+        if order0_xy is None:
+            raise ReductionError(
+                "the master flat is a full sensor frame but this star has no order0 marked -- "
+                "can't align them (mark order 0 in its Reference star/Target tab first)",
+            )
+        return extract_aligned_crop(master_flat, order0_xy, 0.0, crop_shape=science_shape)
+
     def _on_build_masters(self) -> None:
-        lines = []
+        # Both stars are normally already chosen by the time masters are
+        # built (captures happen first) -- this is where the session
+        # folder gets created and named, see Session.ensure's own
+        # docstring for why here rather than at the very first capture.
+        reference_star = self._target_panel.get_reference_star()
+        target_star = self._target_panel.get_target_star()
+        session_dir = self._session.ensure(
+            reference_star.name if reference_star is not None else None,
+            target_star.name if target_star is not None else None,
+        )
+
+        def _star_info(star) -> dict:
+            if star is None:
+                return {"name": None}
+            return {"name": star.name, "ra_deg": star.ra_deg, "dec_deg": star.dec_deg, "vmag": star.vmag}
+
+        self._session.write_metadata({
+            "reference_star": _star_info(reference_star),
+            "target_star": _star_info(target_star),
+            "trail_angle_deg": self._alignment_panel.get_trail_angle_deg(),
+            "instrument": self._connection_panel.get_instrument_metadata(),
+        })
+
+        lines = [f"Session folder: {session_dir}"]
         ok = True
         for label, panel in (("Reference", self._reference_panel), ("Target", self._target_capture_panel)):
             darks = panel.get_dark_frames()
@@ -2101,6 +2559,10 @@ class ReductionPanel(ttk.Frame):
                 self._reference_master_dark, self._reference_master_offset = master_dark, master_offset
             else:
                 self._target_master_dark, self._target_master_offset = master_dark, master_offset
+            self._session.save_fits(f"{label.lower()}_master_dark.fits", master_dark)
+            self._session.save_fits(f"{label.lower()}_master_offset.fits", master_offset)
+            self._session.save_fits_cube(f"{label.lower()}_dark_raw.fits", darks)
+            self._session.save_fits_cube(f"{label.lower()}_offset_raw.fits", offsets)
             lines.append(
                 f"{label}: {len(darks)} darks + {len(offsets)} offset frames stacked "
                 f"(bias level ~{master_offset.mean():.1f} ADU).",
@@ -2110,6 +2572,8 @@ class ReductionPanel(ttk.Frame):
             lines.append("Flats: build a master flat in the Flats tab first.")
             ok = False
         else:
+            self._session.save_fits("master_flat.fits", master_flat)
+            self._session.save_fits_cube("flats_raw.fits", self._flats_panel.get_flat_frames())
             lines.append(f"Flats: master flat ready (mean {master_flat.mean():.1f} ADU).")
         self._set_status(self._step1_status_label, self._step1_status_var, "\n".join(lines), ok)
 
@@ -2153,7 +2617,8 @@ class ReductionPanel(ttk.Frame):
             return
         stack = stack_frames(science)
         try:
-            calibrated = calibrate_science(stack, self._reference_master_dark, master_flat, self._reference_master_offset)
+            flat = self._flat_for_calibration(master_flat, stack.shape, self._reference_panel.get_order0_full_xy())
+            calibrated = calibrate_science(stack, self._reference_master_dark, flat, self._reference_master_offset)
         except ReductionError as exc:
             self._set_status(self._step2_status_label, self._step2_status_var, f"Reduction failed: {exc}", False)
             return
@@ -2168,6 +2633,8 @@ class ReductionPanel(ttk.Frame):
             crop_shape=calibrated.shape, local_anchor=(_ROI_TARGET_X, _ROI_TARGET_Y),
         )
         self._reference_calibrated = calibrated
+        self._session.save_fits("reference_calibrated.fits", calibrated)
+        self._session.save_fits_cube("reference_science_raw.fits", science)
         profile = extract_profile(calibrated)
         assumed_dispersion_a = self._connection_panel.get_dispersion_a_per_px()
         detected = detect_line_pixels(profile, dispersion_a=assumed_dispersion_a)
@@ -2210,7 +2677,8 @@ class ReductionPanel(ttk.Frame):
             return
         stack = stack_frames(science)
         try:
-            calibrated = calibrate_science(stack, self._target_master_dark, master_flat, self._target_master_offset)
+            flat = self._flat_for_calibration(master_flat, stack.shape, self._target_capture_panel.get_order0_full_xy())
+            calibrated = calibrate_science(stack, self._target_master_dark, flat, self._target_master_offset)
         except ReductionError as exc:
             self._set_status(self._step3_status_label, self._step3_status_var, f"Reduction failed: {exc}", False)
             return
@@ -2220,6 +2688,8 @@ class ReductionPanel(ttk.Frame):
             crop_shape=calibrated.shape, local_anchor=(_ROI_TARGET_X, _ROI_TARGET_Y),
         )
         self._target_calibrated = calibrated
+        self._session.save_fits("target_calibrated.fits", calibrated)
+        self._session.save_fits_cube("target_science_raw.fits", science)
         profile = extract_profile(calibrated)
         gain = snr_gain(len(science))
         angle_note = f" (trail straightened by {angle_deg:+.1f}°)" if abs(angle_deg) > 0.05 else ""
@@ -2254,6 +2724,7 @@ class ReductionPanel(ttk.Frame):
         )
         final_wl, final_flux = apply_response(self._target_calibrated, response, self._dispersion, assumed_dispersion_a)
         self._final_wl, self._final_flux = final_wl, final_flux
+        self._session.save_spectrum_fits("final_spectrum.fits", final_wl, final_flux)
         self._result_version += 1
         if self._dispersion is not None:
             dispersion_note = f"real fitted dispersion ({self._dispersion[0]:.3f} Å/px)"
@@ -2453,9 +2924,9 @@ class SpectrumPanel(ttk.Frame):
     def _on_export_avspec(self) -> None:
         if self._connection_panel.is_mock():
             self._avspec_status_var.set(
-                "Refused: Mock is selected in the Connection tab. Connect real hardware before "
-                "exporting for AVSpec submission -- see AcquisitionPanel's own docstring for what's "
-                "real vs. mock in this app.",
+                "Refused: Mock is selected, or mount/camera aren't both actually connected as real "
+                "hardware, in the Connection tab. Connect both for real before exporting for AVSpec "
+                "submission -- see ConnectionPanel.is_mock's own docstring for exactly what this checks.",
             )
             return
         spectrum = self._reduction_panel.get_final_spectrum()

@@ -6,13 +6,16 @@ state, talking to the mount only through MountWorker's existing thread-
 safe API.
 
 Deliberately a smaller window than the ISS tracker's version: no camera
-exposure/gain section (this app has no CameraWorker -- see gui/panels.py's
-module docstring for what's real here vs still mock) and no "GOTO a named
-star" list (that version's GOTO uses a closed-loop jog_goto requiring a
-calibrated AxisSigns, which nothing in this app calibrates; each
-AcquisitionPanel tab already has a more directly useful GOTO button wired
-to the actual SIMBAD-resolved reference/target star instead of a fixed
-named-star list, see panels.py's AcquisitionPanel._on_goto).
+exposure/gain section (this app's CameraWorker only opens the device --
+see gui/panels.py's module docstring -- and each AcquisitionPanel tab
+already has its own exposure/gain sliders for the synthetic frames it
+generates, so a second, real-camera-only control here would be redundant
+until frame acquisition itself is real) and no "GOTO a named star" list
+(that version's GOTO uses a closed-loop jog_goto requiring a calibrated
+AxisSigns, which nothing in this app calibrates; each AcquisitionPanel tab
+already has a more directly useful GOTO button wired to the actual
+SIMBAD-resolved reference/target star instead of a fixed named-star list,
+see panels.py's AcquisitionPanel._on_goto).
 """
 
 from __future__ import annotations

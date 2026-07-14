@@ -2,12 +2,13 @@
 same layout skeleton as am5/gui/app.py (log packed before the notebook so
 a tall tab can't squeeze it to nothing, see that file's own comment for
 the incident this avoids). Most panels are still a visual mock (see
-gui/panels.py's own module docstring for exactly which), but the mount
-connection + manual jog control is real: it owns a real
-am5.gui.worker.MountWorker, unchanged from the ISS tracker, talking to
-either a MockMount or real serial hardware -- same event-pump idiom as
-am5/gui/app.py's own _pump_events (EVENT_POLL_MS below), and the same
-floating-JogWindow-shown-not-destroyed pattern (see gui/jog_window.py).
+gui/panels.py's own module docstring for exactly which), but device
+CONNECTION is real: this owns a real am5.gui.worker.MountWorker and a
+real camera.worker.CameraWorker, both unchanged from the ISS tracker,
+talking to either mock devices or real serial/USB hardware -- same
+event-pump idiom as am5/gui/app.py's own _pump_events (EVENT_POLL_MS
+below), and the same floating-JogWindow-shown-not-destroyed pattern (see
+gui/jog_window.py).
 """
 
 from __future__ import annotations
@@ -15,11 +16,14 @@ from __future__ import annotations
 import queue
 import tkinter as tk
 from datetime import datetime
+from pathlib import Path
 from tkinter import ttk
 
 from am5.gui.theme import apply_dark_theme
 from am5.gui.worker import MountWorker
+from camera.worker import CameraWorker
 from spectro.gui.jog_window import JogWindow
+from spectro.gui.live_camera import LiveCameraFeed
 from spectro.gui.panels import (
     AcquisitionPanel,
     AlignmentPanel,
@@ -29,6 +33,7 @@ from spectro.gui.panels import (
     SpectrumPanel,
     TargetPanel,
 )
+from spectro.session import Session
 
 EVENT_POLL_MS = 100
 
@@ -41,17 +46,30 @@ class App:
         self.palette = apply_dark_theme(root)
 
         self.mount_worker = MountWorker()
+        self.camera_worker = CameraWorker()
+        # Decoded once here (see App._pump_events), read by AlignmentPanel/
+        # AcquisitionPanel/FlatsPanel's own periodic redraw ticks instead
+        # of each panel re-decoding the same PGM independently -- see
+        # LiveCameraFeed's own docstring.
+        self.live_camera_feed = LiveCameraFeed()
+        # Created/named once, at ReductionPanel's own "Build masters" step
+        # -- see Session's own docstring for why there, not at the very
+        # first capture.
+        self.session = Session(Path("spectro_sessions"))
 
         self.notebook = ttk.Notebook(root)
 
         self.connection_panel = ConnectionPanel(
-            self.notebook, mount_worker=self.mount_worker, on_connection_change=self._on_connection_change,
+            self.notebook, mount_worker=self.mount_worker, camera_worker=self.camera_worker,
+            on_connection_change=self._on_connection_change, live_camera_feed=self.live_camera_feed,
         )
         # Once per session, not once per star -- measures how the Star
         # Analyser is physically rotated relative to the sensor, shared
         # by both AcquisitionPanel tabs below and by ReductionPanel's own
         # rotation-correction step, see AlignmentPanel's own docstring.
-        self.alignment_panel = AlignmentPanel(self.notebook, connection_panel=self.connection_panel)
+        self.alignment_panel = AlignmentPanel(
+            self.notebook, connection_panel=self.connection_panel, live_camera_feed=self.live_camera_feed,
+        )
         self.target_panel = TargetPanel(self.notebook)
         # Reference/Target: two acquisition tabs, not one shared Capture +
         # one shared Calibration tab -- darks must match each capture's
@@ -61,13 +79,17 @@ class App:
             self.notebook, role="reference", seed=7, get_star=self.target_panel.get_reference_star,
             get_spectrum=self.target_panel.get_reference_spectrum, mount_worker=self.mount_worker,
             connection_panel=self.connection_panel, alignment_panel=self.alignment_panel,
+            live_camera_feed=self.live_camera_feed, camera_worker=self.camera_worker,
         )
         self.target_capture_panel = AcquisitionPanel(
             self.notebook, role="target", seed=11, get_star=self.target_panel.get_target_star,
             get_spectrum=self.target_panel.get_target_spectrum_model, mount_worker=self.mount_worker,
             connection_panel=self.connection_panel, alignment_panel=self.alignment_panel,
+            live_camera_feed=self.live_camera_feed, camera_worker=self.camera_worker,
         )
-        self.flats_panel = FlatsPanel(self.notebook)
+        self.flats_panel = FlatsPanel(
+            self.notebook, live_camera_feed=self.live_camera_feed, camera_worker=self.camera_worker,
+        )
         # Reduction runs the REAL pipeline (spectro/reduction.py) against
         # whatever's been captured in the three tabs above -- stacking,
         # dark/flat calibration, line detection + dispersion fit, and the
@@ -77,7 +99,7 @@ class App:
         self.reduction_panel = ReductionPanel(
             self.notebook, reference_panel=self.reference_panel, target_capture_panel=self.target_capture_panel,
             flats_panel=self.flats_panel, target_panel=self.target_panel, connection_panel=self.connection_panel,
-            alignment_panel=self.alignment_panel,
+            alignment_panel=self.alignment_panel, session=self.session,
         )
         self.spectrum_panel = SpectrumPanel(
             self.notebook, reduction_panel=self.reduction_panel, target_panel=self.target_panel,
@@ -125,7 +147,10 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(EVENT_POLL_MS, self._pump_events)
 
-        self._log("Frontend mockup -- mount connection + jog control (see \"Jog control...\" below) are real, the rest isn't yet.")
+        self._log(
+            "Frontend mockup -- mount/camera connection + jog control (see \"Jog control...\" below) are real, "
+            "frame capture itself isn't yet (see gui/panels.py's module docstring).",
+        )
 
     def _pump_events(self) -> None:
         while True:
@@ -140,6 +165,16 @@ class App:
                 self.reference_panel.handle_mount_event(event)
                 self.target_capture_panel.handle_mount_event(event)
                 self.jog_window.handle_mount_event(event)
+        while True:
+            try:
+                event = self.camera_worker.events.get_nowait()
+            except queue.Empty:
+                break
+            if event.kind == "log":
+                self._log(f"[camera] {event.payload.get('message', '')}")
+            else:
+                self.live_camera_feed.handle_event(event)
+                self.connection_panel.handle_camera_event(event)
         self.root.after(EVENT_POLL_MS, self._pump_events)
 
     def _show_jog_window(self) -> None:
@@ -152,6 +187,7 @@ class App:
 
     def _on_close(self) -> None:
         self.mount_worker.shutdown()
+        self.camera_worker.shutdown()
         self.root.destroy()
 
     def _log(self, message: str) -> None:
