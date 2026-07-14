@@ -29,8 +29,10 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
+from am5.angles import angular_separation_deg
 from am5.gui.theme import PALETTE, style_axes
 from am5.gui.worker import MountWorker, WorkerEvent
+from spectro.avspec_export import AvspecExportError, write_avspec_fits
 from spectro.catalog import (
     REFERENCE_LINES,
     Star,
@@ -343,6 +345,9 @@ class MockDeviceRow(ttk.Frame):
                 row=3 + detail_lines.index(line), column=0, columnspan=2, sticky="w",
             )
 
+    def get_kind(self) -> str:
+        return self._kind_var.get()
+
     def _on_connect(self) -> None:
         self._connected = True
         self._status_var.set(f"Connected ({self._kind_var.get()})")
@@ -364,16 +369,22 @@ class MockDeviceRow(ttk.Frame):
 
 
 class ConnectionPanel(ttk.Frame):
-    """Mount connection + manual jog are REAL -- this panel owns a real
+    """Mount connection is REAL -- this panel owns a real
     am5.gui.worker.MountWorker (unchanged from the ISS tracker), talking
     to either a MockMount or actual serial hardware exactly the way that
-    project's own ConnectionPanel does. Camera is still a pure visual mock
-    (see MockDeviceRow) -- real camera wiring hasn't been requested for
-    this app yet, only telescope movement."""
+    project's own ConnectionPanel does. Manual jog itself lives in a
+    separate floating window (spectro/gui/jog_window.py, owned by App,
+    same shown-not-destroyed pattern as the ISS tracker's own JogWindow)
+    rather than embedded here, so it's reachable from any tab -- see
+    on_connection_change, which App wires to that window's
+    set_connected(). Camera is still a pure visual mock (see
+    MockDeviceRow) -- real camera wiring hasn't been requested for this
+    app yet, only telescope movement."""
 
-    def __init__(self, parent: tk.Misc, mount_worker: MountWorker):
+    def __init__(self, parent: tk.Misc, mount_worker: MountWorker, on_connection_change=None):
         super().__init__(parent, padding=10)
         self._mount_worker = mount_worker
+        self._on_connection_change = on_connection_change
         columns = ttk.Frame(self)
         columns.pack(fill="both", expand=True)
         left = ttk.Frame(columns)
@@ -382,14 +393,19 @@ class ConnectionPanel(ttk.Frame):
         right.pack(side="left", fill="both", expand=True, padx=(10, 0))
 
         self._build_mount_control(left)
-        MockDeviceRow(left, "Camera (ASI290MC + Star Analyser)", ["Reuses camera/ -- unchanged"]).pack(fill="x", pady=(10, 0))
+        self._camera_row = MockDeviceRow(left, "Camera (ASI290MC + Star Analyser)", ["Reuses camera/ -- unchanged"])
+        self._camera_row.pack(fill="x", pady=(10, 0))
 
         site_frame = ttk.LabelFrame(right, text="Observation site", padding=8)
         site_frame.pack(fill="x")
-        for i, (label, default) in enumerate((("lat", "46.18"), ("lon", "6.14"), ("elevation (m)", "400"))):
+        self._site_lat_var = tk.StringVar(value="46.18")
+        self._site_lon_var = tk.StringVar(value="6.14")
+        self._site_elevation_var = tk.StringVar(value="400")
+        for i, (label, var) in enumerate((
+            ("lat", self._site_lat_var), ("lon", self._site_lon_var), ("elevation (m)", self._site_elevation_var),
+        )):
             ttk.Label(site_frame, text=label).grid(row=i, column=0, sticky="w")
-            ttk.Entry(site_frame, width=10).grid(row=i, column=1, sticky="w")
-            site_frame.grid_slaves(row=i, column=1)[0].insert(0, default)
+            ttk.Entry(site_frame, textvariable=var, width=10).grid(row=i, column=1, sticky="w")
 
         grating_frame = ttk.LabelFrame(right, text="Instrument", padding=8)
         grating_frame.pack(fill="x", pady=(10, 0))
@@ -433,75 +449,54 @@ class ConnectionPanel(ttk.Frame):
         ttk.Label(frame, textvariable=self._mount_status_var, foreground=PALETTE.fg_dim).grid(
             row=4, column=0, columnspan=3, sticky="w", pady=(6, 0),
         )
-
-        # Manual jog -- same MountWorker.jog_start/jog_stop pair the ISS
-        # tracker's JogWindow uses (am5/gui/jog_window.py), reused as-is:
-        # start on button-press, stop on button-release, so the mount only
-        # ever moves while the button is physically held down. No arrow-
-        # key binding here (unlike JogWindow, which is a floating always-
-        # visible Toplevel) -- this panel lives inside a tab notebook
-        # shared with text entries elsewhere in the app, and a global key
-        # binding would hijack arrow-key input on every other tab too.
-        jog_frame = ttk.LabelFrame(frame, text="Manual control (jog)", padding=8)
-        jog_frame.grid(row=5, column=0, columnspan=3, sticky="we", pady=(10, 0))
-        ttk.Label(jog_frame, text="Rate (x sidereal)").grid(row=0, column=0, columnspan=3, sticky="w")
-        self._jog_rate_var = tk.StringVar(value="60")
-        ttk.Entry(jog_frame, textvariable=self._jog_rate_var, width=8).grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(0, 6),
-        )
-        self._jog_buttons: dict[str, ttk.Button] = {
-            "n": self._make_jog_button(jog_frame, "▲", "n", row=2, col=1),
-            "w": self._make_jog_button(jog_frame, "◀", "w", row=3, col=0),
-        }
-        self._jog_stop_button = ttk.Button(
-            jog_frame, text="■", width=4, style="Jog.TButton", command=self._mount_worker.stop_all, state="disabled",
-        )
-        self._jog_stop_button.grid(row=3, column=1, padx=2, pady=2)
-        self._jog_buttons["e"] = self._make_jog_button(jog_frame, "▶", "e", row=3, col=2)
-        self._jog_buttons["s"] = self._make_jog_button(jog_frame, "▼", "s", row=4, col=1)
-        self._set_jog_enabled(False)
-
-    def _make_jog_button(self, parent: tk.Misc, label: str, direction: str, row: int, col: int) -> ttk.Button:
-        button = ttk.Button(parent, text=label, width=4, style="Jog.TButton", state="disabled")
-        button.grid(row=row, column=col, padx=2, pady=2)
-        button.bind("<ButtonPress-1>", lambda _e, d=direction: self._mount_worker.jog_start(d, self._current_jog_rate()))
-        button.bind("<ButtonRelease-1>", lambda _e, d=direction: self._mount_worker.jog_stop(d))
-        return button
-
-    def _current_jog_rate(self) -> float:
-        try:
-            return float(self._jog_rate_var.get())
-        except ValueError:
-            return 60.0
-
-    def _set_jog_enabled(self, enabled: bool) -> None:
-        state = "normal" if enabled else "disabled"
-        for button in self._jog_buttons.values():
-            button.configure(state=state)
-        self._jog_stop_button.configure(state=state)
+        ttk.Label(
+            frame, text="Manual jog control is in its own window -- see the\n\"Jog control...\" button at the bottom of the app.",
+            foreground=PALETTE.fg_dim, justify="left",
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
     def _update_mount_address_state(self) -> None:
         self._mount_address_entry.configure(state="disabled" if self._mount_kind_var.get() == "mock" else "normal")
 
     def _on_mount_connect(self) -> None:
         seed_text = self._mount_seed_var.get().strip()
+        try:
+            latitude_deg, longitude_deg = self.get_site_lat_deg(), self.get_site_lon_deg()
+        except ValueError:
+            self._mount_status_var.set("Invalid site lat/lon")
+            return
         self._mount_connect_button.configure(state="disabled")
         self._mount_status_var.set("Connecting...")
-        # TODO: read from the "Observation site" fields on the right once
-        # those are wired to a shared var -- same gap TargetPanel's own
-        # TODO documents; hardcoded here to the same defaults both already
-        # display so they don't visibly disagree in the meantime.
         self._mount_worker.connect(
             self._mount_kind_var.get(), address=self._mount_address_var.get(),
             mock_seed=int(seed_text) if seed_text else None,
-            latitude_deg=46.18, longitude_deg=6.14,
+            latitude_deg=latitude_deg, longitude_deg=longitude_deg,
         )
+
+    def get_site_lat_deg(self) -> float:
+        return float(self._site_lat_var.get())
+
+    def get_site_lon_deg(self) -> float:
+        return float(self._site_lon_var.get())
+
+    def get_site_elevation_m(self) -> float:
+        return float(self._site_elevation_var.get())
+
+    def is_mock(self) -> bool:
+        """True if EITHER device is set to Mock -- used to refuse exports
+        meant for real submission (see SpectrumPanel's AVSpec export),
+        so a mock run can't produce a file that looks like a real
+        observation. Camera is always effectively mock right now (no real
+        CameraWorker exists yet, see this module's docstring), but the
+        radio button still reflects operator intent and is checked here
+        for when that changes."""
+        return self._mount_kind_var.get() == "mock" or self._camera_row.get_kind() == "mock"
 
     def handle_mount_event(self, event: WorkerEvent) -> None:
         if event.kind == "connected":
             self._mount_status_var.set(f"Connected -- firmware {event.payload['firmware']}")
             self._mount_disconnect_button.configure(state="normal")
-            self._set_jog_enabled(True)
+            if self._on_connection_change is not None:
+                self._on_connection_change(True)
         elif event.kind == "connect_error":
             self._mount_status_var.set(f"Connection failed: {event.payload['message']}")
             self._mount_connect_button.configure(state="normal")
@@ -509,7 +504,8 @@ class ConnectionPanel(ttk.Frame):
             self._mount_status_var.set("Not connected")
             self._mount_connect_button.configure(state="normal")
             self._mount_disconnect_button.configure(state="disabled")
-            self._set_jog_enabled(False)
+            if self._on_connection_change is not None:
+                self._on_connection_change(False)
 
 
 # -- Target / standard star tab ---------------------------------------------------------------
@@ -826,6 +822,24 @@ class TargetPanel(ttk.Frame):
             return self._candidates[int(selection[0])].star.name
         return None
 
+    def get_target_star(self) -> Star | None:
+        """For AcquisitionPanel's "Target" tab GOTO button -- the full
+        Star (RA/DEC included), not just its name."""
+        return self._target
+
+    def get_reference_star(self) -> Star | None:
+        """Same selection logic as get_reference_name, but returns the
+        full Star (RA/DEC included) for AcquisitionPanel's "Reference
+        star" tab GOTO button."""
+        if self._target is None:
+            return None
+        if is_standard_candidate(self._target):
+            return self._target
+        selection = self._tree.selection()
+        if selection:
+            return self._candidates[int(selection[0])].star
+        return None
+
     def get_reference_spectrum(self) -> tuple[np.ndarray, np.ndarray] | None:
         """Whatever's currently shown in the "Reference spectrum" plot
         above (real Pickles data if available, else the labeled blackbody
@@ -876,13 +890,21 @@ class AcquisitionPanel(ttk.Frame):
     only need doing once per setup rather than once per reference/target
     -- see FlatsPanel."""
 
-    def __init__(self, parent: tk.Misc, role: str, seed: int, get_star_name, get_spectrum=None):
+    def __init__(
+        self, parent: tk.Misc, role: str, seed: int, get_star, get_spectrum=None,
+        mount_worker: MountWorker | None = None,
+    ):
         super().__init__(parent, padding=10)
         self._role = role  # "reference" or "target"
         self._title = "Reference star" if role == "reference" else "Target"
         self._seed = seed
-        self._get_star_name = get_star_name
+        self._get_star = get_star
         self._get_spectrum = get_spectrum
+        self._mount_worker = mount_worker
+        self._mount_connected = False
+        self._goto_pending = False
+        self._goto_target_ra_deg: float | None = None
+        self._goto_target_dec_deg: float | None = None
         self._science_count = 0
         self._dark_count = 0
         self._offset_count = 0
@@ -965,8 +987,16 @@ class AcquisitionPanel(ttk.Frame):
         ttk.Label(controls, textvariable=self._gain_label_var, width=10).grid(row=1, column=2, sticky="w", pady=(6, 0))
         controls.columnconfigure(1, weight=1)
 
+        telescope_frame = ttk.LabelFrame(right, text="Telescope", padding=8)
+        telescope_frame.pack(fill="x")
+        self._goto_status_var = tk.StringVar(value="No star selected yet.")
+        ttk.Label(
+            telescope_frame, textvariable=self._goto_status_var, foreground=PALETTE.fg_dim, wraplength=200, justify="left",
+        ).pack(anchor="w")
+        ttk.Button(telescope_frame, text="GOTO", command=self._on_goto).pack(anchor="w", pady=(6, 0))
+
         status_frame = ttk.LabelFrame(right, text="This session", padding=8)
-        status_frame.pack(fill="x")
+        status_frame.pack(fill="x", pady=(10, 0))
         self._science_var = tk.StringVar(value=f"⬜ {self._title} spectrum (0 frames)")
         ttk.Label(status_frame, textvariable=self._science_var, wraplength=200, justify="left").pack(anchor="w", pady=2)
         self._dark_var = tk.StringVar(value="⬜ Darks (0 frames)")
@@ -1017,9 +1047,53 @@ class AcquisitionPanel(ttk.Frame):
         self._live_tick()
 
     def _refresh_header(self) -> None:
-        name = self._get_star_name()
+        star = self._get_star()
+        name = star.name if star is not None else None
         self._header_var.set(f"{self._title}: {name}" if name else f"{self._title}: (none selected yet -- pick one in Target & standard)")
         self.after(500, self._refresh_header)
+
+    def _on_goto(self) -> None:
+        if self._mount_worker is None:
+            return
+        if not self._mount_connected:
+            self._goto_status_var.set("Mount not connected -- connect it in the Connection tab first.")
+            return
+        star = self._get_star()
+        if star is None:
+            self._goto_status_var.set("No star selected yet -- pick one in Target & standard.")
+            return
+        self._goto_pending = True
+        self._goto_target_ra_deg = star.ra_deg
+        self._goto_target_dec_deg = star.dec_deg
+        self._goto_status_var.set(f"Slewing to {star.name}...")
+        self._mount_worker.goto(star.ra_deg / 15.0, star.dec_deg)
+
+    def handle_mount_event(self, event: WorkerEvent) -> None:
+        """Fed by App._pump_events -- every AcquisitionPanel sees every
+        mount event (there's only one mount), but only reacts to
+        goto_result/position while ITS OWN GOTO is the one pending, so
+        the Reference star tab doesn't show the Target tab's slew status
+        or vice versa."""
+        if event.kind == "connected":
+            self._mount_connected = True
+        elif event.kind == "disconnected":
+            self._mount_connected = False
+            self._goto_pending = False
+        elif event.kind == "goto_result" and self._goto_pending:
+            self._goto_status_var.set(f"GOTO: {event.payload['meaning']}")
+            if event.payload.get("code") != 0:
+                self._goto_pending = False  # rejected outright (e.g. below horizon) -- nothing more will arrive
+        elif event.kind == "position" and self._goto_pending and self._goto_target_ra_deg is not None:
+            current_ra_deg = event.payload["ra_hours"] * 15.0
+            current_dec_deg = event.payload["dec_deg"]
+            separation_deg = angular_separation_deg(
+                self._goto_target_ra_deg, self._goto_target_dec_deg, current_ra_deg, current_dec_deg,
+            )
+            if separation_deg < 0.05:  # ~3 arcmin -- plenty tight for "close enough to see it drift into frame"
+                self._goto_status_var.set(f"Arrived -- within {separation_deg * 3600:.0f}\" of target")
+                self._goto_pending = False
+            else:
+                self._goto_status_var.set(f"Slewing... {separation_deg:.2f}° from target")
 
     def _exposure_ms(self) -> float:
         return 10.0 + self._exposure_var.get() * 20.0  # 10-2010ms -- display/model only, not wired to a real camera
@@ -1145,9 +1219,6 @@ class AcquisitionPanel(ttk.Frame):
 
     def get_offset_frames(self) -> list[np.ndarray]:
         return self._offset_frames
-
-    def get_star_name(self) -> str | None:
-        return self._get_star_name()
 
 
 # -- Flats tab ---------------------------------------------------------------
@@ -1560,10 +1631,14 @@ class SpectrumPanel(ttk.Frame):
     steps, and there's no event/callback wiring between tabs elsewhere in
     this app either."""
 
-    def __init__(self, parent: tk.Misc, reduction_panel: ReductionPanel, target_panel: TargetPanel):
+    def __init__(
+        self, parent: tk.Misc, reduction_panel: ReductionPanel, target_panel: TargetPanel,
+        connection_panel: ConnectionPanel,
+    ):
         super().__init__(parent, padding=10)
         self._reduction_panel = reduction_panel
         self._target_panel = target_panel
+        self._connection_panel = connection_panel
         self._last_result_version = -1
 
         self._header_var = tk.StringVar(
@@ -1575,7 +1650,7 @@ class SpectrumPanel(ttk.Frame):
 
         result_frame = ttk.LabelFrame(self, text="Calibrated, response-corrected spectrum", padding=8)
         result_frame.pack(fill="both", expand=True, pady=(10, 0))
-        self._figure = Figure(figsize=(9, 3.6), dpi=100)
+        self._figure = Figure(figsize=(9, 2.0), dpi=100)
         self._ax = self._figure.add_subplot(111)
         style_axes(self._figure, self._ax)
         self._canvas = FigureCanvasTkAgg(self._figure, master=result_frame)
@@ -1592,6 +1667,38 @@ class SpectrumPanel(ttk.Frame):
         self._export_status_var = tk.StringVar(value="")
         ttk.Label(export_row, textvariable=self._export_status_var, foreground=PALETTE.fg_dim).pack(
             side="left", padx=(16, 0),
+        )
+
+        avspec_frame = ttk.LabelFrame(self, text="Export for AAVSO AVSpec submission", padding=8)
+        avspec_frame.pack(fill="x", pady=(10, 0))
+        ttk.Label(
+            avspec_frame, foreground=PALETTE.fg_dim, wraplength=1000, justify="left",
+            text=(
+                "Fills in the FITS header fields AVSpec expects (site, instrument, observer code, "
+                "wavelength axis) -- you still submit it yourself at aavso.org/apps/avspec/submit, "
+                "and it still goes through AAVSO's own validation. Refused while Mock is selected in "
+                "the Connection tab, so a practice run can't be passed off as a real observation."
+            ),
+        ).pack(anchor="w")
+        avspec_row = ttk.Frame(avspec_frame)
+        avspec_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(avspec_row, text="Obscode").grid(row=0, column=0, sticky="w")
+        self._observer_code_var = tk.StringVar(value="")
+        ttk.Entry(avspec_row, textvariable=self._observer_code_var, width=10).grid(row=0, column=1, sticky="w", padx=(4, 12))
+        ttk.Label(avspec_row, text="Site name").grid(row=0, column=2, sticky="w")
+        self._site_name_var = tk.StringVar(value="")
+        ttk.Entry(avspec_row, textvariable=self._site_name_var, width=18).grid(row=0, column=3, sticky="w", padx=(4, 12))
+        ttk.Label(avspec_row, text="Instrument name").grid(row=0, column=4, sticky="w")
+        self._instrument_name_var = tk.StringVar(value="")
+        ttk.Entry(avspec_row, textvariable=self._instrument_name_var, width=18).grid(row=0, column=5, sticky="w", padx=(4, 0))
+        ttk.Label(
+            avspec_frame, foreground=PALETTE.fg_dim,
+            text="Site name and instrument name must match exactly what's registered at app.aavso.org/site_equip/.",
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Button(avspec_frame, text="Export for AVSpec...", command=self._on_export_avspec).pack(anchor="w", pady=(6, 0))
+        self._avspec_status_var = tk.StringVar(value="")
+        ttk.Label(avspec_frame, textvariable=self._avspec_status_var, foreground=PALETTE.fg_dim, wraplength=1000, justify="left").pack(
+            anchor="w", pady=(4, 0),
         )
 
         self.after(500, self._poll)
@@ -1667,3 +1774,51 @@ class SpectrumPanel(ttk.Frame):
         ])
         fits.BinTableHDU.from_columns(columns).writeto(path, overwrite=True)
         self._export_status_var.set(f"Exported {len(wl)} points to {path}")
+
+    def _on_export_avspec(self) -> None:
+        if self._connection_panel.is_mock():
+            self._avspec_status_var.set(
+                "Refused: Mock is selected in the Connection tab. Connect real hardware before "
+                "exporting for AVSpec submission -- see AcquisitionPanel's own docstring for what's "
+                "real vs. mock in this app.",
+            )
+            return
+        spectrum = self._reduction_panel.get_final_spectrum()
+        if spectrum is None:
+            self._avspec_status_var.set("Nothing to export yet -- run the reduction pipeline first.")
+            return
+        target_name = self._target_panel.get_target_name()
+        if target_name is None:
+            self._avspec_status_var.set("No target star resolved yet -- pick one in Target & standard.")
+            return
+        observer_code = self._observer_code_var.get().strip()
+        site_name = self._site_name_var.get().strip()
+        instrument_name = self._instrument_name_var.get().strip()
+        if not observer_code or not site_name or not instrument_name:
+            self._avspec_status_var.set("Fill in Obscode, site name, and instrument name first.")
+            return
+        try:
+            site_lat_deg = self._connection_panel.get_site_lat_deg()
+            site_lon_deg = self._connection_panel.get_site_lon_deg()
+            site_elevation_m = self._connection_panel.get_site_elevation_m()
+        except ValueError:
+            self._avspec_status_var.set("Invalid site lat/lon/elevation in the Connection tab.")
+            return
+        wl, flux = spectrum
+        path = filedialog.asksaveasfilename(
+            defaultextension=".fits", filetypes=[("FITS", "*.fits")], title="Export for AVSpec submission",
+        )
+        if not path:
+            return
+        try:
+            write_avspec_fits(
+                path, wl, flux, object_name=target_name, observer_code=observer_code, site_name=site_name,
+                site_lat_deg=site_lat_deg, site_lon_deg=site_lon_deg, site_elevation_m=site_elevation_m,
+                instrument_name=instrument_name,
+            )
+        except AvspecExportError as exc:
+            self._avspec_status_var.set(f"Export failed: {exc}")
+            return
+        self._avspec_status_var.set(
+            f"Exported {len(wl)} points to {path} -- submit it yourself at aavso.org/apps/avspec/submit.",
+        )
