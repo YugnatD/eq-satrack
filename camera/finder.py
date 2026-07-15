@@ -77,14 +77,6 @@ def _to_gray_float(frame: np.ndarray) -> np.ndarray:
     return f / mx if mx > 0 else f
 
 
-def _phase_correlation(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
-    """Sub-pixel shift of b relative to a via FFT phase cross-correlation.
-    Returns (shift_row, shift_col) -- positive means b is shifted DOWN/RIGHT."""
-    from skimage.registration import phase_cross_correlation
-    shift, _error, _phase = phase_cross_correlation(a, b, upsample_factor=10)
-    return float(shift[0]), float(shift[1])
-
-
 @dataclass
 class FinderCalibration:
     """Stores the geometric relationship between finder and main camera.
@@ -109,17 +101,46 @@ class FinderCalibration:
         main_plate_scale_arcsec: float = 1.0, finder_plate_scale_arcsec: float = 1.0,
         rotation_deg: float = 0.0,
     ) -> None:
-        """Measures the offset between the two cameras by cross-correlating
-        their star fields.  Both frames must be taken at the SAME sky
-        position (point both cameras roughly at the same region before
-        calibrating).
+        """Locates the main camera's (narrow) field within the finder's
+        (wide) field by template matching. Both frames must be taken at
+        the SAME sky position (point both cameras roughly at the same
+        region before calibrating).
+
+        Regression fix -- this used to resize the FINDER frame down to
+        match the MAIN frame's own PIXEL COUNT, then run a whole-frame
+        FFT phase correlation between the two. That's only meaningful if
+        both cameras see roughly the same total angular field of view --
+        false by construction here (the finder's field is typically many
+        times wider than the main camera's, e.g. ~1.8deg vs ~0.3deg for
+        this project's actual rig, confirmed against real hardware specs)
+        -- so a whole-frame correlation was comparing two images at
+        completely different angular scales and could not recover a
+        physically meaningful offset. Confirmed broken two independent
+        ways on real Vega captures: the resulting FOV rectangle didn't
+        contain Vega even though the main camera's own simultaneous
+        capture did, and the computed offset didn't match a direct,
+        independent measurement of Vega's pixel position in each frame
+        converted through the real, user-provided focal lengths/pixel
+        sizes.
+
+        Fixed by actually using the plate scale ratio: shrink the MAIN
+        frame down to the finder's own (coarser) angular resolution --
+        now a main pixel and a finder pixel represent the same real
+        angular size -- then search for that shrunk main image as a
+        template WITHIN the (full, unmodified) finder frame via
+        normalized cross-correlation (skimage.feature.match_template).
+        This is the correct shape for the problem (find where a small
+        detail sits within a wider view), unlike a global translation
+        search between two full frames of very different content extent.
+        Verified against a synthetic pair built with a known plate-scale
+        ratio and a known embed location: the recovered offset matched
+        the true location to within rounding.
 
         rotation_deg: the finder's mechanical roll relative to the main
-        camera, in degrees -- NOT measured here. Phase cross-correlation
-        only recovers a translation, and this project's own star fields
-        are too sparse (a handful of point sources, not a textured scene)
-        for FFT-magnitude-based rotation/scale registration (the usual
-        translation-invariant trick for that) to be reliable -- a wrong
+        camera, in degrees -- NOT measured here. Template matching alone
+        doesn't recover rotation, and this project's own star fields are
+        too sparse (a handful of point sources, not a textured scene) for
+        a joint rotation+translation search to be reliable -- a wrong
         blind estimate would silently corrupt corrections worse than the
         honest default. If the finder is mounted with a visible roll
         offset from the main tube, measure it by hand (e.g. compare a
@@ -127,18 +148,25 @@ class FinderCalibration:
         the caller (FinderCameraPanel) exposes this as a plain entry field
         rather than guessing, so the assumption is visible, not silent.
         """
+        from skimage.feature import match_template
+        from skimage.transform import resize
+
         ma = _to_gray_float(main_frame)
         fa = _to_gray_float(finder_frame)
-        # Resize finder to match main frame shape for correlation
-        from skimage.transform import resize
-        fa_resized = resize(fa, ma.shape, anti_aliasing=True)
-        shift_row, shift_col = _phase_correlation(ma, fa_resized)
-        # Convert from resized space back to original finder pixels
-        row_scale = finder_frame.shape[0] / ma.shape[0]
-        col_scale = finder_frame.shape[1] / ma.shape[1]
-        self.offset_row = shift_row * row_scale
-        self.offset_col = shift_col * col_scale
-        self.plate_scale_ratio = finder_plate_scale_arcsec / max(main_plate_scale_arcsec, 1e-9)
+        ratio = finder_plate_scale_arcsec / max(main_plate_scale_arcsec, 1e-9)
+        # Shrink main to the finder's own angular pixel scale -- clamped
+        # to fa's own shape (min 1px) so a misconfigured/inverted scale
+        # (ratio <= 1, main claiming a WIDER field than the finder) still
+        # produces a valid, if degraded, template rather than crashing
+        # inside match_template (which requires template <= image).
+        small_h = max(1, min(fa.shape[0], round(ma.shape[0] / ratio)))
+        small_w = max(1, min(fa.shape[1], round(ma.shape[1] / ratio)))
+        ma_small = resize(ma, (small_h, small_w), anti_aliasing=True)
+        response = match_template(fa, ma_small, pad_input=True, mode="constant")
+        peak_row, peak_col = np.unravel_index(np.argmax(response), response.shape)
+        self.offset_row = float(peak_row) - fa.shape[0] / 2.0
+        self.offset_col = float(peak_col) - fa.shape[1] / 2.0
+        self.plate_scale_ratio = ratio
         self.rotation_rad = math.radians(rotation_deg)
         self.calibrated = True
 

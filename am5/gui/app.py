@@ -29,7 +29,7 @@ from am5.gui.theme import apply_dark_theme
 from am5.gui.worker import MountWorker
 from am5.tracker import AxisSigns, LiveOffsets
 from camera.finder import FinderState
-from camera.worker import CameraWorker, pgm_to_array
+from camera.worker import CameraEvent, CameraWorker, pgm_to_array
 
 # Events after which the operator has just confirmed/reset "on target" --
 # the idle-mode camera reference re-acquires from the next position sample
@@ -38,6 +38,38 @@ CAMERA_REFERENCE_RESET_EVENTS = {"connected", "goto_arrived", "parked"}
 
 EVENT_POLL_MS = 100
 LOG_EVENT_KINDS = {"log", "connect_error", "tracking_error"}
+
+
+def _drain_coalescing_preview_frames(event_queue: "queue.Queue[CameraEvent]") -> list[CameraEvent]:
+    """Drains every currently-queued event from a CameraWorker's events
+    queue, but collapses a run of CONSECUTIVE "preview_frame" events down
+    to just the last one in that run -- if _pump_events ever falls behind
+    for any reason (a slow one-off redraw elsewhere on the Tk thread,
+    e.g. TransitPanel's own sky-map redraw when Simulate is clicked, or
+    simply the machine being briefly busy), the camera worker's own read
+    loop keeps producing preview_frame events in the background
+    regardless of whether anyone's drawing them. Rendering each stale one
+    in turn (a real tk.PhotoImage + canvas update per panel watching it
+    -- not cheap, confirmed via profiling: TransitPanel's own preview
+    update alone measured as the single largest cost in a normal
+    _pump_events call) only makes an existing backlog worse, and nothing
+    before the last frame in a consecutive run was ever actually visible
+    anyway. Only collapses a run that's actually consecutive (not any two
+    preview_frame events anywhere in the batch) so every OTHER event kind
+    stays exactly where it was in the original queue order -- a
+    preview_frame that arrived after a "stats"/"log"/etc. event must not
+    end up reordered to look like it arrived before it."""
+    events: list[CameraEvent] = []
+    while True:
+        try:
+            event = event_queue.get_nowait()
+        except queue.Empty:
+            break
+        if event.kind == "preview_frame" and events and events[-1].kind == "preview_frame":
+            events[-1] = event  # supersedes the immediately-preceding stale one
+        else:
+            events.append(event)
+    return events
 
 
 class App:
@@ -293,11 +325,7 @@ class App:
             self.jog_window.handle_mount_event(event)
             self.finder_window.handle_mount_event(event)
 
-        while True:
-            try:
-                event = self.camera_worker.events.get_nowait()
-            except queue.Empty:
-                break
+        for event in _drain_coalescing_preview_frames(self.camera_worker.events):
             if event.kind in LOG_EVENT_KINDS:
                 self._log(f"[camera:{event.kind}] {event.payload.get('message', '')}")
             if event.kind == "preview_frame":
@@ -311,11 +339,7 @@ class App:
             self.calibration_panel.handle_camera_event(event)
             self.jog_window.handle_camera_event(event)
 
-        while True:
-            try:
-                event = self.finder_worker.events.get_nowait()
-            except queue.Empty:
-                break
+        for event in _drain_coalescing_preview_frames(self.finder_worker.events):
             if event.kind in LOG_EVENT_KINDS:
                 self._log(f"[finder:{event.kind}] {event.payload.get('message', '')}")
             if event.kind == "disconnected":

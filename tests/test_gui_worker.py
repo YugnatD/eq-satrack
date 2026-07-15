@@ -54,6 +54,42 @@ def test_connect_emits_connected_with_firmware(worker):
     assert "firmware" in event.payload
 
 
+def test_connect_emits_connected_with_the_connection_kind(worker):
+    # TransitPanel's training-scenario checkbox (see am5/gui/panels.py's
+    # _mount_is_mock) gates itself off this field, not off whatever the
+    # ConnectionPanel dropdown currently shows -- it must reflect what's
+    # ACTUALLY connected right now.
+    worker.connect("mock", mock_seed=1)
+    event = _wait_for(worker, "connected")
+    assert event.payload["connection_kind"] == "mock"
+
+
+def test_inject_training_pointing_error_before_any_connect_warns_instead_of_crashing(worker):
+    worker.inject_training_pointing_error(ra_bias_deg=1.0, dec_bias_deg=1.0)
+    event = _wait_for(worker, "log")
+    assert "isn't mock" in event.payload["message"]
+
+
+def test_inject_training_pointing_error_shifts_the_mock_mounts_reported_position(worker):
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    before = _wait_for(worker, "position", timeout=3.0)
+
+    worker.inject_training_pointing_error(ra_bias_deg=2.0, dec_bias_deg=-1.0)
+
+    shifted = False
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        try:
+            event = worker.events.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if event.kind == "position" and abs(event.payload["dec_deg"] - before.payload["dec_deg"]) > 0.5:
+            shifted = True
+            break
+    assert shifted
+
+
 def test_connect_warns_in_log_when_system_clock_not_synchronized(worker):
     # sync_site_and_time (called during connect) pushes THIS machine's
     # clock to the mount -- if it's wrong, the mount's time is wrong too,

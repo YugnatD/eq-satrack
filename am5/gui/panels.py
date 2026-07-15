@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import queue
+import random
 import threading
 import time
 import tkinter as tk
@@ -229,6 +230,18 @@ class SiteVars:
 # outside-the-window rate=0 clamp in am5/ephemeris.py).
 MAX_TRACKING_DURATION_S = 20 * 60.0
 
+# Simulate track's optional "random pointing error" training scenario
+# (mock only): magnitude range per axis (arcmin), randomized independently
+# for RA and DEC each run so the operator can't memorize a fixed
+# correction. Tuned to this project's actual rig (1000mm F/4 + ASI290MC
+# main: ~19.3'x10.9' FOV; SVBony 60mm F4 (240mm) + ASI678MM finder:
+# ~110'x62' FOV, see logs/*/optics.txt) -- comfortably beyond the main
+# camera's half-extent (~9.6'x5.5') so the ISS is never accidentally
+# already in the main camera's frame, comfortably inside the finder's
+# half-extent (~55'x31') so it's always still findable there without
+# needing a blind search.
+TRAINING_POINTING_ERROR_ARCMIN_RANGE = (12.0, 25.0)
+
 # CalibrationPanel: calibration nudge, gentle and short (a static/steady target
 # is assumed -- see the panel's own instructions -- so no ISS-motion
 # contamination to worry about here, unlike a live pass). Rate/duration are
@@ -247,6 +260,12 @@ GUIDING_CALIB_SETTLE_S = 0.5
 GUIDING_DEADBAND_PX = 3.0
 GUIDING_MIN_CORRECTION_INTERVAL_S = 1.0
 GUIDING_PERP_PULSE_DURATION_S = 0.15
+# CalibrationPanel's live preview/blob-detection frame cap -- bounds both
+# detect_brightest_blob's cost and the preview tk.PhotoImage's size
+# regardless of the main camera's actual sensor resolution, see
+# CalibrationPanel.handle_camera_event's own comment for the incident
+# this fixes (a high-res main camera froze the whole window).
+MAX_CALIBRATION_PREVIEW_DIM = 480
 
 
 class ConnectionPanel(ttk.Frame):
@@ -1126,6 +1145,15 @@ class TransitPanel(ttk.Frame):
         self._finder_state = finder_state
         self._armed = False
         self._mount_connected = False
+        # Set from the "connected" WorkerEvent's own kind field (see
+        # MountWorker._handle_connect), not the ConnectionPanel dropdown's
+        # current selection -- reflects what's ACTUALLY connected right
+        # now. Gates the training-scenario checkbox below; the worker
+        # itself also refuses the injection outright if the connected
+        # mount isn't mock (see MountWorker._handle_inject_training_
+        # pointing_error), so this is UX only, not the safety boundary.
+        self._mount_is_mock = False
+        self._training_error_var = tk.BooleanVar(value=False)
 
         # -- camera state --
         self._camera_interactive_widgets: list[tk.Widget] = []
@@ -1203,6 +1231,14 @@ class TransitPanel(ttk.Frame):
         self._jog_goto_button.pack(side="left", padx=(4, 0))
         self._mount_goto_button = ttk.Button(button_row, text="GOTO (mount, auto pier side)", command=self._on_mount_goto_click, state="disabled")
         self._mount_goto_button.pack(side="left", padx=(4, 0))
+
+        training_row = ttk.Frame(parent)
+        training_row.pack(anchor="w", pady=(0, 4))
+        self._training_error_check = ttk.Checkbutton(
+            training_row, text="Simulate a random pointing error (mock only) -- rehearse finder-first acquisition",
+            variable=self._training_error_var, state="disabled",
+        )
+        self._training_error_check.pack(side="left")
 
         offset_row = ttk.Frame(parent)
         offset_row.pack(anchor="w", pady=(4, 4))
@@ -1521,6 +1557,8 @@ class TransitPanel(ttk.Frame):
         self._out_dir.mkdir(parents=True, exist_ok=True)
         csv_path = self._out_dir / f"simulate_{datetime.now().strftime('%Y%m%dT%H%M%S')}.csv"
         duration_s = min(float(shifted.t_unix[-1]) - now, MAX_TRACKING_DURATION_S)
+        if self._mount_is_mock and self._training_error_var.get():
+            self._inject_training_pointing_error(shifted, now)
         self._mount_worker.start_tracking(
             shifted, self._axis_signs, self._offsets, csv_path, duration_s, self._build_tracking_config(),
         )
@@ -1530,6 +1568,26 @@ class TransitPanel(ttk.Frame):
         self._start_button.configure(state="disabled")
         self._arm_button.configure(state="disabled")
         self._stop_button.configure(state="normal")
+
+    def _inject_training_pointing_error(self, shifted: Trajectory, now_unix: float) -> None:
+        """Nudges the (mock) mount's own believed position by a random,
+        realistic residual pointing error -- as if the last GOTO/sync
+        landed a bit off, exactly the kind of thing a real operator has
+        to notice and correct at the start of a real pass. Random sign
+        and magnitude per axis, independently, each time -- see
+        TRAINING_POINTING_ERROR_ARCMIN_RANGE's own comment for why the
+        range is safe (always outside the main camera's narrow FOV,
+        always inside the finder's wide one). RA bias divided by cos(dec)
+        so the INJECTED ANGULAR offset on sky is what's actually in
+        range, not the raw RA-degree number (which would read as a much
+        bigger angle than intended away from the celestial equator)."""
+        _ra_deg, dec_deg, _dra_dt, _ddec_dt = shifted.interpolate(now_unix)
+        lo, hi = TRAINING_POINTING_ERROR_ARCMIN_RANGE
+        dec_bias_arcmin = random.uniform(lo, hi) * random.choice((-1.0, 1.0))
+        ra_bias_arcmin = random.uniform(lo, hi) * random.choice((-1.0, 1.0))
+        dec_bias_deg = dec_bias_arcmin / 60.0
+        ra_bias_deg = (ra_bias_arcmin / 60.0) / max(math.cos(math.radians(dec_deg)), 0.05)
+        self._mount_worker.inject_training_pointing_error(ra_bias_deg, dec_bias_deg)
 
     def _goto_start_radec(self) -> tuple[float, float]:
         """RA/DEC where the ISS will be at pass start (or NOW if already
@@ -1610,7 +1668,16 @@ class TransitPanel(ttk.Frame):
         self._sky_map.update_mount_marker(az_deg, alt_deg)
 
     def handle_mount_event(self, event: WorkerEvent) -> None:
-        if event.kind == "position":
+        if event.kind == "connected":
+            self._mount_is_mock = event.payload.get("connection_kind") == "mock"
+            self._training_error_check.configure(state="normal" if self._mount_is_mock else "disabled")
+            if not self._mount_is_mock:
+                self._training_error_var.set(False)
+        elif event.kind == "disconnected":
+            self._mount_is_mock = False
+            self._training_error_check.configure(state="disabled")
+            self._training_error_var.set(False)
+        elif event.kind == "position":
             side = event.payload.get("pier_side")
             side_text = f"  Pier side: {side}" if side else ""
             self._mount_radec_var.set(f"RA: {event.payload['ra_hours']:.4f}h  DEC: {event.payload['dec_deg']:+.4f} deg{side_text}")
@@ -1666,6 +1733,40 @@ class TransitPanel(ttk.Frame):
                 self._simulate_button.configure(state="normal")
                 self._jog_goto_button.configure(state="normal")
                 self._mount_goto_button.configure(state="normal")
+
+    def _maybe_apply_finder_correction(self) -> None:
+        """Apply a cross-track correction from the finder camera if it has
+        a blob locked AND its field has been calibrated against the main
+        camera. Uses the same trigger_perp_pulse mechanism as auto-guiding
+        -- gentle, bounded pulses, not instantaneous position jumps.
+        Only active when the finder checkbox is checked.
+
+        Regression fix: this method used to be defined on CalibrationPanel
+        (which has neither self._finder_state nor self._finder_correct_var
+        -- both are TransitPanel-only attributes, see __init__ above and
+        the "Enable finder correction" checkbox in the camera column
+        below), while its only call site was already correctly here, on
+        TransitPanel.handle_mount_event's "tracking_tick" branch. Every
+        real or simulated tracking session hit this the moment the first
+        tracking_tick arrived (~1s in) -- an AttributeError there
+        propagates out of App._pump_events BEFORE it reaches its own
+        self.root.after(EVENT_POLL_MS, self._pump_events) reschedule call
+        at the very end, permanently killing the whole event pump (not
+        just this panel) for the rest of the session: no more camera
+        previews, no more mount position updates, nothing -- matching a
+        real, reported "the app just freezes" symptom far better than
+        any per-frame performance cost does. Confirmed by reproducing an
+        actual live Simulate-track session end-to-end against a mock
+        rig and watching it crash on the first tracking_tick."""
+        if self._finder_state is None or not self._finder_correct_var.get():
+            return
+        correction = self._finder_state.get_correction_arcsec()
+        if correction is None:
+            return
+        _along_arcsec, cross_arcsec = correction
+        if abs(cross_arcsec) < 5.0:  # ~5" dead-band -- don't over-correct noise
+            return
+        self._offsets.trigger_perp_pulse(1.0 if cross_arcsec > 0 else -1.0)
 
     # ==================================================================
     # Camera column
@@ -2722,9 +2823,30 @@ class CalibrationPanel(ttk.Frame):
         if event.kind != "preview_frame":
             return
         frame = pgm_to_array(event.payload["pgm"])
-        blob = detect_brightest_blob(frame)
+        # Detect on a downsampled copy, not the full-resolution frame --
+        # same fix as FinderState.update_frame (see its own docstring for
+        # the original incident): detect_brightest_blob's centroid math
+        # costs ~60ms on a finder-class sensor (confirmed measured, vs
+        # ~9ms at this project's normal ~2MP main-camera resolution), and
+        # building a full-resolution tk.PhotoImage for the preview below
+        # adds more on top -- together enough to blow the ~100ms preview
+        # interval and freeze the whole Tk main thread once App._pump_
+        # events has a backlog of queued preview_frame events to drain.
+        # Never a problem at this project's own reference main camera
+        # (ASI290MC, ~2MP) -- only surfaced when a wider/higher-res sensor
+        # (e.g. an ASI678MM-class camera) is used in the main role instead.
+        _dw, _dh, scale, small = downsample_for_display(frame, MAX_CALIBRATION_PREVIEW_DIM, MAX_CALIBRATION_PREVIEW_DIM)
+        small_blob = detect_brightest_blob(small)
+        # self._latest_blob (and everything downstream: the calibration
+        # sequence's pixel-delta math, auto-guide's dx_px/dy_px against
+        # frame.shape) stays in FULL-resolution pixel coordinates, exactly
+        # as before this fix -- only the detection pass itself runs on the
+        # downsampled copy, so nothing downstream needs to know that.
+        blob = small_blob
+        if small_blob.found:
+            blob = dataclasses.replace(small_blob, centroid_x=small_blob.centroid_x / scale, centroid_y=small_blob.centroid_y / scale)
         self._latest_blob = blob
-        self._show_preview(frame, blob)
+        self._show_preview(small, small_blob)
         if blob.found:
             self._blob_status_var.set(f"ISS at pixel ({blob.centroid_x:.0f}, {blob.centroid_y:.0f}), peak {blob.peak_value:.0f}")
         else:
@@ -2733,6 +2855,9 @@ class CalibrationPanel(ttk.Frame):
             self._maybe_apply_auto_guide_correction(frame.shape, blob)
 
     def _show_preview(self, frame: np.ndarray, blob: BlobDetection) -> None:
+        # frame is the already-downsampled display copy from
+        # handle_camera_event, and blob is in that SAME (downsampled)
+        # coordinate space -- do not pass full-resolution coordinates here.
         display = frame.copy()
         h, w = display.shape
         if blob.found:
@@ -2861,24 +2986,6 @@ class CalibrationPanel(ttk.Frame):
             return
         self._last_correction_t = time.monotonic()
         self._live_offsets.trigger_perp_pulse(1.0 if cross_deg > 0 else -1.0, duration_s=GUIDING_PERP_PULSE_DURATION_S)
-
-    def _maybe_apply_finder_correction(self) -> None:
-        """Apply a cross-track correction from the finder camera if it has
-        a blob locked AND its field has been calibrated against the main
-        camera. Uses the same trigger_perp_pulse mechanism as auto-guiding
-        -- gentle, bounded pulses, not instantaneous position jumps.
-        Only active when the finder checkbox is checked."""
-        if self._finder_state is None or not getattr(self, "_finder_correct_var", None):
-            return
-        if not self._finder_correct_var.get():
-            return
-        correction = self._finder_state.get_correction_arcsec()
-        if correction is None:
-            return
-        _along_arcsec, cross_arcsec = correction
-        if abs(cross_arcsec) < 5.0:  # ~5" dead-band -- don't over-correct noise
-            return
-        self._offsets.trigger_perp_pulse(1.0 if cross_arcsec > 0 else -1.0)
 
 
 # ---------------------------------------------------------------------------

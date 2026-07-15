@@ -170,6 +170,39 @@ def test_meridian_behavior_roundtrip_through_the_mock():
         m.close()
 
 
+def test_inject_pointing_error_offsets_ra_and_dec():
+    # MockMount.inject_pointing_error has no wire-protocol equivalent --
+    # it's the training-scenario aid TransitPanel's "Simulate a random
+    # pointing error" checkbox uses (see am5/gui/panels.py's
+    # _inject_training_pointing_error) to make the mock ISS start off-
+    # centre, forcing the operator to actually use the finder to re-
+    # acquire it, same as a real residual GOTO/polar-alignment error would.
+    mock = MockMount(MockConfig(start_ra_deg=45.0, start_dec_deg=45.0))
+    m = Mount(mock)
+    try:
+        m.sync_site_and_time(46.18, 6.14)
+        before = m.get_radec()
+        mock.inject_pointing_error(ra_bias_deg=2.0, dec_bias_deg=-1.0)
+        after = m.get_radec()
+        assert after.ra_hours == pytest.approx(before.ra_hours + 2.0 / 15.0, abs=1e-6)
+        assert after.dec_deg == pytest.approx(before.dec_deg - 1.0, abs=1e-6)
+    finally:
+        m.close()
+
+
+def test_inject_pointing_error_wraps_ra_and_clamps_dec_at_the_poles():
+    mock = MockMount(MockConfig(start_ra_deg=359.0, start_dec_deg=89.0))
+    m = Mount(mock)
+    try:
+        m.sync_site_and_time(46.18, 6.14)
+        mock.inject_pointing_error(ra_bias_deg=5.0, dec_bias_deg=5.0)
+        after = m.get_radec()
+        assert after.ra_hours == pytest.approx((364.0 % 360.0) / 15.0, abs=1e-6)
+        assert after.dec_deg == pytest.approx(90.0, abs=1e-6)
+    finally:
+        m.close()
+
+
 def test_mock_mount_configured_to_stop_freezes_ra_shortly_past_the_meridian():
     # Regression: this project never sent :ST# before, so a real mount ran
     # on whatever its own factory/current default meridian behavior is --

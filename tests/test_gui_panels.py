@@ -17,6 +17,7 @@ from am5.gui.panels import (
     GUIDING_CALIB_NUDGE_RATE_X,
     GUIDING_PERP_PULSE_DURATION_S,
     KNOWN_SATELLITES,
+    MAX_CALIBRATION_PREVIEW_DIM,
     MAX_TRACKING_DURATION_S,
     ConnectionPanel,
     ExposurePanel,
@@ -33,7 +34,7 @@ from am5.gui.panels import (
 from am5.gui.worker import MountWorker, WorkerEvent
 from am5.optics import OpticalTrain
 from am5.tracker import LiveOffsets
-from camera.finder import FinderState
+from camera.finder import FinderCalibration, FinderState
 from camera.guiding import BlobDetection, GuidingCalibration
 from camera.worker import CameraEvent, CameraWorker, frame_to_pgm
 
@@ -121,6 +122,63 @@ def panel(tmp_path):
     mount_worker.shutdown()
     camera_worker.shutdown()
     root.destroy()
+
+
+def test_tracking_tick_event_does_not_crash_the_event_pump(panel):
+    # Regression: _maybe_apply_finder_correction used to be defined on
+    # CalibrationPanel (which has neither self._finder_state nor
+    # self._finder_correct_var -- both TransitPanel-only), while its only
+    # call site was already correctly here, in TransitPanel.
+    # handle_mount_event's "tracking_tick" branch -- an AttributeError on
+    # every single real tracking_tick (about 1s after any tracking session
+    # starts). In the real app this propagates out of App._pump_events
+    # BEFORE it reaches its own self.root.after(...) reschedule call at
+    # the very end, permanently killing the whole event pump -- not just
+    # this panel -- for the rest of the session (no more camera previews,
+    # no more mount position updates, nothing). This is what a reported
+    # "the app just freezes right after I click Simulate" was actually
+    # tracked back to.
+    event = WorkerEvent("tracking_tick", {
+        "actual_ra_deg": 10.0, "actual_dec_deg": 20.0, "target_ra_deg": 10.0, "target_dec_deg": 20.0,
+        "elapsed_s": 1.0, "along_track_arcsec": 0.0, "cross_track_arcsec": 0.0,
+    })
+    panel.handle_mount_event(event)  # must not raise
+
+
+def test_maybe_apply_finder_correction_triggers_a_perp_pulse_when_enabled_and_off_target(panel):
+    state = FinderState()
+    state.calibration = FinderCalibration(calibrated=True)  # offset_row/col=0, plate_scale_ratio=1, rotation=0
+    state.blob_found = True
+    state.last_blob_row = 100.0  # frame centre row -- no along-track component
+    state.last_blob_col = 250.0  # 100px right of frame centre (300-wide) -- clear cross-track offset
+    state.last_frame = np.zeros((200, 300), dtype=np.uint8)
+    panel._finder_state = state
+    panel._finder_correct_var.set(True)
+
+    triggered = []
+    panel._offsets.trigger_perp_pulse = lambda sign, **kw: triggered.append(sign)
+
+    panel._maybe_apply_finder_correction()
+
+    assert triggered == [1.0]
+
+
+def test_maybe_apply_finder_correction_does_nothing_when_checkbox_unchecked(panel):
+    state = FinderState()
+    state.calibration = FinderCalibration(calibrated=True)
+    state.blob_found = True
+    state.last_blob_row = 100.0
+    state.last_blob_col = 250.0
+    state.last_frame = np.zeros((200, 300), dtype=np.uint8)
+    panel._finder_state = state
+    panel._finder_correct_var.set(False)
+
+    triggered = []
+    panel._offsets.trigger_perp_pulse = lambda sign, **kw: triggered.append(sign)
+
+    panel._maybe_apply_finder_correction()
+
+    assert triggered == []
 
 
 def test_check_pass_timing_allows_starting_hours_early(panel):
@@ -660,6 +718,82 @@ def test_jog_goto_click_does_not_re_enable_start_if_never_armed(panel):
     assert str(panel._start_button["state"]) == "disabled"
 
 
+def test_training_error_checkbox_enables_only_when_the_connected_mount_is_mock(panel):
+    assert str(panel._training_error_check["state"]) == "disabled"
+
+    panel.handle_mount_event(WorkerEvent("connected", {"firmware": "1.0", "connection_kind": "mock"}))
+    assert str(panel._training_error_check["state"]) == "normal"
+    assert panel._mount_is_mock is True
+
+    panel.handle_mount_event(WorkerEvent("disconnected", {}))
+    assert str(panel._training_error_check["state"]) == "disabled"
+    assert panel._mount_is_mock is False
+
+    panel.handle_mount_event(WorkerEvent("connected", {"firmware": "1.0", "connection_kind": "serial"}))
+    assert str(panel._training_error_check["state"]) == "disabled"
+    assert panel._mount_is_mock is False
+
+
+def test_training_error_checkbox_unchecks_itself_when_a_real_mount_connects(panel):
+    # If it were left checked while disabled, the next mock session would
+    # silently start with an injected error the operator never asked for.
+    panel.handle_mount_event(WorkerEvent("connected", {"firmware": "1.0", "connection_kind": "mock"}))
+    panel._training_error_var.set(True)
+
+    panel.handle_mount_event(WorkerEvent("connected", {"firmware": "1.0", "connection_kind": "serial"}))
+
+    assert panel._training_error_var.get() is False
+
+
+def test_simulate_click_injects_a_training_pointing_error_when_checked_on_mock(panel):
+    _select_a_pass(panel)
+    panel.set_mount_connected(True)
+    panel.handle_mount_event(WorkerEvent("connected", {"firmware": "1.0", "connection_kind": "mock"}))
+    panel._training_error_var.set(True)
+
+    injected = {}
+    panel._mount_worker.inject_training_pointing_error = lambda ra, dec: injected.update(ra=ra, dec=dec)
+    panel._mount_worker.start_tracking = lambda *a, **kw: None
+
+    panel._on_simulate_click()
+
+    assert "ra" in injected and "dec" in injected
+    assert injected["ra"] != 0.0 or injected["dec"] != 0.0
+
+
+def test_simulate_click_does_not_inject_when_checkbox_unchecked(panel):
+    _select_a_pass(panel)
+    panel.set_mount_connected(True)
+    panel.handle_mount_event(WorkerEvent("connected", {"firmware": "1.0", "connection_kind": "mock"}))
+    assert panel._training_error_var.get() is False  # default
+
+    called = []
+    panel._mount_worker.inject_training_pointing_error = lambda *a, **kw: called.append((a, kw))
+    panel._mount_worker.start_tracking = lambda *a, **kw: None
+
+    panel._on_simulate_click()
+
+    assert called == []
+
+
+def test_simulate_click_does_not_inject_when_mount_is_not_mock_even_if_checked(panel):
+    # Defense in depth: _on_simulate_click checks _mount_is_mock itself,
+    # not just the checkbox's enabled state -- belt and suspenders with
+    # MountWorker's own refusal (see _handle_inject_training_pointing_error).
+    _select_a_pass(panel)
+    panel.set_mount_connected(True)
+    panel._training_error_var.set(True)  # simulate a stale/forced-True var
+    assert panel._mount_is_mock is False  # never told it's mock
+
+    called = []
+    panel._mount_worker.inject_training_pointing_error = lambda *a, **kw: called.append((a, kw))
+    panel._mount_worker.start_tracking = lambda *a, **kw: None
+
+    panel._on_simulate_click()
+
+    assert called == []
+
+
 @pytest.fixture
 def calibration_panel():
     root = tk.Tk()
@@ -828,6 +962,70 @@ def test_calibration_panel_handle_camera_event_updates_blob_and_preview(calibrat
     assert p._latest_blob.found is True
     assert p._preview_image is not None
     assert "ISS at pixel" in p._blob_status_var.get()
+
+
+def test_calibration_panel_blob_position_is_full_resolution_for_a_frame_above_the_preview_cap(calibration_panel):
+    # Regression test: handle_camera_event now detects on a downsampled
+    # copy (see MAX_CALIBRATION_PREVIEW_DIM's own comment -- fixes a real
+    # freeze when a high-res camera, e.g. an ASI678MM-class sensor, is
+    # used as the main camera: detect_brightest_blob alone cost ~60ms at
+    # that resolution vs ~9ms at this project's normal ~2MP main camera,
+    # enough to blow the ~100ms preview budget and back up the whole Tk
+    # event queue). self._latest_blob (and everything downstream: the
+    # calibration sequence, auto-guide's dx_px/dy_px against frame.shape)
+    # must still land in FULL-resolution pixel coordinates, not the
+    # downsampled detection copy's -- otherwise every consumer of
+    # _latest_blob silently breaks the moment a frame exceeds the cap.
+    p = calibration_panel
+    h, w = 1200, 1600  # comfortably above MAX_CALIBRATION_PREVIEW_DIM (480)
+    frame = np.full((h, w), 15, dtype=np.uint8)
+    true_cx, true_cy = 1000, 300
+    frame[true_cy - 10:true_cy + 10, true_cx - 10:true_cx + 10] = 220
+    p.handle_camera_event(CameraEvent(kind="preview_frame", payload={"pgm": frame_to_pgm(frame), "width": w, "height": h}))
+    assert p._latest_blob is not None
+    assert p._latest_blob.found is True
+    # Within a couple pixels: the downsample stride quantizes the centroid
+    # a bit, exact equality isn't the point -- landing in the right
+    # coordinate SYSTEM (full-res, not the ~480px-capped detection copy) is.
+    assert p._latest_blob.centroid_x == pytest.approx(true_cx, abs=5)
+    assert p._latest_blob.centroid_y == pytest.approx(true_cy, abs=5)
+    # The preview image itself must stay roughly bounded regardless of the
+    # source frame's resolution -- this used to be a full, unbounded
+    # resolution tk.PhotoImage (1600x1200 here). downsample_for_display's
+    # own integer-stride rounding means the result isn't an exact ceiling
+    # (534px came out of a 480px cap here), so allow some slack -- the
+    # point is "roughly capped", not "full resolution" (which would be
+    # 1600x1200, more than 2x over even generous slack).
+    assert p._preview_image.width() <= MAX_CALIBRATION_PREVIEW_DIM * 1.5
+    assert p._preview_image.height() <= MAX_CALIBRATION_PREVIEW_DIM * 1.5
+
+
+def test_calibration_panel_handle_camera_event_stays_fast_on_a_finder_class_resolution(calibration_panel):
+    # Regression test for a real freeze: the pre-fix code (full-resolution
+    # detect_brightest_blob + a full-resolution preview PhotoImage, every
+    # single preview_frame event) measured ~285ms end-to-end for a
+    # finder-class frame (3840x2160, e.g. an ASI678MM used as the main
+    # camera) on this machine -- enough to blow the ~100ms preview
+    # interval and, once App._pump_events had a backlog of queued
+    # preview_frame events to drain, freeze the whole Tk main thread. The
+    # post-fix path measured ~5-10ms on the same frame. 100ms sits
+    # comfortably between the two (>10x the fixed path's steady-state
+    # time, <3x under the pre-fix time) -- tight enough to catch a
+    # regression back to full-resolution processing, loose enough not to
+    # be sensitive to normal machine-to-machine timing noise.
+    import time
+
+    p = calibration_panel
+    h, w = 2160, 3840
+    frame = np.full((h, w), 15, dtype=np.uint8)
+    frame[1000:1020, 1600:1620] = 220
+    payload = {"pgm": frame_to_pgm(frame), "width": w, "height": h}
+
+    t0 = time.perf_counter()
+    p.handle_camera_event(CameraEvent(kind="preview_frame", payload=payload))
+    elapsed = time.perf_counter() - t0
+
+    assert elapsed < 0.1
 
 
 def test_calibration_panel_axis_calibration_done_updates_status(calibration_panel):

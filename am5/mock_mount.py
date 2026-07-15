@@ -172,6 +172,25 @@ class MockMount(Transport):
                 t.cancel()
         self._sim_thread.join(timeout=1.0)
 
+    # -- training-only extension (no wire-protocol equivalent) ----------------
+
+    def inject_pointing_error(self, ra_bias_deg: float, dec_bias_deg: float) -> None:
+        """Nudges the SIMULATED mount's own believed position by a fixed
+        bias, as if the last GOTO/sync had landed this far off -- unlike
+        everything else in this class, this has no wire-protocol
+        equivalent and exists purely so a GUI training scenario (see
+        MountWorker.inject_training_pointing_error) can rehearse "the ISS
+        isn't quite where the mount thinks" for real, rather than faking
+        it in the rendered camera frame -- which would silently distort
+        FinderCalibration/blob-detection math instead of exercising it.
+        Applied directly to state, not via vel_target -- an instant jump,
+        not a slew, deliberately: a real residual pointing error is
+        already "there" the moment tracking starts, not something that
+        visibly arrives via motion."""
+        with self._lock:
+            self._state.ra_deg = (self._state.ra_deg + ra_bias_deg) % 360.0
+            self._state.dec_deg = max(-90.0, min(90.0, self._state.dec_deg + dec_bias_deg))
+
     # -- physics simulation ---------------------------------------------------
 
     def _sim_loop(self) -> None:

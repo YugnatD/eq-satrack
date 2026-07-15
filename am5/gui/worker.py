@@ -93,6 +93,12 @@ class MountWorker:
         self.events: "queue.Queue[WorkerEvent]" = queue.Queue()
         self._commands: "queue.Queue[tuple[str, dict]]" = queue.Queue()
         self._mount: Mount | None = None
+        # Set at connect time only for kind="mock" (see _handle_connect),
+        # None otherwise -- lets inject_training_pointing_error refuse to
+        # act on a real mount even if a caller ever gets this wrong, since
+        # it checks this instead of trusting the GUI's own last-requested
+        # connection kind.
+        self._mock_mount: MockMount | None = None
         self._safety: SafetyGuard | None = None
         self._connected = threading.Event()
         self._idle_poll_enabled = threading.Event()
@@ -174,6 +180,14 @@ class MountWorker:
     def calibrate(self) -> None:
         self._commands.put(("calibrate", {}))
 
+    def inject_training_pointing_error(self, ra_bias_deg: float, dec_bias_deg: float) -> None:
+        """Mock-only training aid: see MockMount.inject_pointing_error's
+        own docstring. Silently ignored (with a log line) if the
+        currently connected mount isn't mock -- see _mock_mount's own
+        comment for why this is checked on the worker thread against the
+        actual connected transport, not trusted from the caller."""
+        self._commands.put(("inject_training_pointing_error", {"ra_bias_deg": ra_bias_deg, "dec_bias_deg": dec_bias_deg}))
+
     def measure_mount_lag(self, rate_x: float = 100.0, duration_s: float = 1.5) -> None:
         self._commands.put(("measure_mount_lag", {"rate_x": rate_x, "duration_s": duration_s}))
 
@@ -236,6 +250,7 @@ class MountWorker:
             "calibrate": self._handle_calibrate,
             "measure_mount_lag": self._handle_measure_mount_lag,
             "start_tracking": self._handle_start_tracking,
+            "inject_training_pointing_error": self._handle_inject_training_pointing_error,
         }
         # Idle poll cadence for "position" events (~2Hz -- cheap given the
         # real ~5ms round trip measured by characterize.py). Tracked as a
@@ -294,8 +309,10 @@ class MountWorker:
     def _handle_connect(self, payload: dict) -> None:
         kind = payload["kind"]
         transport: Transport
+        self._mock_mount = None
         if kind == "mock":
             transport = MockMount(MockConfig(), seed=payload.get("mock_seed"))
+            self._mock_mount = transport
         elif kind == "serial":
             transport = SerialTransport(payload["address"], baudrate=9600)
         elif kind == "tcp":
@@ -344,7 +361,7 @@ class MountWorker:
         self._safety = SafetyGuard(mount, watchdog_timeout=5.0, install_signal_handlers=False)
         self._connected.set()
         self._idle_poll_enabled.set()
-        self._emit("connected", firmware=firmware)
+        self._emit("connected", firmware=firmware, connection_kind=kind)
 
     def _handle_disconnect(self, payload: dict) -> None:
         self._idle_poll_enabled.clear()
@@ -355,6 +372,7 @@ class MountWorker:
                 self._safety = None
             self._mount.close()
             self._mount = None
+        self._mock_mount = None
         self._connected.clear()
         self._parked = False
         self._emit("disconnected")
@@ -529,6 +547,12 @@ class MountWorker:
             return
         self._mount.set_altitude_limits_enabled(payload["enabled"])
         self._emit("log", message=f"altitude limits {'enabled' if payload['enabled'] else 'DISABLED'}")
+
+    def _handle_inject_training_pointing_error(self, payload: dict) -> None:
+        if self._mock_mount is None:
+            self._emit("log", message="[warn] pointing-error injection requested but the connected mount isn't mock -- ignored")
+            return
+        self._mock_mount.inject_pointing_error(payload["ra_bias_deg"], payload["dec_bias_deg"])
 
     def _handle_calibrate(self, payload: dict) -> None:
         if self._mount is None or self._blocked_while_parked("calibrating"):

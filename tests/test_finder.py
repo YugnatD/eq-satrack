@@ -1,6 +1,7 @@
 import math
 
 import numpy as np
+import pytest
 
 from camera.finder import FinderCalibration, FinderState
 
@@ -186,3 +187,91 @@ def test_calibrate_from_frames_defaults_rotation_to_zero():
     frame = np.random.default_rng(1).random((50, 50))
     c.calibrate_from_frames(frame, frame)
     assert c.rotation_rad == 0.0
+
+
+def test_calibrate_from_frames_recovers_a_known_offset_across_different_plate_scales():
+    # Regression test for a real bug caught on actual hardware (real Vega
+    # captures, real ASI290MC/ASI678MM optics): the previous implementation
+    # resized the FINDER frame down to match the MAIN frame's own PIXEL
+    # COUNT, then ran a whole-frame FFT phase correlation -- only valid if
+    # both cameras see roughly the same total angular field, which is false
+    # by construction here (the finder's field is much wider than the main
+    # camera's). The resulting FOV rectangle didn't contain Vega even
+    # though the main camera's own simultaneous capture did.
+    #
+    # Ground truth built independently of calibrate_from_frames's own
+    # logic: a "sky" noise field at the main camera's fine angular
+    # resolution, covering the finder's whole (wider) field. main_frame is
+    # a raw crop of that sky at a KNOWN pixel location; finder_frame is the
+    # whole sky resampled down to the finder's coarser resolution. The
+    # true centre of main's content, in finder pixels, is computable
+    # directly from the known crop location and the plate scale ratio --
+    # calibrate_from_frames must recover that same centre without being
+    # given it.
+    rng = np.random.default_rng(3)
+    finder_h, finder_w = 400, 600
+    finder_scale = 2.0
+    main_h, main_w = 100, 150
+    main_scale = 0.5
+    ratio = finder_scale / main_scale  # 4.0 -- finder sees 4x more sky per pixel
+
+    sky_h, sky_w = round(finder_h * ratio), round(finder_w * ratio)
+    sky = np.clip(rng.normal(size=(sky_h, sky_w)), 0, None)
+
+    known_top, known_left = 700, 1200
+    main_frame = sky[known_top:known_top + main_h, known_left:known_left + main_w].copy()
+    from skimage.transform import resize
+    finder_frame = resize(sky, (finder_h, finder_w), anti_aliasing=True)
+
+    true_centre_row = (known_top + main_h / 2) / ratio
+    true_centre_col = (known_left + main_w / 2) / ratio
+
+    c = FinderCalibration()
+    c.calibrate_from_frames(main_frame, finder_frame, main_plate_scale_arcsec=main_scale, finder_plate_scale_arcsec=finder_scale)
+    corners = c.main_fov_corners_px((finder_h, finder_w), main_w, main_h)
+    rows = [r for r, _ in corners]
+    cols = [_c for _, _c in corners]
+    computed_centre_row = (min(rows) + max(rows)) / 2
+    computed_centre_col = (min(cols) + max(cols)) / 2
+
+    assert computed_centre_row == pytest.approx(true_centre_row, abs=1.0)
+    assert computed_centre_col == pytest.approx(true_centre_col, abs=1.0)
+    # The rectangle must actually be SMALLER than the finder frame (main's
+    # field is narrower) -- the old bug's pixel-count-based resize made it
+    # roughly half the finder frame's size regardless of the true ratio.
+    assert (max(rows) - min(rows)) < finder_h / 2
+    assert (max(cols) - min(cols)) < finder_w / 2
+
+
+def test_calibrate_from_frames_the_recovered_target_lands_inside_the_main_fov_rectangle():
+    # A second, independent framing of the same regression: a target that
+    # is genuinely within the main camera's field (placed at main's own
+    # centre) must land inside the calibrated FOV rectangle drawn on the
+    # finder frame -- this is the exact real-world symptom that surfaced
+    # the bug (a real captured Vega, confirmed present in the main
+    # camera's own simultaneous frame, fell outside the rectangle).
+    rng = np.random.default_rng(7)
+    finder_h, finder_w = 500, 700
+    finder_scale = 1.7189  # this project's real SVBony 60mm F4 + ASI678MM
+    main_h, main_w = 1096, 1936
+    main_scale = 0.5982  # this project's real 1000mm F/4 + ASI290MC
+    ratio = finder_scale / main_scale
+
+    sky_h, sky_w = round(finder_h * ratio), round(finder_w * ratio)
+    sky = np.clip(rng.normal(size=(sky_h, sky_w)), 0, None)
+    top, left = sky_h // 3, sky_w // 3  # anywhere but dead centre, to actually exercise the offset
+    main_frame = sky[top:top + main_h, left:left + main_w].copy()
+    from skimage.transform import resize
+    finder_frame = resize(sky, (finder_h, finder_w), anti_aliasing=True)
+
+    target_row_finder = (top + main_h / 2) / ratio
+    target_col_finder = (left + main_w / 2) / ratio
+
+    c = FinderCalibration()
+    c.calibrate_from_frames(main_frame, finder_frame, main_plate_scale_arcsec=main_scale, finder_plate_scale_arcsec=finder_scale)
+    corners = c.main_fov_corners_px((finder_h, finder_w), main_w, main_h)
+    rows = [r for r, _ in corners]
+    cols = [_c for _, _c in corners]
+
+    assert min(rows) <= target_row_finder <= max(rows)
+    assert min(cols) <= target_col_finder <= max(cols)

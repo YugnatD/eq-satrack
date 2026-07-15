@@ -1,8 +1,9 @@
+import queue
 import tkinter as tk
 
 import pytest
 
-from am5.gui.app import App
+from am5.gui.app import App, _drain_coalescing_preview_frames
 from am5.gui.worker import WorkerEvent
 from camera.worker import CameraEvent
 
@@ -151,3 +152,59 @@ def test_finder_disconnected_event_clears_a_stale_blob_detection(app):
     assert app.finder_state.blob_found is False
     assert app.finder_state.last_blob_row is None
     assert app.finder_state.last_blob_col is None
+
+
+def test_drain_coalescing_preview_frames_keeps_only_the_last_of_a_backlog():
+    # Regression: if _pump_events ever falls behind (a slow one-off redraw
+    # elsewhere on the Tk thread, e.g. TransitPanel's own sky-map redraw
+    # when Simulate is clicked), the camera worker keeps producing
+    # preview_frame events in the background regardless -- rendering each
+    # stale one in turn (a real tk.PhotoImage + canvas update per panel,
+    # confirmed via profiling as the single largest cost in a normal
+    # _pump_events call) only makes an existing backlog worse. Only the
+    # LAST preview_frame in a backlog was ever going to be visible anyway.
+    q: "queue.Queue" = queue.Queue()
+    q.put(CameraEvent(kind="preview_frame", payload={"n": 1}))
+    q.put(CameraEvent(kind="preview_frame", payload={"n": 2}))
+    q.put(CameraEvent(kind="stats", payload={"fps": 10.0}))
+    q.put(CameraEvent(kind="preview_frame", payload={"n": 3}))
+    q.put(CameraEvent(kind="preview_frame", payload={"n": 4}))
+
+    events = _drain_coalescing_preview_frames(q)
+
+    kinds_and_payloads = [(e.kind, e.payload) for e in events]
+    assert kinds_and_payloads == [
+        ("preview_frame", {"n": 2}),
+        ("stats", {"fps": 10.0}),
+        ("preview_frame", {"n": 4}),
+    ]
+    assert q.empty()
+
+
+def test_drain_coalescing_preview_frames_passes_through_non_preview_events_untouched():
+    q: "queue.Queue" = queue.Queue()
+    q.put(CameraEvent(kind="connected", payload={"width": 640, "height": 480}))
+    q.put(CameraEvent(kind="log", payload={"message": "hello"}))
+
+    events = _drain_coalescing_preview_frames(q)
+
+    assert [e.kind for e in events] == ["connected", "log"]
+
+
+def test_pump_events_only_renders_the_last_of_several_queued_camera_preview_frames(app):
+    # Integration-level version of the two tests above: pushing a backlog
+    # of preview_frame events straight onto the real CameraWorker queue
+    # and pumping once must leave the panel showing the LAST frame's
+    # dimensions, not stall trying to render every one of them.
+    from camera.worker import frame_to_pgm
+    import numpy as np
+
+    small = frame_to_pgm(np.zeros((10, 10), dtype=np.uint8))
+    big = frame_to_pgm(np.zeros((20, 20), dtype=np.uint8))
+    app.camera_worker.events.put(CameraEvent(kind="preview_frame", payload={"pgm": small, "width": 10, "height": 10}))
+    app.camera_worker.events.put(CameraEvent(kind="preview_frame", payload={"pgm": big, "width": 20, "height": 20}))
+
+    app._pump_events()
+
+    assert app.transit_panel._display_w == 20
+    assert app.transit_panel._display_h == 20
