@@ -21,6 +21,8 @@ from am5.gui.panels import (
     ConnectionPanel,
     ExposurePanel,
     CalibrationPanel,
+    FinderCameraPanel,
+    PALETTE,
     PassesPanel,
     SiteVars,
     TransitPanel,
@@ -31,6 +33,7 @@ from am5.gui.panels import (
 from am5.gui.worker import MountWorker, WorkerEvent
 from am5.optics import OpticalTrain
 from am5.tracker import LiveOffsets
+from camera.finder import FinderState
 from camera.guiding import BlobDetection, GuidingCalibration
 from camera.worker import CameraEvent, CameraWorker, frame_to_pgm
 
@@ -447,6 +450,60 @@ def _select_a_pass(panel):
     crossings = meridian_crossings(trajectory)
     panel.set_trajectory(trajectory, window, crossings, site, satellite.name)
     return window
+
+
+def test_recording_started_event_disables_roi_and_bit_depth_widgets(panel):
+    # The worker refuses ROI/bit-depth changes mid-recording (see
+    # CameraWorker._handle_set_roi/_handle_set_bit_depth, added after a
+    # live change was found to corrupt the SER file being written) -- the
+    # GUI must grey these out too, not just rely on the log warning, so
+    # the operator isn't clicking a control that silently no-ops.
+    for widget in panel._roi_bitdepth_widgets:
+        widget.configure(state="normal")
+
+    panel.handle_camera_event(CameraEvent(kind="recording_started", payload={"path": "/tmp/x.ser"}))
+
+    for widget in panel._roi_bitdepth_widgets:
+        assert str(widget["state"]) == "disabled"
+
+
+def test_recording_stopped_event_reenables_roi_and_bit_depth_widgets(panel):
+    panel.handle_camera_event(CameraEvent(kind="recording_started", payload={"path": "/tmp/x.ser"}))
+    panel.handle_camera_event(CameraEvent(
+        kind="recording_stopped",
+        payload={"path": "/tmp/x.ser", "frame_count": 10, "buffer_dropped_frames": 0},
+    ))
+
+    for widget in panel._roi_bitdepth_widgets:
+        expected = "readonly" if widget is panel._bit_depth_combo else "normal"
+        assert str(widget["state"]) == expected
+
+
+def test_recording_stopped_with_an_error_reports_it_and_keeps_the_partial_frame_count(panel):
+    # A write-thread failure (disk full, permissions -- see
+    # CameraWorker._write_loop) now surfaces an "error" field instead of
+    # silently reporting a clean stop; the panel must show it, not just
+    # the frame count, so the operator knows the recording was cut short.
+    panel.handle_camera_event(CameraEvent(kind="recording_started", payload={"path": "/tmp/x.ser"}))
+    panel.handle_camera_event(CameraEvent(
+        kind="recording_stopped",
+        payload={"path": "/tmp/x.ser", "frame_count": 2, "buffer_dropped_frames": 0, "error": "disk full"},
+    ))
+
+    assert "disk full" in panel._path_var.get()
+    assert "2" in panel._path_var.get()
+    assert str(panel._path_label["foreground"]) == PALETTE.accent_warn
+
+
+def test_recording_stopped_without_an_error_reports_a_clean_save(panel):
+    panel.handle_camera_event(CameraEvent(kind="recording_started", payload={"path": "/tmp/x.ser"}))
+    panel.handle_camera_event(CameraEvent(
+        kind="recording_stopped",
+        payload={"path": "/tmp/x.ser", "frame_count": 42, "buffer_dropped_frames": 0},
+    ))
+
+    assert "Saved" in panel._path_var.get()
+    assert str(panel._path_label["foreground"]) == PALETTE.accent_ok
 
 
 def test_recording_with_no_pass_selected_uses_the_flat_out_dir(panel, tmp_path):
@@ -882,7 +939,11 @@ def test_calibration_panel_clock_sync_poll_reports_unknown_status(calibration_pa
 
 def test_camera_connect_uses_the_real_configured_plate_scale():
     # Camera connection lives in ConnectionPanel (moved there so both
-    # devices are wired up from one tab), not TransitPanel.
+    # devices are wired up from one tab), not TransitPanel. get_optical_train
+    # only feeds a REAL camera connection -- Mock mode uses this panel's own
+    # focal/sensor/pixel-size fields instead (see the next test), since the
+    # Exposure calc tab's optical train models a hypothetical setup for
+    # exposure planning, not necessarily what the mock should simulate.
     root = tk.Tk()
     root.withdraw()
     mount_worker = MountWorker()
@@ -890,6 +951,7 @@ def test_camera_connect_uses_the_real_configured_plate_scale():
     try:
         train = OpticalTrain(aperture_mm=200, focal_length_mm=1000, barlow_multiplier=2.0, pixel_size_um=2.9)
         p = ConnectionPanel(root, mount_worker, camera_worker, lambda _connected: None, get_optical_train=lambda: train, map_widget_cls=_StubMapWidget)
+        p._camera_kind_var.set("real")
         captured = {}
         p._camera_worker.connect = lambda *args, **kwargs: captured.update(kwargs, kind=args[0])
         p._on_camera_connect_click()
@@ -901,16 +963,285 @@ def test_camera_connect_uses_the_real_configured_plate_scale():
 
 
 def test_camera_connect_falls_back_to_default_plate_scale_when_fields_invalid():
+    # Real mode, no optical train configured -- falls back to CameraWorker/
+    # MockAsiCamera's own default.
     root = tk.Tk()
     root.withdraw()
     mount_worker = MountWorker()
     camera_worker = CameraWorker()
     try:
         p = ConnectionPanel(root, mount_worker, camera_worker, lambda _connected: None, get_optical_train=lambda: None, map_widget_cls=_StubMapWidget)
+        p._camera_kind_var.set("real")
         captured = {}
         p._camera_worker.connect = lambda *args, **kwargs: captured.update(kwargs, kind=args[0])
         p._on_camera_connect_click()
         assert captured["plate_scale_arcsec_per_px"] is None  # CameraWorker/MockAsiCamera fall back to their own default
+    finally:
+        mount_worker.shutdown()
+        camera_worker.shutdown()
+        root.destroy()
+
+
+def test_camera_connect_in_mock_mode_uses_this_panels_own_optics_fields():
+    # Mock mode: focal length / sensor size / pixel size come from
+    # ConnectionPanel's own fields (defaults to the real ASI290MC + 1000mm
+    # main tube specs), computed into a real plate scale -- NOT from
+    # get_optical_train, even if one is configured.
+    root = tk.Tk()
+    root.withdraw()
+    mount_worker = MountWorker()
+    camera_worker = CameraWorker()
+    try:
+        train = OpticalTrain(aperture_mm=200, focal_length_mm=2000, barlow_multiplier=1.0, pixel_size_um=5.0)
+        p = ConnectionPanel(root, mount_worker, camera_worker, lambda _connected: None, get_optical_train=lambda: train, map_widget_cls=_StubMapWidget)
+        assert p._camera_kind_var.get() == "mock"  # default
+        captured = {}
+        p._camera_worker.connect = lambda *args, **kwargs: captured.update(kwargs, kind=args[0])
+        p._on_camera_connect_click()
+        expected_scale = ConnectionPanel._plate_scale_arcsec_per_px(
+            ConnectionPanel.MAIN_DEFAULT_FOCAL_MM, ConnectionPanel.MAIN_DEFAULT_PIXEL_UM,
+        )
+        assert captured["plate_scale_arcsec_per_px"] == pytest.approx(expected_scale)
+        assert captured["mock_sensor_width"] == ConnectionPanel.MAIN_DEFAULT_SENSOR_W
+        assert captured["mock_sensor_height"] == ConnectionPanel.MAIN_DEFAULT_SENSOR_H
+    finally:
+        mount_worker.shutdown()
+        camera_worker.shutdown()
+        root.destroy()
+
+
+def test_camera_and_finder_connect_push_their_real_plate_scale_into_finder_state():
+    # Regression: FinderCameraPanel's "Calibrate fields" used to read a
+    # separately-typed plate-scale field that could silently drift out of
+    # sync with what's actually configured -- see FinderState's
+    # main_plate_scale_arcsec/finder_plate_scale_arcsec docstring.
+    root = tk.Tk()
+    root.withdraw()
+    mount_worker = MountWorker()
+    camera_worker = CameraWorker()
+    finder_worker = CameraWorker()
+    finder_state = FinderState()
+    try:
+        p = ConnectionPanel(
+            root, mount_worker, camera_worker, lambda _connected: None,
+            map_widget_cls=_StubMapWidget, finder_worker=finder_worker, finder_state=finder_state,
+        )
+        p._camera_worker.connect = lambda *args, **kwargs: None
+        p._finder_worker.connect = lambda *args, **kwargs: None
+        p._on_camera_connect_click()
+        p._on_finder_connect_click()
+        expected_main_scale = ConnectionPanel._plate_scale_arcsec_per_px(
+            ConnectionPanel.MAIN_DEFAULT_FOCAL_MM, ConnectionPanel.MAIN_DEFAULT_PIXEL_UM,
+        )
+        expected_finder_scale = ConnectionPanel._plate_scale_arcsec_per_px(
+            ConnectionPanel.FINDER_DEFAULT_FOCAL_MM, ConnectionPanel.FINDER_DEFAULT_PIXEL_UM,
+        )
+        assert finder_state.main_plate_scale_arcsec == pytest.approx(expected_main_scale)
+        assert finder_state.finder_plate_scale_arcsec == pytest.approx(expected_finder_scale)
+    finally:
+        mount_worker.shutdown()
+        camera_worker.shutdown()
+        finder_worker.shutdown()
+        root.destroy()
+
+
+def test_real_finder_connect_also_pushes_the_real_plate_scale():
+    # Regression: connecting a REAL finder camera used to never touch
+    # FinderState.finder_plate_scale_arcsec at all (only the mock branch
+    # did), silently leaving it stuck at the 1.0 dataclass default --
+    # wrong by the real finder's ~1.72"/px, corrupting both the FOV
+    # rectangle's size and every finder-based correction's magnitude for
+    # anyone using real hardware.
+    root = tk.Tk()
+    root.withdraw()
+    mount_worker = MountWorker()
+    camera_worker = CameraWorker()
+    finder_worker = CameraWorker()
+    finder_state = FinderState()
+    try:
+        p = ConnectionPanel(
+            root, mount_worker, camera_worker, lambda _connected: None,
+            map_widget_cls=_StubMapWidget, finder_worker=finder_worker, finder_state=finder_state,
+        )
+        p._finder_worker.connect = lambda *args, **kwargs: None
+        p._finder_kind_var.set("real")
+        p._on_finder_connect_click()
+        expected_finder_scale = ConnectionPanel._plate_scale_arcsec_per_px(
+            ConnectionPanel.FINDER_DEFAULT_FOCAL_MM, ConnectionPanel.FINDER_DEFAULT_PIXEL_UM,
+        )
+        assert finder_state.finder_plate_scale_arcsec == pytest.approx(expected_finder_scale)
+    finally:
+        mount_worker.shutdown()
+        camera_worker.shutdown()
+        finder_worker.shutdown()
+        root.destroy()
+
+
+def test_finder_focal_and_pixel_fields_stay_editable_in_real_mode():
+    # The sensor W/H fields are correctly mock-only (a real camera reports
+    # its own sensor size), but focal length/pixel size are never
+    # auto-reported by ANY camera, real or mock -- locking them in real
+    # mode (as originally implemented) left no way at all to configure
+    # the real finder's plate scale.
+    root = tk.Tk()
+    root.withdraw()
+    mount_worker = MountWorker()
+    camera_worker = CameraWorker()
+    finder_worker = CameraWorker()
+    try:
+        p = ConnectionPanel(
+            root, mount_worker, camera_worker, lambda _connected: None,
+            map_widget_cls=_StubMapWidget, finder_worker=finder_worker,
+        )
+        p._finder_kind_var.set("real")
+        p._update_mock_optics_state("finder")
+        for widget in p._finder_optics_always_editable_widgets:
+            assert str(widget["state"]) == "normal"
+        for widget in p._finder_optics_widgets:
+            assert str(widget["state"]) == "disabled"
+    finally:
+        mount_worker.shutdown()
+        camera_worker.shutdown()
+        finder_worker.shutdown()
+        root.destroy()
+
+
+def test_finder_calibrate_success_notifies_on_calibration_ready():
+    # Regression: the Transit tab's "Enable finder correction" checkbox was
+    # created disabled and never re-enabled anywhere -- there was no
+    # callback from FinderCameraPanel's calibration to TransitPanel, unlike
+    # CalibrationPanel's own on_calibration_ready for auto-guiding.
+    root = tk.Tk()
+    root.withdraw()
+    finder_worker = CameraWorker()
+    finder_state = FinderState()
+    notified = []
+    try:
+        p = FinderCameraPanel(
+            root, finder_worker, finder_state,
+            on_calibration_ready=lambda: notified.append(True),
+        )
+        p._latest_frame = np.zeros((20, 20), dtype=np.uint8)
+        finder_state.last_main_frame = np.zeros((20, 20), dtype=np.uint8)
+        finder_state.calibration.calibrate_from_frames = lambda *a, **kw: setattr(
+            finder_state.calibration, "calibrated", True,
+        )
+        p._on_calibrate()
+        assert notified == [True]
+    finally:
+        finder_worker.shutdown()
+        root.destroy()
+
+
+def test_finder_calibrate_failure_does_not_notify_on_calibration_ready():
+    root = tk.Tk()
+    root.withdraw()
+    finder_worker = CameraWorker()
+    finder_state = FinderState()
+    notified = []
+    try:
+        p = FinderCameraPanel(
+            root, finder_worker, finder_state,
+            on_calibration_ready=lambda: notified.append(True),
+        )
+        p._latest_frame = np.zeros((20, 20), dtype=np.uint8)
+        finder_state.last_main_frame = np.zeros((20, 20), dtype=np.uint8)
+
+        def _raise(*_a, **_kw):
+            raise ValueError("boom")
+
+        finder_state.calibration.calibrate_from_frames = _raise
+        p._on_calibrate()
+        assert notified == []
+        assert "failed" in p._calib_status_var.get().lower()
+    finally:
+        finder_worker.shutdown()
+        root.destroy()
+
+
+def test_finder_calibrate_passes_the_typed_rotation_through():
+    root = tk.Tk()
+    root.withdraw()
+    finder_worker = CameraWorker()
+    finder_state = FinderState()
+    try:
+        p = FinderCameraPanel(root, finder_worker, finder_state)
+        p._latest_frame = np.zeros((20, 20), dtype=np.uint8)
+        finder_state.last_main_frame = np.zeros((20, 20), dtype=np.uint8)
+        p._finder_rotation_var.set("7.5")
+
+        captured = {}
+        finder_state.calibration.calibrate_from_frames = lambda *a, **kw: captured.update(kw)
+        p._on_calibrate()
+
+        assert captured["rotation_deg"] == pytest.approx(7.5)
+    finally:
+        finder_worker.shutdown()
+        root.destroy()
+
+
+def test_finder_panel_delta_t_and_perp_nudge_controls_use_live_offsets():
+    # The Finder tab got its own delta_t/perp-nudge controls (mirroring
+    # TransitPanel's) so the operator doesn't have to look away from the
+    # finder's wide view to nudge tracking once a pass starts -- that's
+    # exactly when they're watching the finder to frame the ISS into the
+    # much narrower acquisition camera.
+    root = tk.Tk()
+    root.withdraw()
+    finder_worker = CameraWorker()
+    finder_state = FinderState()
+    try:
+        p = FinderCameraPanel(root, finder_worker, finder_state)
+
+        p._live_offsets.adjust_delta_t(1.0)
+        dt, _ = p._live_offsets.snapshot()
+        assert dt == pytest.approx(1.0)
+
+        p._live_offsets.trigger_perp_pulse(-1.0)
+        _, perp = p._live_offsets.snapshot()
+        assert perp == -1.0
+
+        # Keyboard path -- same handlers the recursive _bind_offset_keys
+        # binding wires to <Up>/<Down>/<Left>/<Right>.
+        p._on_finder_delta_t_key_press(0.1)
+        dt, _ = p._live_offsets.snapshot()
+        assert dt == pytest.approx(1.1)
+
+        p._on_finder_perp_nudge_key_press(1.0)
+        _, perp = p._live_offsets.snapshot()
+        assert perp == 1.0
+    finally:
+        finder_worker.shutdown()
+        root.destroy()
+
+
+def test_transit_panel_apply_roi_pushes_current_capture_extent_into_finder_state():
+    # Regression: the finder preview's FOV rectangle used to always reflect
+    # the main camera's FULL sensor, even after dragging a smaller ROI --
+    # see FinderState.main_sensor_width/height and main_roi_offset_row/col.
+    root = tk.Tk()
+    root.withdraw()
+    mount_worker = MountWorker()
+    camera_worker = CameraWorker()
+    finder_state = FinderState()
+    try:
+        p = TransitPanel(root, mount_worker, camera_worker, Path("/tmp"), finder_state=finder_state)
+        p._sensor_width, p._sensor_height = 1936, 1096
+        p._camera_worker.set_roi = lambda *a, **kw: None
+
+        p._apply_roi(0, 0, 1936, 1096)
+        assert finder_state.main_sensor_width == 1936
+        assert finder_state.main_sensor_height == 1096
+        assert finder_state.main_roi_offset_row == pytest.approx(0.0)
+        assert finder_state.main_roi_offset_col == pytest.approx(0.0)
+
+        # A 400x300 ROI starting at (100, 50): centre is (300, 200), full
+        # sensor centre is (968, 548) -- offset is centre - full_centre.
+        p._apply_roi(100, 50, 400, 300)
+        assert finder_state.main_sensor_width == 400
+        assert finder_state.main_sensor_height == 300
+        assert finder_state.main_roi_offset_col == pytest.approx((100 + 200) - 968)
+        assert finder_state.main_roi_offset_row == pytest.approx((50 + 150) - 548)
     finally:
         mount_worker.shutdown()
         camera_worker.shutdown()

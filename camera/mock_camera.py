@@ -59,7 +59,16 @@ STAR_CATALOG_PATH = Path(__file__).resolve().parent.parent / "assets" / "bright_
 # STAR_MAG0_PEAK is deliberately a bit under ISS_PEAK_VALUE so the ISS is
 # always the brightest thing in frame even next to a hypothetical mag-0 star.
 STAR_MAG0_PEAK = 180.0
-STAR_MIN_VISIBLE_PEAK = 3.0  # skip rendering (and the gaussian-patch cost) below this -- indistinguishable from noise anyway
+# 1.5, not the original 3.0 -- at default gain/exposure this puts the
+# visible magnitude limit around ~5.7 instead of ~4.9 (confirmed: with the
+# old 3.0 threshold, a wide-FOV finder camera and the narrow main camera
+# showed almost the same star count for most sky positions, since the
+# catalogue is sparse above mag~5 -- the FOV difference only becomes
+# visible once faint-enough stars are allowed through). Kept above the
+# noise floor (~0.4-1.1x noise_sigma depending on gain) rather than
+# pushed all the way down to the catalogue's real mag~9.5 depth, which
+# would put most of the newly-revealed stars indistinguishable from noise.
+STAR_MIN_VISIBLE_PEAK = 1.5  # skip rendering (and the gaussian-patch cost) below this -- indistinguishable from noise anyway
 STAR_SIGMA_PX = 1.2
 ISS_PEAK_VALUE = 200.0
 ISS_SIGMA_PX = 3.0
@@ -71,6 +80,11 @@ ISS_SIGMA_PX = 3.0
 # stand-in, not true dB-based gain math) -- so this is a direct ratio, not
 # another capped curve.
 EXPOSURE_REFERENCE_US = 1000.0
+
+# Real minimum frame interval regardless of configured exposure -- see
+# read_frame's own comment for why this exists (CPU/thermal, not just a
+# nicety). ~33fps ceiling, still plenty smooth for a mock preview.
+MIN_FRAME_INTERVAL_S = 0.03
 
 _star_catalog_cache: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
 
@@ -93,10 +107,12 @@ class MockAsiCamera:
     def __init__(
         self, seed: int | None = None, plate_scale_arcsec_per_px: float = DEFAULT_ARCSEC_PER_PIXEL,
         bit_depth: int = 8,
+        sensor_width: int = 640, sensor_height: int = 480,
     ):
         self._rng = np.random.default_rng(seed)
         self._x, self._y = 0, 0
-        self._width, self._height = 640, 480
+        self._width, self._height = sensor_width, sensor_height
+        self._sensor_width, self._sensor_height = sensor_width, sensor_height
         self._exposure_us = 1000
         self._gain = 300
         self._bit_depth = bit_depth
@@ -107,6 +123,16 @@ class MockAsiCamera:
         self._sky_lock = threading.Lock()
         self._boresight_radec: tuple[float, float] | None = None  # (ra_deg, dec_deg)
         self._target_radec: tuple[float, float] | None = None  # (ra_deg, dec_deg) -- the ISS
+        # Precomputed once per (width, height) instead of drawing a fresh
+        # full-frame gaussian every read_frame() call -- rng.normal() over
+        # the finder's 3840x2160 frame alone measured ~93ms, which pinned a
+        # full CPU core (confirmed via psutil: ~97.5% utilization) and was
+        # the real cause of a reported sustained 100°C CPU temperature with
+        # two mock cameras running. Each frame instead slices a random
+        # window of this pool (~9ms) -- still a different-looking pattern
+        # every frame (the offset moves), just not independently drawn.
+        self._noise_pool: np.ndarray | None = None
+        self._noise_pool_dims: tuple[int, int] | None = None
 
     def open(self) -> None:
         self._opened = True
@@ -202,6 +228,25 @@ class MockAsiCamera:
         yy, xx = np.mgrid[y0:y1, x0:x1]
         frame[y0:y1, x0:x1] += peak * np.exp(-(((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma**2)))
 
+    # How far the random window can roam inside the pool -- also what makes
+    # consecutive frames look like independent noise despite sharing a pool.
+    _NOISE_POOL_MARGIN = 64
+
+    def _draw_noise(self, sigma: float) -> np.ndarray:
+        """A (height, width) background-noise array, mean 20.0 -- see the
+        _noise_pool comment in __init__ for why this doesn't call
+        rng.normal() fresh every frame."""
+        dims = (self._height, self._width)
+        if self._noise_pool is None or self._noise_pool_dims != dims:
+            pool_h = self._height + self._NOISE_POOL_MARGIN
+            pool_w = self._width + self._NOISE_POOL_MARGIN
+            self._noise_pool = self._rng.standard_normal(size=(pool_h, pool_w)).astype(np.float32)
+            self._noise_pool_dims = dims
+        oy = self._rng.integers(0, self._NOISE_POOL_MARGIN + 1)
+        ox = self._rng.integers(0, self._NOISE_POOL_MARGIN + 1)
+        window = self._noise_pool[oy:oy + self._height, ox:ox + self._width]
+        return window * sigma + 20.0
+
     def _render_float_frame(self) -> np.ndarray:
         """Builds one frame of the synthetic scene at full float precision,
         unclamped to any particular bit depth -- read_frame clamps this to
@@ -214,7 +259,7 @@ class MockAsiCamera:
         exposure_scale = self._exposure_us / EXPOSURE_REFERENCE_US
         gain_scale = (1.0 + self._gain / 570.0) * exposure_scale
         noise_sigma = 6.0 / max(1.0 + self._gain / 570.0, 0.1)
-        frame = self._rng.normal(20.0, noise_sigma, size=(self._height, self._width))
+        frame = self._draw_noise(noise_sigma)
 
         with self._sky_lock:
             boresight, target = self._boresight_radec, self._target_radec
@@ -245,8 +290,20 @@ class MockAsiCamera:
 
     def read_frame(self, timeout_ms: int = 2000) -> np.ndarray:
         # Pace frames by the configured exposure, like a real sensor's frame
-        # interval — lets the worker measure a believable fps.
-        time.sleep(max(self._exposure_us / 1_000_000.0, 0.002))
+        # interval — lets the worker measure a believable fps. Floored at
+        # MIN_FRAME_INTERVAL_S (not the old 2ms), which caps this at
+        # roughly 30fps regardless of how short the configured exposure is
+        # -- _render_float_frame's own cost (a fresh full-frame gaussian
+        # noise draw + star rendering every call, ~35-120ms measured on
+        # this machine depending on sensor size) means CameraWorker's read
+        # loop (see camera/worker.py's _run, which just calls read_frame
+        # back-to-back with no throttle of its own) would otherwise pin a
+        # full CPU core continuously per connected mock camera -- confirmed
+        # as the cause of a real sustained 100°C CPU temperature with two
+        # mock cameras (main + finder) connected at once. A real ASI290MC/
+        # ASI678MM wouldn't sustain anywhere near 500fps in practice either,
+        # so this is a more realistic ceiling, not just a workaround.
+        time.sleep(max(self._exposure_us / 1_000_000.0, MIN_FRAME_INTERVAL_S))
         frame = self._render_float_frame()
         if self._bit_depth == 16:
             return np.clip(frame * (4095.0 / 255.0), 0, 4095).astype(np.uint16)

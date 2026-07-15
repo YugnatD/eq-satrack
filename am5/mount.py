@@ -132,6 +132,29 @@ class Mount:
         tracking run."""
         return self._send(b":Gm#", expect_response=True).strip().rstrip("#")
 
+    def set_meridian_behavior(self, track_past_meridian: bool, limit_deg: float, flip: bool = False) -> None:
+        """:ST<nnsnn># -- see protocol.build_set_meridian_behavior's
+        docstring for why this exists (root cause of a real "diverges
+        badly after the meridian" incident: never configured before,
+        default mount behavior silently stops RA tracking ~1 deg past the
+        meridian). Reply format is UNCONFIRMED against real hardware --
+        the doc's own "1: Success, 0: False" wording is identical to
+        set_tracking's/set_altitude_limits_enabled's, both of which turned
+        out to be a bare, unterminated "1"/"0" only after a real-hardware
+        test caught _send() blocking for the full response_timeout
+        expecting a '#' that never came, so this uses the same
+        _send_single_char path defensively -- treat as unverified until
+        actually tested."""
+        reply = self._send_single_char(protocol.build_set_meridian_behavior(track_past_meridian, limit_deg, flip)).strip()
+        if reply not in ("1", "1#"):
+            raise ProtocolError(f"mount rejected meridian behavior: {reply!r}")
+
+    def get_meridian_behavior(self) -> tuple[bool, bool, float]:
+        """:GTa# -- (flip, track_past_meridian, limit_deg), see
+        protocol.parse_meridian_behavior. Doc shows this reply IS
+        '#'-terminated ('nnsnn#'), unlike the Set command above."""
+        return protocol.parse_meridian_behavior(self._send(b":GTa#", expect_response=True))
+
     def set_altitude_limits_enabled(self, enabled: bool) -> str:
         # :SLE#/:SLD# reply "1"/"0" with no '#' terminator -- same class of
         # bug as set_tracking() had (confirmed on real hardware: this was

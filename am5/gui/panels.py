@@ -44,6 +44,7 @@ from am5.optics import (
 from am5.gui.theme import PALETTE, style_axes
 from am5.gui.worker import MountWorker, WorkerEvent
 from am5.tracker import AxisSigns, LiveOffsets, TrackingConfig, decompose_error
+from camera.finder import MAX_FINDER_EXPOSURE_US, FinderState, downsample_for_display
 from camera.guiding import BlobDetection, GuidingCalibration, calibrate_from_nudges, detect_brightest_blob
 from camera.ser_reader import SerReader
 from camera.worker import CameraEvent, CameraWorker, frame_to_pgm, pgm_to_array
@@ -254,16 +255,48 @@ class ConnectionPanel(ttk.Frame):
     should have to visit two different tabs just to plug both in before
     doing anything else."""
 
+    # Default optics for the mock cameras' simulated star field/ISS size --
+    # editable per-session via the sliders below, unlocked only in Mock
+    # mode (a real camera reports its own sensor size; focal length is a
+    # property of whichever telescope/lens is actually mounted, not
+    # something software can query). Plate scale = 206265 * pixel_size_um
+    # / (1000 * focal_length_mm) arcsec/px.
+    #
+    # Main: ASI290MC (1936x1096, 2.9µm pixels) on the main 1000mm tube.
+    MAIN_DEFAULT_FOCAL_MM = 1000
+    MAIN_DEFAULT_SENSOR_W = 1936
+    MAIN_DEFAULT_SENSOR_H = 1096
+    MAIN_DEFAULT_PIXEL_UM = 2.9
+    # Finder: ASI678MM (3840x2160, 2.0µm pixels) on an SVBony 60mm F/4
+    # (240mm focal length) finder scope.
+    FINDER_DEFAULT_FOCAL_MM = 240
+    FINDER_DEFAULT_SENSOR_W = 3840
+    FINDER_DEFAULT_SENSOR_H = 2160
+    FINDER_DEFAULT_PIXEL_UM = 2.0
+
+    @staticmethod
+    def _plate_scale_arcsec_per_px(focal_length_mm: float, pixel_size_um: float) -> float:
+        return 206265.0 * pixel_size_um / (1000.0 * focal_length_mm)
+
     def __init__(
         self, parent: tk.Misc, mount_worker: MountWorker, camera_worker: CameraWorker,
         on_connection_change: Callable[[bool], None],
         get_optical_train: Callable[[], OpticalTrain | None] | None = None,
         site_vars: SiteVars | None = None,
         map_widget_cls: type = TkinterMapView,
+        finder_worker: CameraWorker | None = None,
+        finder_state: FinderState | None = None,
     ):
         super().__init__(parent, padding=10)
         self._worker = mount_worker
         self._camera_worker = camera_worker
+        self._finder_worker = finder_worker
+        # Shared with FinderCameraPanel/FinderWindow/TransitPanel (same
+        # instance, owned by App) -- so the plate scale each camera is
+        # ACTUALLY connected with lands where calibration/correction read
+        # it (see calibrate_from_frames/get_correction_arcsec's callers),
+        # instead of a separately-typed, easily-stale duplicate value.
+        self._finder_state = finder_state
         self._on_connection_change = on_connection_change
         # Real configured plate scale for the mock camera's simulated star
         # field/ISS size -- optional so this panel still works without an
@@ -327,23 +360,87 @@ class ConnectionPanel(ttk.Frame):
 
         self._update_address_state()
 
-        camera_frame = ttk.LabelFrame(left, text="Camera", padding=8)
+        camera_frame = ttk.LabelFrame(left, text="Camera (ASI290MC, main tube)", padding=8)
         camera_frame.pack(fill="x", anchor="n", pady=(10, 0))
 
         self._camera_kind_var = tk.StringVar(value="mock")
-        ttk.Radiobutton(camera_frame, text="Mock", variable=self._camera_kind_var, value="mock").grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(camera_frame, text="Real ASI camera", variable=self._camera_kind_var, value="real").grid(row=0, column=1, sticky="w")
+        ttk.Radiobutton(
+            camera_frame, text="Mock", variable=self._camera_kind_var, value="mock",
+            command=lambda: self._update_mock_optics_state("main"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(
+            camera_frame, text="Real ASI camera", variable=self._camera_kind_var, value="real",
+            command=lambda: self._update_mock_optics_state("main"),
+        ).grid(row=0, column=1, sticky="w")
         ttk.Label(camera_frame, text="camera id").grid(row=1, column=0, sticky="w")
         self._camera_id_var = tk.StringVar(value="0")
         ttk.Entry(camera_frame, textvariable=self._camera_id_var, width=6).grid(row=1, column=1, sticky="w")
+
+        (
+            self._main_focal_var, self._main_sensor_w_var, self._main_sensor_h_var,
+            self._main_pixel_var, self._main_scale_label_var,
+        ) = self._build_mock_optics_rows(
+            camera_frame, start_row=2, prefix="main",
+            focal_mm=self.MAIN_DEFAULT_FOCAL_MM, sensor_w=self.MAIN_DEFAULT_SENSOR_W,
+            sensor_h=self.MAIN_DEFAULT_SENSOR_H, pixel_um=self.MAIN_DEFAULT_PIXEL_UM,
+        )
+
         self._camera_connect_button = ttk.Button(camera_frame, text="Connect", command=self._on_camera_connect_click)
-        self._camera_connect_button.grid(row=2, column=0, pady=(6, 0))
+        self._camera_connect_button.grid(row=7, column=0, pady=(6, 0))
         self._camera_disconnect_button = ttk.Button(
             camera_frame, text="Disconnect", command=self._camera_worker.disconnect, state="disabled",
         )
-        self._camera_disconnect_button.grid(row=2, column=1, pady=(6, 0))
+        self._camera_disconnect_button.grid(row=7, column=1, pady=(6, 0))
         self._camera_status_var = tk.StringVar(value="Not connected")
-        ttk.Label(camera_frame, textvariable=self._camera_status_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(camera_frame, textvariable=self._camera_status_var).grid(row=8, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self._update_mock_optics_state("main")
+
+        # Finder scope camera -- entirely optional, greyed out if no
+        # finder_worker was passed in (e.g. tests, or a build without the
+        # finder feature wired up).
+        finder_frame = ttk.LabelFrame(left, text="Finder camera (ASI678MM, optional)", padding=8)
+        finder_frame.pack(fill="x", anchor="n", pady=(10, 0))
+        self._finder_kind_var = tk.StringVar(value="mock")
+        finder_mock_radio = ttk.Radiobutton(
+            finder_frame, text="Mock", variable=self._finder_kind_var, value="mock",
+            command=lambda: self._update_mock_optics_state("finder"),
+        )
+        finder_mock_radio.grid(row=0, column=0, sticky="w")
+        finder_real_radio = ttk.Radiobutton(
+            finder_frame, text="Real ASI camera", variable=self._finder_kind_var, value="real",
+            command=lambda: self._update_mock_optics_state("finder"),
+        )
+        finder_real_radio.grid(row=0, column=1, sticky="w")
+        ttk.Label(finder_frame, text="camera id").grid(row=1, column=0, sticky="w")
+        self._finder_id_var = tk.StringVar(value="1")
+        finder_id_entry = ttk.Entry(finder_frame, textvariable=self._finder_id_var, width=6)
+        finder_id_entry.grid(row=1, column=1, sticky="w")
+
+        (
+            self._finder_focal_var, self._finder_sensor_w_var, self._finder_sensor_h_var,
+            self._finder_pixel_var, self._finder_scale_label_var,
+        ) = self._build_mock_optics_rows(
+            finder_frame, start_row=2, prefix="finder",
+            focal_mm=self.FINDER_DEFAULT_FOCAL_MM, sensor_w=self.FINDER_DEFAULT_SENSOR_W,
+            sensor_h=self.FINDER_DEFAULT_SENSOR_H, pixel_um=self.FINDER_DEFAULT_PIXEL_UM,
+            focal_pixel_always_editable=True,
+        )
+
+        self._finder_connect_button = ttk.Button(finder_frame, text="Connect", command=self._on_finder_connect_click)
+        self._finder_connect_button.grid(row=7, column=0, pady=(6, 0))
+        self._finder_disconnect_button = ttk.Button(
+            finder_frame, text="Disconnect",
+            command=self._finder_worker.disconnect if self._finder_worker is not None else (lambda: None),
+            state="disabled",
+        )
+        self._finder_disconnect_button.grid(row=7, column=1, pady=(6, 0))
+        self._finder_status_var = tk.StringVar(value="Not connected")
+        ttk.Label(finder_frame, textvariable=self._finder_status_var).grid(row=8, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        if self._finder_worker is None:
+            for w in (finder_mock_radio, finder_real_radio, finder_id_entry, self._finder_connect_button):
+                w.configure(state="disabled")
+            self._finder_status_var.set("Not available (no finder worker configured)")
+        self._update_mock_optics_state("finder")
 
         location_frame = ttk.LabelFrame(right, text="Location", padding=8)
         location_frame.pack(fill="both", expand=True)
@@ -379,6 +476,86 @@ class ConnectionPanel(ttk.Frame):
         self._map_widget.add_left_click_map_command(self._on_map_click)
 
         self.after(200, self._poll_geocode_results)
+
+    def _build_mock_optics_rows(
+        self, parent: tk.Misc, start_row: int, prefix: str,
+        focal_mm: float, sensor_w: int, sensor_h: int, pixel_um: float,
+        focal_pixel_always_editable: bool = False,
+    ) -> tuple[tk.StringVar, tk.StringVar, tk.StringVar, tk.StringVar, tk.StringVar]:
+        """Focal length / sensor resolution / pixel size fields for a mock
+        camera's simulated optics -- sensor W/H are only meaningful (and
+        only editable) in Mock mode, since a real camera reports its own
+        sensor size (see the "connected" event's width/height). Unlocked/
+        locked by _update_mock_optics_state. Returns the four StringVars
+        plus a live plate-scale readout var.
+
+        focal_pixel_always_editable: if True, focal length and pixel size
+        stay editable in Real mode too (only sensor W/H get locked) --
+        neither is auto-reported by ANY camera, real or mock, unlike
+        sensor size. The main camera doesn't need this (its real-mode
+        plate scale comes from the Exposure calc tab's own fields
+        instead, see ConnectionPanel._on_camera_connect_click), but the
+        finder has no other source for these two values in real mode --
+        confirmed missing entirely before this parameter existed, which
+        silently left FinderState.finder_plate_scale_arcsec stuck at its
+        1.0 default for any real finder camera, corrupting both the FOV
+        rectangle's size and every finder-based correction's magnitude."""
+        focal_var = tk.StringVar(value=str(focal_mm))
+        sensor_w_var = tk.StringVar(value=str(sensor_w))
+        sensor_h_var = tk.StringVar(value=str(sensor_h))
+        pixel_var = tk.StringVar(value=str(pixel_um))
+        scale_label_var = tk.StringVar(value="")
+
+        ttk.Label(parent, text="focal length (mm)").grid(row=start_row, column=0, sticky="w")
+        focal_entry = ttk.Entry(parent, textvariable=focal_var, width=8)
+        focal_entry.grid(row=start_row, column=1, sticky="w")
+        ttk.Label(parent, text="sensor W x H (px)").grid(row=start_row + 1, column=0, sticky="w")
+        sensor_frame = ttk.Frame(parent)
+        sensor_frame.grid(row=start_row + 1, column=1, sticky="w")
+        sensor_w_entry = ttk.Entry(sensor_frame, textvariable=sensor_w_var, width=6)
+        sensor_w_entry.pack(side="left")
+        ttk.Label(sensor_frame, text="x").pack(side="left")
+        sensor_h_entry = ttk.Entry(sensor_frame, textvariable=sensor_h_var, width=6)
+        sensor_h_entry.pack(side="left")
+        ttk.Label(parent, text="pixel size (µm)").grid(row=start_row + 2, column=0, sticky="w")
+        pixel_entry = ttk.Entry(parent, textvariable=pixel_var, width=8)
+        pixel_entry.grid(row=start_row + 2, column=1, sticky="w")
+        ttk.Label(parent, textvariable=scale_label_var, foreground=PALETTE.fg_dim).grid(
+            row=start_row + 3, column=0, columnspan=2, sticky="w", pady=(2, 4),
+        )
+
+        def _update_scale_label(*_args: object) -> None:
+            try:
+                scale = self._plate_scale_arcsec_per_px(float(focal_var.get()), float(pixel_var.get()))
+                scale_label_var.set(f"→ {scale:.3f} arcsec/px")
+            except (ValueError, ZeroDivisionError):
+                scale_label_var.set("→ invalid focal length / pixel size")
+
+        for var in (focal_var, pixel_var):
+            var.trace_add("write", _update_scale_label)
+        _update_scale_label()
+
+        # Store widgets directly (not collected after the fact) so
+        # _update_mock_optics_state can lock/unlock exactly these.
+        mock_only_widgets = [sensor_w_entry, sensor_h_entry] if focal_pixel_always_editable else [
+            focal_entry, sensor_w_entry, sensor_h_entry, pixel_entry,
+        ]
+        setattr(self, f"_{prefix}_optics_widgets", mock_only_widgets)
+        if focal_pixel_always_editable:
+            setattr(self, f"_{prefix}_optics_always_editable_widgets", [focal_entry, pixel_entry])
+
+        return focal_var, sensor_w_var, sensor_h_var, pixel_var, scale_label_var
+
+    def _update_mock_optics_state(self, which: str) -> None:
+        """Locks the sensor-size fields (and, for the main camera, also
+        focal/pixel -- see _build_mock_optics_rows' focal_pixel_always_
+        editable param) for `which` ("main" or "finder") unless that
+        device's kind var is set to Mock."""
+        kind_var = self._camera_kind_var if which == "main" else self._finder_kind_var
+        is_mock = kind_var.get() == "mock"
+        widgets = getattr(self, f"_{which}_optics_widgets", [])
+        for w in widgets:
+            w.configure(state="normal" if is_mock else "disabled")
 
     def _update_address_state(self) -> None:
         self._address_entry.configure(state="disabled" if self._kind_var.get() == "mock" else "normal")
@@ -480,14 +657,37 @@ class ConnectionPanel(ttk.Frame):
             return
         self._camera_connect_button.configure(state="disabled")
         self._camera_status_var.set("Connecting...")
+        kind = self._camera_kind_var.get()
+        if kind == "mock":
+            # Mock mode: this panel's own focal/sensor/pixel fields are the
+            # single source of truth -- NOT the Exposure calc tab's optical
+            # train, which models a hypothetical setup for exposure planning
+            # and isn't necessarily what the mock should simulate right now.
+            try:
+                focal_mm = float(self._main_focal_var.get())
+                sensor_w = int(float(self._main_sensor_w_var.get()))
+                sensor_h = int(float(self._main_sensor_h_var.get()))
+                pixel_um = float(self._main_pixel_var.get())
+            except ValueError:
+                self._camera_status_var.set("Invalid focal length / sensor / pixel size")
+                self._camera_connect_button.configure(state="normal")
+                return
+            plate_scale = self._plate_scale_arcsec_per_px(focal_mm, pixel_um)
+            self._camera_worker.connect(
+                kind, camera_id=camera_id, plate_scale_arcsec_per_px=plate_scale,
+                mock_sensor_width=sensor_w, mock_sensor_height=sensor_h,
+            )
+            if self._finder_state is not None:
+                self._finder_state.main_plate_scale_arcsec = plate_scale
+            return
         plate_scale = None
         if self._get_optical_train is not None:
             train = self._get_optical_train()
             if train is not None:
                 plate_scale = train.plate_scale_arcsec_per_px
-        self._camera_worker.connect(
-            self._camera_kind_var.get(), camera_id=camera_id, plate_scale_arcsec_per_px=plate_scale,
-        )
+        self._camera_worker.connect(kind, camera_id=camera_id, plate_scale_arcsec_per_px=plate_scale)
+        if self._finder_state is not None and plate_scale is not None:
+            self._finder_state.main_plate_scale_arcsec = plate_scale
 
     def handle_camera_event(self, event: CameraEvent) -> None:
         if event.kind == "connected":
@@ -504,6 +704,73 @@ class ConnectionPanel(ttk.Frame):
             self._camera_status_var.set("Not connected")
             self._camera_connect_button.configure(state="normal")
             self._camera_disconnect_button.configure(state="disabled")
+
+    def _on_finder_connect_click(self) -> None:
+        if self._finder_worker is None:
+            return
+        try:
+            camera_id = int(self._finder_id_var.get())
+        except ValueError:
+            self._finder_status_var.set("Invalid camera id")
+            return
+        self._finder_connect_button.configure(state="disabled")
+        self._finder_status_var.set("Connecting...")
+        kind = self._finder_kind_var.get()
+        if kind == "mock":
+            try:
+                focal_mm = float(self._finder_focal_var.get())
+                sensor_w = int(float(self._finder_sensor_w_var.get()))
+                sensor_h = int(float(self._finder_sensor_h_var.get()))
+                pixel_um = float(self._finder_pixel_var.get())
+            except ValueError:
+                self._finder_status_var.set("Invalid focal length / sensor / pixel size")
+                self._finder_connect_button.configure(state="normal")
+                return
+            plate_scale = self._plate_scale_arcsec_per_px(focal_mm, pixel_um)
+            self._finder_worker.connect(
+                kind, camera_id=camera_id, plate_scale_arcsec_per_px=plate_scale,
+                mock_sensor_width=sensor_w, mock_sensor_height=sensor_h,
+            )
+            if self._finder_state is not None:
+                self._finder_state.finder_plate_scale_arcsec = plate_scale
+            return
+        # Real camera: sensor size comes from the device itself (the
+        # "connected" event), but focal length/pixel size are never
+        # auto-reported by any camera -- read them from this panel's own
+        # (always-editable in real mode, see focal_pixel_always_editable)
+        # fields, same formula as the mock branch above. Without this, a
+        # real finder camera left FinderState.finder_plate_scale_arcsec
+        # stuck at its 1.0 default -- silently wrong for every finder
+        # calibration and correction (confirmed missing entirely before
+        # this fix, the main camera's equivalent case works only because
+        # it has a different source, the Exposure calc tab's optical
+        # train, see _on_camera_connect_click).
+        try:
+            focal_mm = float(self._finder_focal_var.get())
+            pixel_um = float(self._finder_pixel_var.get())
+            if self._finder_state is not None:
+                self._finder_state.finder_plate_scale_arcsec = self._plate_scale_arcsec_per_px(focal_mm, pixel_um)
+        except (ValueError, ZeroDivisionError):
+            self._finder_status_var.set(
+                "Warning: invalid finder focal length / pixel size -- calibration will use a wrong scale"
+            )
+        self._finder_worker.connect(kind, camera_id=camera_id)
+
+    def handle_finder_camera_event(self, event: CameraEvent) -> None:
+        if event.kind == "connected":
+            self._finder_status_var.set(
+                f"Connected — {event.payload['width']}x{event.payload['height']}"
+                f"{' colour' if event.payload['is_color'] else ' mono'}"
+                f", {event.payload.get('bit_depth', 8)}-bit"
+            )
+            self._finder_disconnect_button.configure(state="normal")
+        elif event.kind == "connect_error":
+            self._finder_status_var.set(f"Connection failed: {event.payload['message']}")
+            self._finder_connect_button.configure(state="normal")
+        elif event.kind == "disconnected":
+            self._finder_status_var.set("Not connected")
+            self._finder_connect_button.configure(state="normal")
+            self._finder_disconnect_button.configure(state="disabled")
 
 
 class SkyMapWidget:
@@ -817,6 +1084,7 @@ class TransitPanel(ttk.Frame):
         axis_signs: AxisSigns | None = None, auto_guide_var: tk.BooleanVar | None = None,
         camera_vars: CameraControlVars | None = None,
         mount_lag_var: tk.DoubleVar | None = None, feedback_enabled_var: tk.BooleanVar | None = None,
+        finder_state: FinderState | None = None,
     ):
         super().__init__(parent, padding=10)
         self._mount_worker = mount_worker
@@ -855,11 +1123,19 @@ class TransitPanel(ttk.Frame):
         # Falls back to a private var so this panel still works standalone.
         self._mount_lag_var = mount_lag_var if mount_lag_var is not None else tk.DoubleVar(value=0.0)
         self._feedback_enabled_var = feedback_enabled_var if feedback_enabled_var is not None else tk.BooleanVar(value=False)
+        self._finder_state = finder_state
         self._armed = False
         self._mount_connected = False
 
         # -- camera state --
         self._camera_interactive_widgets: list[tk.Widget] = []
+        # Subset of the above that must also grey out while recording is
+        # active -- the worker refuses ROI/bit-depth changes mid-recording
+        # (see CameraWorker._handle_set_roi/_handle_set_bit_depth, added
+        # after a live ROI change was found to corrupt the SER file being
+        # written), so disable them here too rather than let the operator
+        # click a control that silently no-ops except for a log line.
+        self._roi_bitdepth_widgets: list[tk.Widget] = []
         self._recording = False
         self._colour_id = 0
         self._is_color = False
@@ -923,8 +1199,10 @@ class TransitPanel(ttk.Frame):
         self._stop_button.pack(side="left", padx=(4, 0))
         self._simulate_button = ttk.Button(button_row, text="Simulate track", command=self._on_simulate_click, state="disabled")
         self._simulate_button.pack(side="left", padx=(4, 0))
-        self._jog_goto_button = ttk.Button(button_row, text="Manual GOTO (keep pier side)", command=self._on_jog_goto_click, state="disabled")
+        self._jog_goto_button = ttk.Button(button_row, text="GOTO (jog, keep pier side)", command=self._on_jog_goto_click, state="disabled")
         self._jog_goto_button.pack(side="left", padx=(4, 0))
+        self._mount_goto_button = ttk.Button(button_row, text="GOTO (mount, auto pier side)", command=self._on_mount_goto_click, state="disabled")
+        self._mount_goto_button.pack(side="left", padx=(4, 0))
 
         offset_row = ttk.Frame(parent)
         offset_row.pack(anchor="w", pady=(4, 4))
@@ -960,6 +1238,17 @@ class TransitPanel(ttk.Frame):
             foreground=PALETTE.fg_dim, justify="left",
         ).pack(anchor="w", pady=(0, 4))
 
+        self._finder_correct_var = tk.BooleanVar(value=False)
+        self._finder_check = ttk.Checkbutton(
+            parent, text="Enable finder correction (wide-field ISS blob → cross-track nudge)",
+            variable=self._finder_correct_var, state="disabled",
+        )
+        self._finder_check.pack(anchor="w")
+        ttk.Label(
+            parent, text="Needs finder calibration first, in the Finder tab.",
+            foreground=PALETTE.fg_dim, justify="left",
+        ).pack(anchor="w", pady=(0, 4))
+
         self._feedback_check = ttk.Checkbutton(
             parent, text="Enable feedback trim (experimental PI on along/cross-track error)",
             variable=self._feedback_enabled_var,
@@ -974,8 +1263,10 @@ class TransitPanel(ttk.Frame):
         views = ttk.Notebook(parent)
         views.pack(fill="both", expand=True)
         error_tab = ttk.Frame(views)
+        hist_tab = ttk.Frame(views)
         sky_tab = ttk.Frame(views)
         views.add(error_tab, text="Error plot")
+        views.add(hist_tab, text="Histogram")
         views.add(sky_tab, text="Sky map")
 
         self._figure = Figure(figsize=(5, 3), dpi=100)
@@ -993,6 +1284,17 @@ class TransitPanel(ttk.Frame):
         self._plot_t: list[float] = []
         self._plot_along: list[float] = []
         self._plot_cross: list[float] = []
+
+        # Histogram: distribution of tracking errors -- useful for judging
+        # overall pass quality (a tight, zero-centred peak = good; wide or
+        # offset = systematic error) without having to read the time-series.
+        self._hist_figure = Figure(figsize=(5, 3), dpi=100)
+        self._hist_ax = self._hist_figure.add_subplot(111)
+        self._hist_ax.set_xlabel("error (arcsec)")
+        self._hist_ax.set_ylabel("frames")
+        style_axes(self._hist_figure, self._hist_ax)
+        self._hist_canvas = FigureCanvasTkAgg(self._hist_figure, master=hist_tab)
+        self._hist_canvas.get_tk_widget().pack(fill="both", expand=True)
 
         self._sky_map = SkyMapWidget(sky_tab)
         self._sky_map.widget().pack(fill="both", expand=True)
@@ -1043,6 +1345,11 @@ class TransitPanel(ttk.Frame):
         if not available:
             self._auto_guide_var.set(False)
 
+    def set_finder_correction_available(self, available: bool) -> None:
+        self._finder_check.configure(state="normal" if available else "disabled")
+        if not available:
+            self._finder_correct_var.set(False)
+
     def set_mount_connected(self, connected: bool) -> None:
         self._mount_connected = connected
         if not connected:
@@ -1050,10 +1357,12 @@ class TransitPanel(ttk.Frame):
             self._start_button.configure(state="disabled")
             self._simulate_button.configure(state="disabled")
             self._jog_goto_button.configure(state="disabled")
+            self._mount_goto_button.configure(state="disabled")
         elif self._trajectory is not None:
             self._arm_button.configure(state="normal")
             self._simulate_button.configure(state="normal")
             self._jog_goto_button.configure(state="normal")
+            self._mount_goto_button.configure(state="normal")
 
     def set_trajectory(
         self, trajectory: Trajectory, window: PassWindow, crossings: list, site: GeographicPosition,
@@ -1078,6 +1387,7 @@ class TransitPanel(ttk.Frame):
             self._arm_button.configure(state="normal")
             self._simulate_button.configure(state="normal")
             self._jog_goto_button.configure(state="normal")
+            self._mount_goto_button.configure(state="normal")
 
         self._redraw_sky_map()
 
@@ -1178,6 +1488,8 @@ class TransitPanel(ttk.Frame):
         self._plot_t.clear()
         self._plot_along.clear()
         self._plot_cross.clear()
+        self._hist_ax.clear()
+        self._hist_canvas.draw_idle()
         self._out_dir.mkdir(parents=True, exist_ok=True)
         csv_path = self._out_dir / f"tracking_{datetime.now().strftime('%Y%m%dT%H%M%S')}.csv"
         duration_s = max(0.0, (self._window.t_set - datetime.now(timezone.utc)).total_seconds())
@@ -1190,6 +1502,7 @@ class TransitPanel(ttk.Frame):
         self._arm_button.configure(state="disabled")
         self._simulate_button.configure(state="disabled")
         self._jog_goto_button.configure(state="disabled")
+        self._mount_goto_button.configure(state="disabled")
 
     def _on_simulate_click(self) -> None:
         """Replays the exact same real trajectory (RA/DEC/rates, including
@@ -1213,36 +1526,54 @@ class TransitPanel(ttk.Frame):
         )
         self._simulate_button.configure(state="disabled")
         self._jog_goto_button.configure(state="disabled")
+        self._mount_goto_button.configure(state="disabled")
         self._start_button.configure(state="disabled")
         self._arm_button.configure(state="disabled")
         self._stop_button.configure(state="normal")
 
-    def _on_jog_goto_click(self) -> None:
-        """Approaches the pass's start RA/DEC via jog only (never :MS#), so
-        it preserves whatever pier side the mount is already on -- see
-        MountWorker.jog_goto's docstring for why :MS# can't be used for
-        this (it ignores the mount's current position/side entirely)."""
-        if self._trajectory is None:
-            return
-        self._redraw_sky_map(rehearsal_now=datetime.now(timezone.utc))
-        start_ra, start_dec, _, _ = self._trajectory.interpolate(float(self._trajectory.t_unix[0]))
-        # Disable everything that could start tracking while this runs,
-        # not just this button -- confirmed on real hardware: Start/
-        # Simulate aren't gated on jog_goto's own in-progress state, so
-        # clicking one while a jog_goto is still converging queues a
-        # start_tracking command that only actually begins once jog_goto
-        # finally finishes (MountWorker processes one command at a time).
-        # But the trajectory's "start now" time-shift is computed at CLICK
-        # time, not at whenever tracking actually begins -- so tracking
-        # started with a large, silent along-track error baked in (~1.36
-        # deg measured -- nowhere near enough to trip the runaway guard,
-        # but easily enough to put a narrow-FOV target outside the frame
-        # for the whole pass).
+    def _goto_start_radec(self) -> tuple[float, float]:
+        """RA/DEC where the ISS will be at pass start (or NOW if already
+        in-progress) -- what to slew to before arming, so the mount is
+        already pointed correctly when tracking begins rather than needing
+        to catch up from wherever it happened to be."""
+        now_unix = datetime.now(timezone.utc).timestamp()
+        t_target = max(float(self._trajectory.t_unix[0]), now_unix)
+        t_target = min(t_target, float(self._trajectory.t_unix[-1]))
+        ra, dec, _, _ = self._trajectory.interpolate(t_target)
+        return (ra % 360.0) / 15.0, dec
+
+    def _disable_goto_buttons(self) -> None:
+        """Disable everything that could start tracking while a GOTO runs --
+        not just the GOTO button itself (confirmed on real hardware: Start/
+        Simulate queued while jog_goto was still converging would inherit a
+        large silent along-track error baked in at click time)."""
         self._jog_goto_button.configure(state="disabled")
+        self._mount_goto_button.configure(state="disabled")
         self._arm_button.configure(state="disabled")
         self._start_button.configure(state="disabled")
         self._simulate_button.configure(state="disabled")
-        self._mount_worker.jog_goto((start_ra % 360.0) / 15.0, start_dec, self._axis_signs)
+
+    def _on_jog_goto_click(self) -> None:
+        """Jog-based GOTO to the pass-start position -- preserves pier side
+        (never uses :MS#) but requires a valid axis-sign calibration."""
+        if self._trajectory is None:
+            return
+        self._redraw_sky_map(rehearsal_now=datetime.now(timezone.utc))
+        ra_hours, dec_deg = self._goto_start_radec()
+        self._disable_goto_buttons()
+        self._mount_worker.jog_goto(ra_hours, dec_deg, self._axis_signs)
+
+    def _on_mount_goto_click(self) -> None:
+        """Native mount GOTO (:MS#) to the pass-start position -- the
+        firmware handles pier side automatically, so this works even
+        without a valid axis-sign calibration. Trade-off: the mount
+        chooses the pier side, which may differ from the current one."""
+        if self._trajectory is None:
+            return
+        self._redraw_sky_map(rehearsal_now=datetime.now(timezone.utc))
+        ra_hours, dec_deg = self._goto_start_radec()
+        self._disable_goto_buttons()
+        self._mount_worker.goto(ra_hours, dec_deg)
 
     def _poll_delta_t_display(self) -> None:
         dt, _ = self._offsets.snapshot()
@@ -1261,8 +1592,12 @@ class TransitPanel(ttk.Frame):
         until_rise_s = (self._window.t_rise - now).total_seconds()
         until_set_s = (self._window.t_set - now).total_seconds()
         if until_rise_s > 0:
+            if until_rise_s < 90:
+                return f"Rise in {until_rise_s:.0f} s"
             return f"Rise in {until_rise_s / 60.0:.1f} min"
         if until_set_s > 0:
+            if until_set_s < 90:
+                return f"Pass in progress -- sets in {until_set_s:.0f} s"
             return f"Pass in progress -- sets in {until_set_s / 60.0:.1f} min"
         return f"Pass ended {-until_set_s / 60.0:.1f} min ago -- pick another pass"
 
@@ -1293,9 +1628,33 @@ class TransitPanel(ttk.Frame):
             self._ax.relim()
             self._ax.autoscale_view()
             self._canvas.draw_idle()
+            self._maybe_apply_finder_correction()
+            # Histogram: update every 10 ticks (no need to redraw every tick)
+            if len(self._plot_along) % 10 == 0 and len(self._plot_along) > 0:
+                self._hist_ax.clear()
+                self._hist_ax.hist(self._plot_along, bins=20, alpha=0.7, color=PALETTE.accent, label="along-track")
+                self._hist_ax.hist(self._plot_cross, bins=20, alpha=0.7, color=PALETTE.accent_warn, label="cross-track")
+                self._hist_ax.axvline(0, color=PALETTE.fg_dim, linewidth=0.8, linestyle="--")
+                self._hist_ax.set_xlabel("error (arcsec)")
+                self._hist_ax.set_ylabel("frames")
+                legend = self._hist_ax.legend(loc="upper right", facecolor=PALETTE.bg_widget, edgecolor=PALETTE.border)
+                for text in legend.get_texts():
+                    text.set_color(PALETTE.fg)
+                style_axes(self._hist_figure, self._hist_ax)
+                self._hist_canvas.draw_idle()
         elif event.kind == "jog_goto_result":
             if self._mount_connected and self._trajectory is not None:
                 self._jog_goto_button.configure(state="normal")
+                self._mount_goto_button.configure(state="normal")
+                self._arm_button.configure(state="normal")
+                self._simulate_button.configure(state="normal")
+                if self._armed:
+                    self._start_button.configure(state="normal")
+        elif event.kind == "goto_result":
+            # Native :MS# GOTO complete -- re-enable GOTO buttons
+            if self._mount_connected and self._trajectory is not None:
+                self._jog_goto_button.configure(state="normal")
+                self._mount_goto_button.configure(state="normal")
                 self._arm_button.configure(state="normal")
                 self._simulate_button.configure(state="normal")
                 if self._armed:
@@ -1306,6 +1665,7 @@ class TransitPanel(ttk.Frame):
                 self._arm_button.configure(state="normal")
                 self._simulate_button.configure(state="normal")
                 self._jog_goto_button.configure(state="normal")
+                self._mount_goto_button.configure(state="normal")
 
     # ==================================================================
     # Camera column
@@ -1331,12 +1691,15 @@ class TransitPanel(ttk.Frame):
             entry = ttk.Entry(roi_frame, textvariable=var, width=6)
             entry.grid(row=0, column=i * 2 + 1, sticky="w")
             self._camera_interactive_widgets.append(entry)
+            self._roi_bitdepth_widgets.append(entry)
         roi_button = ttk.Button(roi_frame, text="Apply", command=self._on_apply_roi_entries)
         roi_button.grid(row=0, column=8, padx=(8, 0))
         self._camera_interactive_widgets.append(roi_button)
+        self._roi_bitdepth_widgets.append(roi_button)
         reset_button = ttk.Button(roi_frame, text="Reset (full frame)", command=self._on_reset_roi)
         reset_button.grid(row=0, column=9, padx=(4, 0))
         self._camera_interactive_widgets.append(reset_button)
+        self._roi_bitdepth_widgets.append(reset_button)
 
         controls_frame = ttk.LabelFrame(parent, text="Exposure / gain", padding=8)
         controls_frame.pack(fill="x", pady=(8, 0))
@@ -1392,6 +1755,7 @@ class TransitPanel(ttk.Frame):
         self._bit_depth_combo.pack(side="left", padx=(4, 0))
         self._bit_depth_combo.bind("<<ComboboxSelected>>", self._on_bit_depth_selected)
         self._bit_depth_combo.configure(state="disabled")  # "readonly" once connected, not "normal" -- see _set_camera_controls_enabled
+        self._roi_bitdepth_widgets.append(self._bit_depth_combo)
 
         self._stats_var = tk.StringVar(value="")
         self._stats_label = ttk.Label(parent, textvariable=self._stats_var)
@@ -1407,7 +1771,8 @@ class TransitPanel(ttk.Frame):
         self._file_size_var = tk.StringVar(value="")
         ttk.Label(buffer_row, textvariable=self._file_size_var).pack(side="left", padx=(10, 0))
         self._path_var = tk.StringVar(value=f"Output folder: {self._out_dir.resolve()}")
-        ttk.Label(parent, textvariable=self._path_var, foreground=PALETTE.accent_ok).pack(anchor="w", pady=(2, 0))
+        self._path_label = ttk.Label(parent, textvariable=self._path_var, foreground=PALETTE.accent_ok)
+        self._path_label.pack(anchor="w", pady=(2, 0))
 
     def _apply_roi(self, x: int, y: int, w: int, h: int) -> None:
         x = max(0, min(x, self._sensor_width - 1))
@@ -1426,6 +1791,17 @@ class TransitPanel(ttk.Frame):
         self._roi_w_var.set(str(w))
         self._roi_h_var.set(str(h))
         self._camera_worker.set_roi(x, y, w, h)
+        if self._finder_state is not None:
+            # Feeds FinderState.main_fov_corners_px (see camera/finder.py)
+            # so the finder preview's FOV rectangle shrinks to match a
+            # smaller ROI instead of always claiming the full sensor's
+            # field -- also called with the full sensor at connect time
+            # (see handle_camera_event's "connected" branch above), so
+            # this is the single place that keeps the rectangle in sync.
+            self._finder_state.main_sensor_width = w
+            self._finder_state.main_sensor_height = h
+            self._finder_state.main_roi_offset_col = (x + w / 2.0) - self._sensor_width / 2.0
+            self._finder_state.main_roi_offset_row = (y + h / 2.0) - self._sensor_height / 2.0
 
     def _on_apply_roi_entries(self) -> None:
         try:
@@ -1613,6 +1989,17 @@ class TransitPanel(ttk.Frame):
             widget.configure(state="normal" if connected else "disabled")
         self._bit_depth_combo.configure(state="readonly" if connected else "disabled")
 
+    def _set_camera_roi_bitdepth_enabled(self, enabled: bool) -> None:
+        # Only touches ROI/bit-depth widgets, not the whole
+        # _camera_interactive_widgets set -- exposure/gain/record/snapshot
+        # stay usable while recording, only ROI and bit depth are refused
+        # by the worker mid-recording.
+        for widget in self._roi_bitdepth_widgets:
+            if widget is self._bit_depth_combo:
+                widget.configure(state="readonly" if enabled else "disabled")
+            else:
+                widget.configure(state="normal" if enabled else "disabled")
+
     def focus_preview(self) -> None:
         """Called by app.py when this tab becomes the active one, so arrow
         keys work immediately without requiring a click first."""
@@ -1671,14 +2058,22 @@ class TransitPanel(ttk.Frame):
         elif event.kind == "recording_started":
             self._recording = True
             self._record_button.configure(text="Stop recording")
+            self._set_camera_roi_bitdepth_enabled(False)
             self._path_var.set(f"Recording to: {event.payload['path']}")
         elif event.kind == "recording_stopped":
             self._recording = False
             self._record_button.configure(text="Start recording (SER)")
             self._file_size_var.set("")
+            self._set_camera_roi_bitdepth_enabled(True)
             buffer_dropped = event.payload.get("buffer_dropped_frames", 0)
             note = f", {buffer_dropped} buffer-dropped" if buffer_dropped else ""
-            self._path_var.set(f"Saved: {event.payload['path']} ({event.payload['frame_count']} frames{note})")
+            error = event.payload.get("error")
+            if error:
+                self._path_var.set(f"Recording stopped early (write error): {error} -- {event.payload['frame_count']} frames saved to {event.payload['path']}")
+                self._path_label.configure(foreground=PALETTE.accent_warn)
+            else:
+                self._path_var.set(f"Saved: {event.payload['path']} ({event.payload['frame_count']} frames{note})")
+                self._path_label.configure(foreground=PALETTE.accent_ok)
         elif event.kind == "fits_saved":
             self._path_var.set(f"Saved ({event.payload.get('bit_depth', 8)}-bit): {event.payload['path']}")
 
@@ -2466,3 +2861,365 @@ class CalibrationPanel(ttk.Frame):
             return
         self._last_correction_t = time.monotonic()
         self._live_offsets.trigger_perp_pulse(1.0 if cross_deg > 0 else -1.0, duration_s=GUIDING_PERP_PULSE_DURATION_S)
+
+    def _maybe_apply_finder_correction(self) -> None:
+        """Apply a cross-track correction from the finder camera if it has
+        a blob locked AND its field has been calibrated against the main
+        camera. Uses the same trigger_perp_pulse mechanism as auto-guiding
+        -- gentle, bounded pulses, not instantaneous position jumps.
+        Only active when the finder checkbox is checked."""
+        if self._finder_state is None or not getattr(self, "_finder_correct_var", None):
+            return
+        if not self._finder_correct_var.get():
+            return
+        correction = self._finder_state.get_correction_arcsec()
+        if correction is None:
+            return
+        _along_arcsec, cross_arcsec = correction
+        if abs(cross_arcsec) < 5.0:  # ~5" dead-band -- don't over-correct noise
+            return
+        self._offsets.trigger_perp_pulse(1.0 if cross_arcsec > 0 else -1.0)
+
+
+# ---------------------------------------------------------------------------
+# FinderCameraPanel
+# ---------------------------------------------------------------------------
+
+class FinderCameraPanel(ttk.Frame):
+    """Wide-field finder-scope camera for ISS acquisition.
+
+    Completely optional -- if no finder camera is plugged in, this panel
+    stays greyed out and nothing else changes.  When a camera IS connected:
+
+    1. Live preview with ISS blob highlight (bright moving dot).
+    2. "Calibrate fields" button: point both cameras at the same region,
+       click -- FFT cross-correlation stores the offset between them.
+    3. Once calibrated, enabling "Finder correction" in the Transit tab
+       automatically nudges the mount cross-track whenever the ISS blob
+       drifts away from the calibrated boresight offset.
+    """
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        finder_worker: CameraWorker,
+        finder_state: FinderState,
+        live_offsets: LiveOffsets | None = None,
+        on_calibration_ready: Callable[[], None] | None = None,
+    ):
+        super().__init__(parent, padding=10)
+        self._finder_worker = finder_worker
+        # Calibration here finishes entirely on its own (button click ->
+        # FFT correlation, synchronous) -- same rationale as CalibrationPanel's
+        # own on_calibration_ready: there's no worker event to pump this
+        # through, so it has to tell TransitPanel directly when its "Enable
+        # finder correction" checkbox should become enabled.
+        self._on_calibration_ready = on_calibration_ready
+        # The main camera's own frames/plate scale arrive via finder_state
+        # (last_main_frame, main_plate_scale_arcsec -- see camera/finder.py
+        # and App._pump_events, which feeds them from the main CameraWorker's
+        # own events) rather than this panel holding a second CameraWorker
+        # reference directly -- one less thing for this panel to wire up.
+        self._finder_state = finder_state
+        # Shared with TransitPanel (same instance, owned by App) when
+        # passed -- so a delta_t/perp nudge made from here (see the
+        # tracking-offset controls below) lands in the SAME LiveOffsets
+        # the active tracking loop is reading, exactly like TransitPanel's
+        # own controls. Falls back to a private instance so this panel
+        # still works standalone (tests, or a build without the Transit
+        # tab wired in) -- same rationale as TransitPanel's own fallback.
+        self._live_offsets = live_offsets if live_offsets is not None else LiveOffsets()
+        self._connected = False
+        self._latest_frame: np.ndarray | None = None
+        self._photo: tk.PhotoImage | None = None
+        self._interactive: list[tk.Widget] = []
+
+        ttk.Label(
+            self,
+            text=(
+                "Wide-field finder camera -- helps acquire the ISS when the main camera's FOV is too "
+                "narrow. Connect it in the Connection tab, then use 'Calibrate fields' below to measure "
+                "the offset between the two cameras."
+            ),
+            foreground=PALETTE.fg_dim, wraplength=800, justify="left",
+        ).pack(anchor="w")
+
+        # Connection state is read-only here -- actually connecting happens
+        # in ConnectionPanel, alongside the mount and main camera, so all
+        # three devices are managed in one consistent place.
+        self._status_var = tk.StringVar(value="Not connected -- connect in the Connection tab")
+        ttk.Label(self, textvariable=self._status_var, foreground=PALETTE.fg_dim).pack(anchor="w", pady=(4, 0))
+
+        # Tracking offset controls -- same LiveOffsets as TransitPanel's own
+        # (see this panel's __init__ docstring comment on self._live_offsets),
+        # duplicated here because once a pass starts, the finder's wide field
+        # is where the operator is actually watching to get the ISS into the
+        # much narrower acquisition camera's FOV -- switching to the Transit
+        # tab just to nudge would mean looking away at exactly the moment
+        # framing matters most.
+        offset_frame = ttk.LabelFrame(self, text="Tracking offset (same as Transit tab)", padding=8)
+        offset_frame.pack(fill="x", pady=(8, 0))
+        offset_row = ttk.Frame(offset_frame)
+        offset_row.pack(anchor="w")
+        ttk.Label(offset_row, text="delta_t:").pack(side="left")
+        ttk.Button(offset_row, text="-1s", width=4, command=lambda: self._live_offsets.adjust_delta_t(-1.0)).pack(side="left")
+        self._finder_delta_t_minus_button = ttk.Button(
+            offset_row, text="-0.1s", width=5, command=lambda: self._live_offsets.adjust_delta_t(-0.1),
+        )
+        self._finder_delta_t_minus_button.pack(side="left")
+        self._finder_delta_t_var = tk.StringVar(value="+0.0s")
+        ttk.Label(offset_row, textvariable=self._finder_delta_t_var, width=8).pack(side="left")
+        self._finder_delta_t_plus_button = ttk.Button(
+            offset_row, text="+0.1s", width=5, command=lambda: self._live_offsets.adjust_delta_t(0.1),
+        )
+        self._finder_delta_t_plus_button.pack(side="left")
+        ttk.Button(offset_row, text="+1s", width=4, command=lambda: self._live_offsets.adjust_delta_t(1.0)).pack(side="left")
+
+        perp_row = ttk.Frame(offset_frame)
+        perp_row.pack(anchor="w", pady=(4, 0))
+        ttk.Label(perp_row, text="perpendicular nudge:").pack(side="left")
+        self._finder_perp_left_button = ttk.Button(perp_row, text="<", width=3, command=lambda: self._live_offsets.trigger_perp_pulse(-1.0))
+        self._finder_perp_left_button.pack(side="left")
+        self._finder_perp_right_button = ttk.Button(perp_row, text=">", width=3, command=lambda: self._live_offsets.trigger_perp_pulse(1.0))
+        self._finder_perp_right_button.pack(side="left")
+        ttk.Label(offset_frame, text="(↑ ↓ = delta_t, ← → = nudge -- from anywhere in this tab)",
+                  foreground=PALETTE.fg_dim).pack(anchor="w", pady=(2, 0))
+
+        # Exposure / gain -- ASI 678MM defaults, log-scale slider like main camera
+        import math as _math
+        exp_frame = ttk.LabelFrame(self, text="Exposure / gain", padding=8)
+        exp_frame.pack(fill="x", pady=(8, 0))
+        # log10(50000) ≈ 4.7 -- 50ms default for finder
+        self._finder_exp_log = tk.DoubleVar(value=_math.log10(50000))
+        self._finder_exp_label = tk.StringVar(value=format_exposure_us(50000))
+        self._finder_gain_var = tk.DoubleVar(value=100)
+        self._finder_gain_label = tk.StringVar(value="100")
+
+        exp_row = ttk.Frame(exp_frame)
+        exp_row.pack(fill="x")
+        ttk.Label(exp_row, text="Exp", width=4).pack(side="left")
+        self._finder_exp_scale = ttk.Scale(
+            exp_row, from_=1.5, to=_math.log10(MAX_FINDER_EXPOSURE_US), variable=self._finder_exp_log, state="disabled",
+            command=lambda _v: (
+                self._finder_exp_label.set(format_exposure_us(10 ** self._finder_exp_log.get())),
+                self._apply_camera_settings() if self._connected else None,
+            ),
+        )
+        self._finder_exp_scale.pack(side="left", fill="x", expand=True, padx=(4, 4))
+        ttk.Label(exp_row, textvariable=self._finder_exp_label, width=10).pack(side="left")
+
+        gain_row = ttk.Frame(exp_frame)
+        gain_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(gain_row, text="Gain", width=4).pack(side="left")
+        self._finder_gain_scale = ttk.Scale(
+            gain_row, from_=0, to=570, variable=self._finder_gain_var, state="disabled",
+            command=lambda _v: (
+                self._finder_gain_label.set(str(round(self._finder_gain_var.get()))),
+                self._apply_camera_settings() if self._connected else None,
+            ),
+        )
+        self._finder_gain_scale.pack(side="left", fill="x", expand=True, padx=(4, 4))
+        ttk.Label(gain_row, textvariable=self._finder_gain_label, width=6).pack(side="left")
+
+        # Calibration
+        calib_frame = ttk.LabelFrame(self, text="Field calibration", padding=8)
+        calib_frame.pack(fill="x", pady=(8, 0))
+        ttk.Label(
+            calib_frame,
+            text="Point both cameras at the same star field, then click Calibrate.\n"
+                 "The FFT cross-correlation takes ~1 s and stores the offset permanently for this session.",
+            foreground=PALETTE.fg_dim, justify="left",
+        ).pack(anchor="w")
+        calib_row = ttk.Frame(calib_frame)
+        calib_row.pack(anchor="w", pady=(6, 0))
+        # Read-only -- the real plate scales come from whatever optics were
+        # actually configured in the Connection tab at connect time (see
+        # FinderState.main_plate_scale_arcsec/finder_plate_scale_arcsec),
+        # not a separately-typed field here that could silently drift out
+        # of sync with the real configuration.
+        self._scales_status_var = tk.StringVar(value="")
+        ttk.Label(calib_row, textvariable=self._scales_status_var, foreground=PALETTE.fg_dim).pack(side="left", padx=(0, 8))
+        # Manual, NOT auto-measured: phase cross-correlation only recovers
+        # a translation, and this project's star fields are too sparse (a
+        # handful of point sources, not a textured scene) for FFT-based
+        # rotation/scale registration to be reliable -- see
+        # FinderCalibration.calibrate_from_frames' own docstring. Defaults
+        # to 0 (the old, silent assumption) but now visible/editable
+        # instead of hidden, so a real mechanical roll offset between the
+        # two scopes can actually be corrected for once measured by hand.
+        ttk.Label(calib_row, text="Rotation (deg):").pack(side="left")
+        self._finder_rotation_var = tk.StringVar(value="0.0")
+        ttk.Entry(calib_row, textvariable=self._finder_rotation_var, width=6).pack(side="left", padx=(4, 8))
+        self._calib_btn = ttk.Button(calib_row, text="Calibrate fields", command=self._on_calibrate, state="disabled")
+        self._calib_btn.pack(side="left")
+        self._interactive.append(self._calib_btn)
+        self._calib_status_var = tk.StringVar(value="Not calibrated")
+        ttk.Label(calib_frame, textvariable=self._calib_status_var, foreground=PALETTE.fg_dim).pack(anchor="w", pady=(4, 0))
+
+        # Live preview
+        preview_frame = ttk.LabelFrame(self, text="Finder preview -- ISS blob highlighted in red", padding=8)
+        preview_frame.pack(fill="both", expand=True, pady=(8, 0))
+        self._canvas = tk.Canvas(preview_frame, bg="black", highlightthickness=0)
+        self._canvas.pack(fill="both", expand=True)
+        self._blob_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self._blob_var, foreground=PALETTE.accent_ok).pack(anchor="w", pady=(4, 0))
+        self._refresh_scales_status()
+
+        # Same rationale as TransitPanel's own _bind_offset_keys call --
+        # bound recursively on every widget, not just self, since a
+        # binding on a container does NOT fire just because some
+        # descendant happens to have focus (Tk only consults the actually
+        # focused widget's own bindtags).
+        self._bind_offset_keys(self)
+        self.after(300, self._poll_delta_t_display)
+
+    # ------------------------------------------------------------------
+
+    def _apply_camera_settings(self) -> None:
+        if not self._connected:
+            return
+        exp_us = round(10 ** self._finder_exp_log.get())
+        gain = round(self._finder_gain_var.get())
+        self._finder_worker.set_exposure_us(exp_us)
+        self._finder_worker.set_gain(gain)
+
+    def _refresh_scales_status(self) -> None:
+        self._scales_status_var.set(
+            f"finder {self._finder_state.finder_plate_scale_arcsec:.3f}\"/px, "
+            f"main {self._finder_state.main_plate_scale_arcsec:.3f}\"/px "
+            "(from the Connection tab)"
+        )
+
+    def _poll_delta_t_display(self) -> None:
+        dt, _ = self._live_offsets.snapshot()
+        self._finder_delta_t_var.set(f"{dt:+.1f}s")
+        self.after(300, self._poll_delta_t_display)
+
+    def _bind_offset_keys(self, widget: tk.Misc) -> None:
+        widget.bind("<Left>", lambda _e: self._on_finder_perp_nudge_key_press(-1.0))
+        widget.bind("<Right>", lambda _e: self._on_finder_perp_nudge_key_press(1.0))
+        widget.bind("<Up>", lambda _e: self._on_finder_delta_t_key_press(0.1))
+        widget.bind("<Down>", lambda _e: self._on_finder_delta_t_key_press(-0.1))
+        for child in widget.winfo_children():
+            self._bind_offset_keys(child)
+
+    def _on_finder_perp_nudge_key_press(self, sign: float) -> str:
+        self._live_offsets.trigger_perp_pulse(sign)
+        self._flash_button(self._finder_perp_left_button if sign < 0 else self._finder_perp_right_button)
+        return "break"  # pre-empts the focused widget's own Left/Right handling
+
+    def _on_finder_delta_t_key_press(self, step: float) -> str:
+        self._live_offsets.adjust_delta_t(step)
+        self._flash_button(self._finder_delta_t_plus_button if step > 0 else self._finder_delta_t_minus_button)
+        return "break"  # pre-empts the focused widget's own Up/Down handling
+
+    def _flash_button(self, button: ttk.Button, duration_ms: int = int(GUIDING_PERP_PULSE_DURATION_S * 1000)) -> None:
+        """Briefly shows a button as pressed -- for actions that fire a
+        single short pulse rather than a press-and-hold, so there's
+        something for the keyboard-triggered case to visually attach to."""
+        button.state(["pressed"])
+        self.after(duration_ms, lambda: button.state(["!pressed"]))
+
+    def _on_calibrate(self) -> None:
+        """Cross-correlate the latest finder frame against the most recent
+        main camera frame to compute the field offset."""
+        if self._latest_frame is None:
+            self._calib_status_var.set("No finder frame yet -- wait for preview")
+            return
+        main_frame = self._finder_state.last_main_frame
+        used_fallback = main_frame is None
+        if used_fallback:
+            # Fall back: calibrate finder to itself (offset = 0, still useful
+            # for ISS blob → correction when both cameras share the boresight)
+            main_frame = self._latest_frame
+        try:
+            rotation_deg = float(self._finder_rotation_var.get())
+        except ValueError:
+            self._calib_status_var.set("Invalid rotation value")
+            return
+        finder_scale = self._finder_state.finder_plate_scale_arcsec
+        main_scale = self._finder_state.main_plate_scale_arcsec
+        self._calib_status_var.set("Calibrating…")
+        self.update_idletasks()
+        try:
+            self._finder_state.calibration.calibrate_from_frames(
+                main_frame, self._latest_frame,
+                main_plate_scale_arcsec=main_scale,
+                finder_plate_scale_arcsec=finder_scale,
+                rotation_deg=rotation_deg,
+            )
+            dr = self._finder_state.calibration.offset_row
+            dc = self._finder_state.calibration.offset_col
+            fallback_note = (
+                " -- WARNING: no main camera frame yet, calibrated the finder against itself "
+                "(offset is meaningless -- point both cameras at the same field and retry)"
+                if used_fallback else ""
+            )
+            self._calib_status_var.set(
+                f"Calibrated ✓  offset ({dr:+.1f}, {dc:+.1f}) finder px  "
+                f"scale ratio {self._finder_state.calibration.plate_scale_ratio:.2f}  "
+                f"rotation {rotation_deg:+.1f}°{fallback_note}"
+            )
+            if self._on_calibration_ready is not None:
+                self._on_calibration_ready()
+        except Exception as exc:  # noqa: BLE001
+            self._calib_status_var.set(f"Calibration failed: {exc}")
+
+    def handle_camera_event(self, event: CameraEvent) -> None:
+        if event.kind == "connected":
+            self._connected = True
+            w, h = event.payload["width"], event.payload["height"]
+            self._status_var.set(f"Connected — {w}×{h} {'colour' if event.payload['is_color'] else 'mono'}")
+            self._calib_btn.configure(state="normal")
+            self._finder_exp_scale.configure(state="normal")
+            self._finder_gain_scale.configure(state="normal")
+            self._apply_camera_settings()
+            self._refresh_scales_status()
+        elif event.kind == "connect_error":
+            self._status_var.set(f"Error: {event.payload.get('message', '?')} -- retry in the Connection tab")
+        elif event.kind == "disconnected":
+            self._connected = False
+            self._status_var.set("Not connected -- connect in the Connection tab")
+            self._calib_btn.configure(state="disabled")
+            self._finder_exp_scale.configure(state="disabled")
+            self._finder_gain_scale.configure(state="disabled")
+        elif event.kind == "preview_frame":
+            frame = pgm_to_array(event.payload["pgm"])
+            self._latest_frame = frame
+            self._finder_state.update_frame(frame)
+            self._show_preview(frame)
+
+    def _show_preview(self, frame: np.ndarray) -> None:
+        cw = self._canvas.winfo_width()
+        ch = self._canvas.winfo_height()
+        if cw < 2 or ch < 2:
+            return
+        gray = frame if frame.ndim == 2 else frame.mean(axis=2).astype(frame.dtype)
+        dw, dh, scale, display = downsample_for_display(gray, cw, ch)
+        header = f"P5\n{dw} {dh}\n255\n".encode()
+        self._photo = tk.PhotoImage(data=header + display.tobytes())
+        self._canvas.delete("all")
+        xoff = (cw - dw) // 2
+        yoff = (ch - dh) // 2
+        self._canvas.create_image(xoff, yoff, anchor="nw", image=self._photo)
+        # Main camera's own FOV, projected into finder space (see
+        # FinderState.main_fov_corners_px) -- shows where the acquisition
+        # camera is actually looking within the finder's wider view.
+        corners = self._finder_state.main_fov_corners_px()
+        if corners is not None:
+            points = []
+            for row, col in corners:
+                points.append(int(col * scale) + xoff)
+                points.append(int(row * scale) + yoff)
+            self._canvas.create_polygon(points, outline="lime", fill="", width=2)
+        # Draw blob marker
+        if self._finder_state.blob_found and self._finder_state.last_blob_row is not None:
+            bx = int(self._finder_state.last_blob_col * scale) + xoff
+            by = int(self._finder_state.last_blob_row * scale) + yoff
+            r = 12
+            self._canvas.create_oval(bx - r, by - r, bx + r, by + r, outline="red", width=2)
+            self._blob_var.set(
+                f"ISS blob: ({self._finder_state.last_blob_col:.0f}, {self._finder_state.last_blob_row:.0f}) px"
+            )
+        else:
+            self._blob_var.set("No bright blob detected")

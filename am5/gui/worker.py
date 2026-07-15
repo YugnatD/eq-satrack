@@ -28,13 +28,14 @@ from am5.mock_mount import MockConfig, MockMount
 from am5.mount import Mount
 from am5.protocol import ProtocolError
 from am5.safety import SafetyGuard
-from am5.tracker import TRACKING_CSV_FIELDS, AxisSigns, LiveOffsets, TrackingConfig, _pick_direction, calibrate_directions, measure_mount_lag, run_tracking_loop
+from am5.tracker import LIMIT_CODE_MEANINGS, TRACKING_CSV_FIELDS, AxisSigns, LiveOffsets, TrackingConfig, _pick_direction, calibrate_directions, measure_mount_lag, run_tracking_loop
 from am5.transport import SerialTransport, TCPTransport, Transport
 
 # Same heuristic as characterize.py test (f): no encoders, so "arrived" can
 # only ever mean "stopped changing", never a hardware-confirmed event.
 GOTO_ARRIVED_THRESHOLD_ARCSEC = 5.0
 GOTO_POLL_TIMEOUT_S = 15.0
+IDLE_POLL_INTERVAL_S = 0.4  # ~2Hz -- see _run's own comment for why this isn't a blocking sleep anymore
 
 MS_REPLY_MEANING = {
     0: "slewing",
@@ -236,11 +237,30 @@ class MountWorker:
             "measure_mount_lag": self._handle_measure_mount_lag,
             "start_tracking": self._handle_start_tracking,
         }
+        # Idle poll cadence for "position" events (~2Hz -- cheap given the
+        # real ~5ms round trip measured by characterize.py). Tracked as a
+        # timestamp rather than a blocking time.sleep() inside the command
+        # loop below -- a sleep() there used to make this the SAME thread
+        # that processes jog_start/jog_stop, so a jog click landing mid-
+        # sleep sat in _commands for up to 0.4s before the mount even saw
+        # it, and the finder/main camera's simulated field (driven by
+        # these very "position" events, see App._on_mount_position) lagged
+        # real jog motion by however much of that sleep was still pending
+        # (confirmed: this is what "the finder field isn't quite in sync
+        # with the telescope" during manual jogging traced back to -- not
+        # a rendering bug in camera/finder.py at all).
+        last_poll_t = 0.0
         while not self._shutdown.is_set():
             try:
-                name, payload = self._commands.get(timeout=0.2)
+                # Short enough that a queued jog command is never stuck
+                # behind more than one of these waits -- long enough to not
+                # busy-loop when idle.
+                name, payload = self._commands.get(timeout=0.05)
             except queue.Empty:
-                self._idle_poll_tick()
+                now = time.monotonic()
+                if now - last_poll_t >= IDLE_POLL_INTERVAL_S:
+                    self._idle_poll_tick()
+                    last_poll_t = now
                 continue
             handler = handlers.get(name)
             if handler is None:
@@ -268,7 +288,6 @@ class MountWorker:
             self._emit("position", ra_hours=radec.ra_hours, dec_deg=radec.dec_deg, pier_side=pier_side)
         except ProtocolError as exc:
             self._emit("log", message=f"[warn] bad reply during idle poll: {exc}")
-        time.sleep(0.4)  # ~2Hz, cheap given the real ~5ms round trip measured by characterize.py
 
     # -- command handlers -----------------------------------------------------
 
@@ -632,6 +651,16 @@ class MountWorker:
                 self._mount, self._safety, payload["trajectory"], payload["axis_signs"], payload["offsets"],
                 writer, payload["duration_s"], config=payload["config"], stop_event=payload["stop_event"],
                 on_tick=lambda tick: self._emit("tracking_tick", **tick),
+                # Was print()-only before -- invisible unless the GUI
+                # happened to be launched from a terminal with stderr
+                # visible. See TrackingConfig.meridian_track_limit_deg's
+                # docstring for the real incident this is meant to catch
+                # if it ever happens again despite that mitigation.
+                on_limit_warning=lambda code: self._emit(
+                    "log", message=f"[warn] mount reports :GAT# limit code {code} "
+                                    f"({LIMIT_CODE_MEANINGS.get(code, '?')}) -- "
+                                    f"tracking may have silently stopped on the mount side",
+                ),
             )
         except Exception as exc:  # noqa: BLE001 - report, then always fall through to cleanup below
             self._emit("tracking_error", message=str(exc))

@@ -247,6 +247,58 @@ def build_set_date_time_timezone(when: datetime) -> bytes:
     return f":SMTI{date_str}&{time_str}&{sign}{hh:02d}:{mm:02d}#".encode("ascii")
 
 
+def format_meridian_behavior(flip: bool, track_past_meridian: bool, limit_deg: float) -> str:
+    """The 5-character 'nnsnn' payload shared by :ST<payload># (set) and
+    :GTa# (get) -- see build_set_meridian_behavior for field meanings."""
+    if not -15.0 <= limit_deg <= 15.0:
+        raise ValueError(f"meridian limit angle {limit_deg} out of range [-15, 15]")
+    sign = "-" if limit_deg < 0 else "+"
+    return f"{1 if flip else 0}{1 if track_past_meridian else 0}{sign}{abs(round(limit_deg)):02d}"
+
+
+def build_set_meridian_behavior(track_past_meridian: bool, limit_deg: float, flip: bool = False) -> bytes:
+    """:ST<nnsnn># -- configure what the mount does when tracking crosses
+    the meridian (docs/ZWO Mount Serial Communication Protocol_v1.7.pdf,
+    "Set the act of crossing the meridian"). Never sent by this project
+    before now -- root cause of a real "tracking diverges badly right
+    after the meridian" incident: left unconfigured, the mount tracks on
+    whatever its own factory/current default is, and the doc's own
+    built-in stop (track_past_meridian=False) lands just 1 degree past
+    the meridian -- the mount then silently stops responding to further
+    :Rv#/:Me#/:Mn# rate commands while am5.tracker.run_tracking_loop keeps
+    sending them, and the along/cross-track error grows unbounded. This
+    is exactly what :GAT#'s e8 code ("meridian has been passed over in
+    tracking", see tracker.py's LIMIT_ERROR_CODES) is reporting when it
+    happens.
+
+    limit_deg: how far past the meridian (positive) or before it
+    (negative) the mount continues tracking before stopping, 0-15 degrees
+    either way (the protocol doc's own range; only meaningful when
+    track_past_meridian is True). flip defaults to False: the doc itself
+    marks flip "temporarily not supported", and this project's own
+    pier-side handling is deliberately manual-only (see AxisSigns'
+    docstring in tracker.py -- an automatic flip mid-track already caused
+    two real divergence incidents there for the same underlying reason,
+    a flip nobody in software knew had happened)."""
+    return f":ST{format_meridian_behavior(flip, track_past_meridian, limit_deg)}#".encode("ascii")
+
+
+def parse_meridian_behavior(raw: str) -> tuple[bool, bool, float]:
+    """Parse a :GTa# reply ('nnsnn#') into (flip, track_past_meridian,
+    limit_deg) -- see build_set_meridian_behavior for field meanings."""
+    body = _strip_frame(raw)
+    if len(body) != 5 or body[2] not in "+-":
+        raise ProtocolError(f"malformed :GTa# reply {raw!r}")
+    flip = body[0] == "1"
+    track_past_meridian = body[1] == "1"
+    sign = -1.0 if body[2] == "-" else 1.0
+    try:
+        limit_deg = sign * float(body[3:5])
+    except ValueError as exc:
+        raise ProtocolError(f"malformed :GTa# reply {raw!r}") from exc
+    return flip, track_past_meridian, limit_deg
+
+
 @dataclass(frozen=True)
 class MountStatus:
     """Best-effort parse of a :GU# reply. The doc lists which characters

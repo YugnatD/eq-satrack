@@ -36,6 +36,7 @@ def app(tmp_path_factory):
     yield a
     a.worker.shutdown()
     a.camera_worker.shutdown()
+    a.finder_worker.shutdown()
     root.destroy()
 
 
@@ -46,6 +47,16 @@ def test_jog_window_shares_the_same_axis_signs_instance_as_transit_panel(app):
     assert app.jog_window._axis_signs is app.axis_signs
     assert app.transit_panel._axis_signs is app.axis_signs
     assert app.calibration_panel._axis_signs is app.axis_signs
+
+
+def test_finder_panel_shares_the_same_live_offsets_instance_as_transit_panel(app):
+    # A delta_t/perp nudge made from the Finder tab (added so the operator
+    # doesn't have to look away from the finder's wide view right when
+    # framing the ISS into the main camera matters most) must land in the
+    # SAME LiveOffsets the active tracking loop and TransitPanel's own
+    # controls read -- see FinderCameraPanel.__init__'s own comment.
+    assert app.finder_panel._live_offsets is app.live_offsets
+    assert app.transit_panel._offsets is app.live_offsets
 
 
 def test_jog_window_starts_hidden_and_show_button_reveals_it(app):
@@ -123,3 +134,20 @@ def test_camera_connected_event_reaches_jog_windows_exposure_gain_controls(app):
 
     assert str(app.jog_window._exposure_scale["state"]) == "normal"
     assert str(app.jog_window._gain_scale["state"]) == "normal"
+
+
+def test_finder_disconnected_event_clears_a_stale_blob_detection(app):
+    # Regression: a dropped finder connection used to leave the last
+    # detected ISS blob in place forever, letting _maybe_apply_finder_
+    # correction keep nudging the mount from stale data -- see
+    # FinderState.reset_blob.
+    app.finder_state.blob_found = True
+    app.finder_state.last_blob_row = 42.0
+    app.finder_state.last_blob_col = 17.0
+
+    app.finder_worker.events.put(CameraEvent(kind="disconnected", payload={}))
+    app._pump_events()
+
+    assert app.finder_state.blob_found is False
+    assert app.finder_state.last_blob_row is None
+    assert app.finder_state.last_blob_col is None

@@ -1,7 +1,12 @@
+import time
+from datetime import datetime, timezone
+
 import pytest
 
+from am5.angles import gmst_deg
 from am5.mock_mount import MockConfig, MockMount
 from am5.mount import Mount
+from am5.protocol import parse_error
 
 
 @pytest.fixture
@@ -143,5 +148,105 @@ def test_get_status_reflects_park_and_home():
         status = m.get_status()
         assert status.is_parked is True
         assert status.is_at_home is False
+    finally:
+        m.close()
+
+
+def _ra_deg_at_ha(ha_deg: float, longitude_deg: float) -> float:
+    """The RA (degrees) that puts the mount's hour angle at ha_deg RIGHT
+    NOW, for the given site longitude -- lets a test start already
+    however far past (or before) the meridian it needs, instead of
+    waiting real minutes for sidereal time to get there on its own."""
+    lst_deg = (gmst_deg(datetime.now(timezone.utc)) + longitude_deg) % 360.0
+    return (lst_deg - ha_deg) % 360.0
+
+
+def test_meridian_behavior_roundtrip_through_the_mock():
+    m = Mount(MockMount(MockConfig(start_ra_deg=45.0, start_dec_deg=45.0)))
+    try:
+        m.set_meridian_behavior(track_past_meridian=True, limit_deg=12.0, flip=False)
+        assert m.get_meridian_behavior() == (False, True, 12.0)
+    finally:
+        m.close()
+
+
+def test_mock_mount_configured_to_stop_freezes_ra_shortly_past_the_meridian():
+    # Regression: this project never sent :ST# before, so a real mount ran
+    # on whatever its own factory/current default meridian behavior is --
+    # explicitly configuring the mock into the documented worst case (stop
+    # 1 degree past the meridian) reproduces the real "tracking diverges
+    # right after the meridian" incident against the mock, without needing
+    # hardware to see the symptom happen at all. NOT MockConfig's own
+    # default (that defaults permissive -- see its docstring for why a
+    # wall-clock-dependent default broke an unrelated test).
+    longitude_deg = 6.14
+    start_ra_deg = _ra_deg_at_ha(5.0, longitude_deg)  # already 5 deg past the meridian
+    cfg = MockConfig(
+        start_ra_deg=start_ra_deg, start_dec_deg=45.0, longitude_deg=longitude_deg,
+        meridian_limit_enabled=True, meridian_track_past=False,
+    )
+    m = Mount(MockMount(cfg))
+    try:
+        m.sync_site_and_time(46.18, longitude_deg)
+        m.set_tracking(True)
+        time.sleep(0.1)  # a few 200Hz sim-loop ticks
+        assert parse_error(m.get_tracking_status()) == 8
+        ra_before = m.get_radec().ra_hours
+        m.set_rate(300.0)  # a large rate -- if this moved anything, it'd be unmissable
+        m.move("e")
+        time.sleep(0.2)
+        # The mount silently ignores further rate commands once stopped --
+        # this is the exact mechanism that made run_tracking_loop's own
+        # error-tracking diverge in the real incident.
+        assert m.get_radec().ra_hours == pytest.approx(ra_before, abs=1e-4)
+    finally:
+        m.close()
+
+
+def test_set_meridian_behavior_to_continue_tracking_prevents_the_stop():
+    # The fix: explicitly configuring the mount to keep tracking past the
+    # meridian (up to the protocol's own max, 15 deg) before a pass means
+    # a normal few-degree crossing never trips the silent stop.
+    longitude_deg = 6.14
+    start_ra_deg = _ra_deg_at_ha(5.0, longitude_deg)  # 5 deg past -- within a 15 deg allowance
+    cfg = MockConfig(start_ra_deg=start_ra_deg, start_dec_deg=45.0, longitude_deg=longitude_deg, meridian_limit_enabled=True)
+    m = Mount(MockMount(cfg))
+    try:
+        m.sync_site_and_time(46.18, longitude_deg)
+        m.set_meridian_behavior(track_past_meridian=True, limit_deg=15.0)
+        m.set_tracking(True)
+        time.sleep(0.1)
+        assert parse_error(m.get_tracking_status()) is None
+        ra_before = m.get_radec().ra_hours
+        m.set_rate(300.0)
+        m.move("e")
+        time.sleep(0.2)
+        # Rate commands still take effect -- RA actually moved, unlike the
+        # stopped case above.
+        assert m.get_radec().ra_hours != pytest.approx(ra_before, abs=1e-4)
+        assert parse_error(m.get_tracking_status()) is None
+    finally:
+        m.close()
+
+
+def test_meridian_stop_only_freezes_ra_not_dec():
+    # Per the protocol doc's own note: only "the RA axis... continues to
+    # track the angle of rotation" up to the limit -- DEC is unaffected.
+    longitude_deg = 6.14
+    start_ra_deg = _ra_deg_at_ha(5.0, longitude_deg)
+    cfg = MockConfig(
+        start_ra_deg=start_ra_deg, start_dec_deg=0.0, longitude_deg=longitude_deg,
+        meridian_limit_enabled=True, meridian_track_past=False,
+    )
+    m = Mount(MockMount(cfg))
+    try:
+        m.sync_site_and_time(46.18, longitude_deg)
+        m.set_tracking(True)
+        time.sleep(0.1)
+        assert parse_error(m.get_tracking_status()) == 8
+        m.set_rate(300.0)
+        m.move("n")
+        time.sleep(0.2)
+        assert m.get_radec().dec_deg > 0.05
     finally:
         m.close()

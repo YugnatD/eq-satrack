@@ -394,6 +394,32 @@ class TrackingConfig:
     feedback_max_correction_deg_s: float = 0.0014  # hard clamp, ~5 arcsec/s -- can't dominate the feedforward term
     feedback_integral_limit_deg: float = 0.05  # anti-windup clamp on the accumulated error (~180 arcsec)
 
+    # If not None, configured on the mount before every pass (:ST#, see
+    # Mount.set_meridian_behavior) instead of relying on whatever the
+    # mount's own factory/current default happens to be -- root cause of a
+    # real "tracking diverges badly right after the meridian" incident:
+    # the protocol doc's own default (track_past_meridian=False) silently
+    # stops RA tracking just 1 degree past the meridian while this loop
+    # keeps sending rate commands, unaware. 15 deg is the protocol's own
+    # maximum allowance -- generous for a ~6min ISS pass.
+    #
+    # DEFAULTS TO None (disabled) DELIBERATELY, even though it fixes a
+    # real bug: Mount.set_meridian_behavior's reply format is UNCONFIRMED
+    # against real hardware (see its own docstring) -- if the mount
+    # actually replies "1#" rather than the assumed bare "1", the
+    # leftover '#' byte stays sitting in the serial buffer and prefixes
+    # the NEXT command's reply, desyncing every subsequent read for the
+    # rest of the session. That failure mode is WORSE than the meridian
+    # bug this exists to fix (one bad pass vs. a corrupted session), so
+    # this must not run unattended before being verified once on real
+    # hardware. To verify: call mount.set_meridian_behavior(True, 15.0)
+    # once by hand, then mount.get_meridian_behavior() immediately after
+    # -- if that raises ProtocolError or returns garbage instead of
+    # (False, True, 15.0), the reply format assumption was wrong and this
+    # must not be enabled. Once confirmed, set this to e.g. 15.0 (or pass
+    # an explicit TrackingConfig(meridian_track_limit_deg=15.0) per call).
+    meridian_track_limit_deg: float | None = None
+
 
 class TrackingRunaway(RuntimeError):
     """Raised by run_tracking_loop when pointing error exceeds
@@ -412,6 +438,7 @@ def run_tracking_loop(
     config: TrackingConfig | None = None,
     stop_event: threading.Event | None = None,
     on_tick: Callable[[dict], None] | None = None,
+    on_limit_warning: Callable[[int], None] | None = None,
 ) -> None:
     cfg = config or TrackingConfig()
     period = 1.0 / cfg.loop_hz
@@ -430,6 +457,18 @@ def run_tracking_loop(
     except ProtocolError as exc:
         print(f"[warn] could not enable sidereal tracking (:Te#) before pass: {exc}", file=sys.stderr)
 
+    # See TrackingConfig.meridian_track_limit_deg's docstring -- without
+    # this, a pass that runs long enough to cross the meridian can silently
+    # stop on the mount side while this loop keeps commanding rates,
+    # producing unbounded along/cross-track error that looks like a
+    # tracking bug but is actually the mount having stopped listening.
+    if cfg.meridian_track_limit_deg is not None:
+        try:
+            mount.set_meridian_behavior(track_past_meridian=True, limit_deg=cfg.meridian_track_limit_deg)
+        except ProtocolError as exc:
+            print(f"[warn] could not configure meridian tracking behavior (:ST#) before pass: {exc}", file=sys.stderr)
+
+    last_limit_code: int | None = None
     t_loop_start = time.monotonic()
     next_tick = t_loop_start
     tick = 0
@@ -541,7 +580,14 @@ def run_tracking_loop(
                 print(f"[warn] bad :GMEQ# reply during error-log poll: {exc}", file=sys.stderr)
 
         if tick % status_every == 0:
-            _check_limits(mount)
+            limit_code = _check_limits(mount)
+            # Only fire on a NEW code (first occurrence, or a change to a
+            # different one) -- status_check_hz keeps polling every second
+            # regardless, so without this a stuck limit would re-notify
+            # once per second for the rest of the pass.
+            if limit_code is not None and limit_code != last_limit_code and on_limit_warning is not None:
+                on_limit_warning(limit_code)
+            last_limit_code = limit_code
 
         csv_writer.writerow({
             "t_mono": time.monotonic(), "t_utc": utc_now_iso(),
@@ -558,7 +604,10 @@ def run_tracking_loop(
             time.sleep(sleep_s)
 
 
-def _check_limits(mount: Mount) -> None:
+LIMIT_CODE_MEANINGS = {5: "below horizon", 6: "below altitude limit", 8: "meridian crossed"}
+
+
+def _check_limits(mount: Mount) -> int | None:
     # Used to also auto-correct axis_signs.dec here from a live :Gm#
     # pier-side read -- tried and reverted, see AxisSigns' docstring in
     # this file for the full account. A real incident: this fired during
@@ -568,15 +617,22 @@ def _check_limits(mount: Mount) -> None:
     # problem). :Gm#'s relationship to true mechanical pier state during
     # continuous tracking (as opposed to a discrete :MS# GOTO, confirmed
     # correct) is unresolved.
+    #
+    # Returns the :GAT# error code if it's one of LIMIT_ERROR_CODES, else
+    # None -- run_tracking_loop's own call site is what actually surfaces
+    # this (both to stderr and, via on_limit_warning, to the GUI's log),
+    # this function just polls and classifies.
     try:
         raw = mount.get_tracking_status()
     except ProtocolError as exc:
         print(f"[warn] bad :GAT# reply during status check: {exc}", file=sys.stderr)
-        return
+        return None
     code = parse_error(raw)
     if code in LIMIT_ERROR_CODES:
-        print(f"[SAFETY] :GAT# reports error {code} (5=below horizon, 6=below altitude limit, "
-              f"8=meridian crossed) — tracking may have silently stopped on the mount side", file=sys.stderr)
+        print(f"[SAFETY] :GAT# reports error {code} ({LIMIT_CODE_MEANINGS.get(code, '?')}) "
+              f"— tracking may have silently stopped on the mount side", file=sys.stderr)
+        return code
+    return None
 
 
 TRACKING_CSV_FIELDS = [

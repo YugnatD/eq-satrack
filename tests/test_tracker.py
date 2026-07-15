@@ -3,12 +3,13 @@ import io
 import math
 import threading
 import time
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import numpy as np
 import pytest
 
-from am5.angles import angular_separation_deg
+from am5.angles import angular_separation_deg, gmst_deg
 from am5.constants import SIDEREAL_DEG_PER_S
 from am5.ephemeris import Trajectory
 from am5.mock_mount import MockConfig, MockMount
@@ -532,3 +533,111 @@ def test_tracking_loop_feedback_reduces_along_track_error_vs_feedforward_only():
     assert final_error_on < final_error_off - 5.0
 
 
+
+
+def _ra_deg_at_ha(ha_deg: float, longitude_deg: float) -> float:
+    """The RA (degrees) that puts the mount's hour angle at ha_deg RIGHT
+    NOW, for the given site longitude -- see test_mount.py's own copy of
+    this helper for the full reasoning (lets a test start already however
+    far past/before the meridian it needs, instead of waiting real minutes
+    for sidereal time to get there on its own)."""
+    lst_deg = (gmst_deg(datetime.now(timezone.utc)) + longitude_deg) % 360.0
+    return (lst_deg - ha_deg) % 360.0
+
+
+def test_meridian_track_limit_deg_defaults_to_none():
+    # Deliberately conservative default -- see TrackingConfig.meridian_
+    # track_limit_deg's own docstring: Mount.set_meridian_behavior's reply
+    # format is unconfirmed against real hardware, and a wrong assumption
+    # there desyncs the ENTIRE session's protocol stream, not just this
+    # one feature -- so it must not run unattended before being verified
+    # once by hand.
+    assert TrackingConfig().meridian_track_limit_deg is None
+
+
+def test_run_tracking_loop_configures_generous_meridian_tracking_before_the_pass_when_enabled():
+    # The actual fix for a real "tracking diverges badly right after the
+    # meridian" incident (see TrackingConfig.meridian_track_limit_deg's
+    # docstring): confirm the loop itself issues :ST# with a generous,
+    # non-stopping configuration before committing to a pass, instead of
+    # relying on whatever the mount's own factory/current default is --
+    # only once explicitly enabled (not the default, see the test above).
+    mock = MockMount(MockConfig(
+        rv_mode="per_axis", meridian_track_past=False, meridian_limit_deg=0.0,
+        start_ra_deg=10.0, start_dec_deg=45.0,
+    ))
+    mount = Mount(mock)
+    safety = SafetyGuard(mount, watchdog_timeout=5.0)
+    trajectory = _make_constant_rate_trajectory(0.0, 1.0, 10.0, 45.0)
+    fh = io.StringIO()
+    writer = csv.DictWriter(fh, fieldnames=TRACKING_CSV_FIELDS)
+    writer.writeheader()
+    try:
+        run_tracking_loop(
+            mount, safety, trajectory, AxisSigns(ra=1.0, dec=1.0), LiveOffsets(), writer,
+            duration_s=0.1, config=TrackingConfig(loop_hz=20.0, meridian_track_limit_deg=15.0),
+        )
+        assert mount.get_meridian_behavior() == (False, True, 15.0)
+    finally:
+        mount.stop()
+        safety.shutdown()
+        mount.close()
+
+
+def test_run_tracking_loop_skips_meridian_configuration_when_set_to_none():
+    mock = MockMount(MockConfig(
+        rv_mode="per_axis", meridian_track_past=False, meridian_limit_deg=3.0,
+        start_ra_deg=10.0, start_dec_deg=45.0,
+    ))
+    mount = Mount(mock)
+    safety = SafetyGuard(mount, watchdog_timeout=5.0)
+    trajectory = _make_constant_rate_trajectory(0.0, 1.0, 10.0, 45.0)
+    fh = io.StringIO()
+    writer = csv.DictWriter(fh, fieldnames=TRACKING_CSV_FIELDS)
+    writer.writeheader()
+    try:
+        run_tracking_loop(
+            mount, safety, trajectory, AxisSigns(ra=1.0, dec=1.0), LiveOffsets(), writer,
+            duration_s=0.1, config=TrackingConfig(loop_hz=20.0, meridian_track_limit_deg=None),
+        )
+        assert mount.get_meridian_behavior() == (False, False, 3.0)
+    finally:
+        mount.stop()
+        safety.shutdown()
+        mount.close()
+
+
+def test_run_tracking_loop_calls_on_limit_warning_when_mount_reports_a_limit_code():
+    # Regression: :GAT# limit codes (5/6/8) used to only ever reach a
+    # stderr print() -- invisible to the GUI unless launched from a terminal
+    # with stderr visible. on_limit_warning is what MountWorker wires to an
+    # actual "log" event the GUI's log panel shows -- see
+    # am5/gui/worker.py's _handle_start_tracking.
+    longitude_deg = 6.14
+    start_ra_deg = _ra_deg_at_ha(5.0, longitude_deg)  # already 5 deg past the meridian
+    cfg = MockConfig(
+        rv_mode="per_axis", start_ra_deg=start_ra_deg, start_dec_deg=45.0,
+        longitude_deg=longitude_deg, meridian_limit_enabled=True, meridian_track_past=False,
+    )
+    mock = MockMount(cfg)
+    mount = Mount(mock)
+    safety = SafetyGuard(mount, watchdog_timeout=5.0)
+    trajectory = _make_constant_rate_trajectory(0.0, 2.0, start_ra_deg, 45.0)
+    fh = io.StringIO()
+    writer = csv.DictWriter(fh, fieldnames=TRACKING_CSV_FIELDS)
+    writer.writeheader()
+    warnings = []
+    try:
+        # meridian_track_limit_deg=None -- don't let the loop's own fix
+        # reconfigure the mount away from the stuck state this test needs.
+        run_tracking_loop(
+            mount, safety, trajectory, AxisSigns(ra=1.0, dec=1.0), LiveOffsets(), writer,
+            duration_s=1.2,
+            config=TrackingConfig(loop_hz=20.0, status_check_hz=5.0, meridian_track_limit_deg=None),
+            on_limit_warning=warnings.append,
+        )
+    finally:
+        mount.stop()
+        safety.shutdown()
+        mount.close()
+    assert warnings == [8]

@@ -195,3 +195,32 @@ def test_parse_gu_status_stall_flags_case_sensitive():
 def test_parse_gu_status_no_mode_char_is_none():
     status = protocol.parse_gu_status("nN001000060#")
     assert status.is_equatorial is None
+
+
+def test_format_meridian_behavior_fields():
+    assert protocol.format_meridian_behavior(flip=False, track_past_meridian=True, limit_deg=15.0) == "01+15"
+    assert protocol.format_meridian_behavior(flip=True, track_past_meridian=False, limit_deg=0.0) == "10+00"
+    assert protocol.format_meridian_behavior(flip=False, track_past_meridian=True, limit_deg=-5.0) == "01-05"
+
+
+def test_format_meridian_behavior_out_of_range_raises():
+    with pytest.raises(ValueError):
+        protocol.format_meridian_behavior(flip=False, track_past_meridian=True, limit_deg=16.0)
+    with pytest.raises(ValueError):
+        protocol.format_meridian_behavior(flip=False, track_past_meridian=True, limit_deg=-16.0)
+
+
+def test_build_set_meridian_behavior():
+    assert protocol.build_set_meridian_behavior(track_past_meridian=True, limit_deg=15.0) == b":ST01+15#"
+    assert protocol.build_set_meridian_behavior(track_past_meridian=False, limit_deg=0.0, flip=True) == b":ST10+00#"
+
+
+def test_parse_meridian_behavior_roundtrip():
+    for flip, track_past, limit_deg in [(False, True, 15.0), (True, False, 0.0), (False, True, -5.0)]:
+        payload = protocol.format_meridian_behavior(flip, track_past, limit_deg)
+        assert protocol.parse_meridian_behavior(f"{payload}#") == (flip, track_past, limit_deg)
+
+
+def test_parse_meridian_behavior_malformed_raises():
+    with pytest.raises(protocol.ProtocolError):
+        protocol.parse_meridian_behavior("bad#")

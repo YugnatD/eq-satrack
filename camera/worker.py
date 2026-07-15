@@ -29,6 +29,11 @@ STATS_INTERVAL_S = 1.0
 WRITE_BUFFER_TARGET_BYTES = 200 * 1024 * 1024  # ~200MB RAM budget for the SER write-behind buffer
 WRITE_BUFFER_MIN_FRAMES = 8
 WRITE_BUFFER_MAX_FRAMES = 1000  # cap even for a tiny ROI -- no reason to buffer minutes of frames
+# How long _handle_disconnect waits for an active recording's write thread
+# to finish before giving up and letting it keep running in the background
+# (see _handle_disconnect's own comment) -- module-level so tests can
+# shorten it to exercise that path without an actual 10s wait.
+DISCONNECT_WRITE_JOIN_TIMEOUT_S = 10.0
 
 
 @dataclass
@@ -65,7 +70,6 @@ class CameraWorker:
         self._camera: AsiCamera | MockAsiCamera | None = None
         self._streaming = threading.Event()
         self._ser_writer: SerWriter | None = None
-        self._recording_path: Path | None = None
         # Write-behind buffer: the disk write (add_frame -- disk I/O, can
         # stall on a slow/contended disk) happens on its own thread, fed by
         # this bounded queue, instead of inline in the frame-read loop
@@ -77,7 +81,15 @@ class CameraWorker:
         # touches self._ser_writer directly while a write thread is alive.
         self._write_queue: "queue.Queue[tuple] | None" = None
         self._write_thread: threading.Thread | None = None
-        self._write_stop_event = threading.Event()
+        # Created fresh per recording in _handle_start_recording, NOT
+        # reused across recordings -- a single shared Event here used to
+        # let a write thread that outlived _handle_stop_recording/
+        # _handle_disconnect's own join timeout (a wedged/very slow disk)
+        # get its stop signal silently cleared by a LATER recording's
+        # own stop, since both would .set()/.clear() the same object. A
+        # private Event per thread means an orphaned thread's stop signal
+        # can never be touched by anything but that thread's own caller.
+        self._write_stop_event: threading.Event | None = None
         self._buffer_dropped_frames = 0
         self._shutdown = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -88,10 +100,12 @@ class CameraWorker:
     def connect(
         self, kind: str, camera_id: int = 0, sdk_path: str | None = None, mock_seed: int | None = None,
         plate_scale_arcsec_per_px: float | None = None, bit_depth: int = 8,
+        mock_sensor_width: int = 640, mock_sensor_height: int = 480,
     ) -> None:
         self._commands.put(("connect", {
             "kind": kind, "camera_id": camera_id, "sdk_path": sdk_path, "mock_seed": mock_seed,
             "plate_scale_arcsec_per_px": plate_scale_arcsec_per_px, "bit_depth": bit_depth,
+            "mock_sensor_width": mock_sensor_width, "mock_sensor_height": mock_sensor_height,
         }))
 
     def disconnect(self) -> None:
@@ -249,44 +263,66 @@ class CameraWorker:
         write, so a slow disk stalls this thread, not the frame-read loop
         in _run. Polls with a short timeout rather than blocking on
         write_queue.get() forever, so stop_event (set by
-        _stop_write_thread) is noticed promptly; once set, drains
-        whatever's left in the queue (in order, non-blocking -- the main
-        loop is the only producer and it's synchronously inside
-        _stop_write_thread while this runs, so nothing new can appear)
-        before closing the writer."""
-        while not stop_event.is_set():
-            try:
-                frame, timestamp = write_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            writer.add_frame(frame, timestamp=timestamp)
-        while True:
-            try:
-                frame, timestamp = write_queue.get_nowait()
-            except queue.Empty:
-                break
-            writer.add_frame(frame, timestamp=timestamp)
-        writer.close()
+        _handle_stop_recording/_handle_disconnect) is noticed promptly;
+        once set, drains whatever's left in the queue (in order,
+        non-blocking -- self._write_queue is nulled out by whoever signals
+        the stop before this loop's caller can enqueue anything new)
+        before closing the writer.
 
-    def _stop_write_thread(self) -> None:
-        """Signals the write thread to drain its queue and close the
-        SerWriter, then waits for it -- must complete before anything
-        else touches self._ser_writer/self._write_queue (start_recording
-        with a fresh writer, disconnect, or a final frame_count read),
-        since the write thread is their exclusive owner while alive.
-        Signaling via an Event rather than a sentinel value pushed onto
-        write_queue -- a bounded queue.put() here would BLOCK this
-        (single, shared) worker thread, potentially for as long as the
-        disk stays slow, if the queue happened to be full at exactly the
-        moment recording is stopped/restarted/disconnected -- precisely
-        the slow-disk scenario this buffer exists to protect against, and
-        exactly when a real operator is most likely to be clicking Stop."""
-        if self._write_thread is None:
-            return
-        self._write_stop_event.set()
-        self._write_thread.join(timeout=10.0)
-        self._write_thread = None
-        self._write_stop_event.clear()
+        Wrapped in try/except/finally: unlike every command handler in
+        _run (each wrapped individually), this thread had no error
+        handling at all -- an add_frame()/close() failure (disk full,
+        permissions, a truncation bug) used to kill the thread mid-write,
+        leaving the SER file with FrameCount=0 and no trailer despite
+        real frame bytes already on disk (close() is what patches both).
+        Now: on any exception, still close() so whatever was captured
+        stays readable.
+
+        Emits "recording_stopped" itself, rather than leaving that to
+        whichever command handler signaled the stop: a wedged/very slow
+        disk can keep this thread alive well past _handle_stop_recording/
+        _handle_disconnect's own join timeout, and reporting "recording
+        stopped" from the command handler in that case used to just be
+        wrong -- it read self._ser_writer.frame_count from a writer this
+        thread might still be mid-write on, before close() ever ran,
+        understating (or, once the command handler gave up and moved on,
+        entirely fabricating) the real result. Confirmed directly: with
+        add_frame() forced to hang past a shortened join timeout,
+        stop_recording() reported frame_count=0/error=None while the file
+        on disk already held real frame bytes and its header FrameCount
+        stayed unpatched. This thread is the only place that actually
+        knows when the file is truly finalized, so it's the only place
+        that should report it -- whether that's milliseconds or, on a
+        stalled disk, much later than the handler that requested the stop
+        ever waited around to see."""
+        error: Exception | None = None
+        try:
+            while not stop_event.is_set():
+                try:
+                    frame, timestamp = write_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                writer.add_frame(frame, timestamp=timestamp)
+            while True:
+                try:
+                    frame, timestamp = write_queue.get_nowait()
+                except queue.Empty:
+                    break
+                writer.add_frame(frame, timestamp=timestamp)
+        except Exception as exc:  # noqa: BLE001
+            error = exc
+        finally:
+            try:
+                writer.close()
+            except Exception as exc:  # noqa: BLE001
+                if error is None:
+                    error = exc
+        if error is not None:
+            self._emit("log", message=f"[error] SER write failed, recording stopped early: {error}")
+        self._emit(
+            "recording_stopped", path=str(writer.path), frame_count=writer.frame_count,
+            buffer_dropped_frames=self._buffer_dropped_frames, error=str(error) if error is not None else None,
+        )
 
     # -- command handlers -----------------------------------------------------
 
@@ -297,6 +333,8 @@ class CameraWorker:
             mock_kwargs = {"seed": payload.get("mock_seed"), "bit_depth": bit_depth}
             if payload.get("plate_scale_arcsec_per_px") is not None:
                 mock_kwargs["plate_scale_arcsec_per_px"] = payload["plate_scale_arcsec_per_px"]
+            mock_kwargs["sensor_width"] = payload.get("mock_sensor_width", 640)
+            mock_kwargs["sensor_height"] = payload.get("mock_sensor_height", 480)
             camera = MockAsiCamera(**mock_kwargs)
         else:
             camera = AsiCamera(payload["camera_id"], payload.get("sdk_path"), bit_depth=bit_depth)
@@ -314,9 +352,26 @@ class CameraWorker:
 
     def _handle_disconnect(self, payload: dict) -> None:
         self._streaming.clear()
-        self._stop_write_thread()  # drains/closes any in-progress recording first
-        self._ser_writer = None
-        self._write_queue = None
+        if self._ser_writer is not None:
+            # Best-effort: wait for THIS recording's write thread to drain
+            # and close so the file on disk is finalized before
+            # "disconnected" fires (tested behavior -- a real operator
+            # expects the file to be immediately usable right after
+            # disconnecting). Bounded, not indefinite -- see _write_loop's
+            # own docstring for why a wedged disk shouldn't hang this
+            # forever. If it times out, the thread is left running (not
+            # nulled here) so a later reconnect+start_recording still
+            # correctly refuses until it actually finishes -- see
+            # _handle_start_recording's own guard -- and it reports its
+            # own "recording_stopped" whenever it's actually done.
+            self._write_stop_event.set()
+            self._write_queue = None
+            self._ser_writer = None
+            self._write_thread.join(timeout=DISCONNECT_WRITE_JOIN_TIMEOUT_S)
+            if self._write_thread.is_alive():
+                self._emit("log", message="[warn] disconnecting while the SER write thread is still finishing (disk busy) -- it will keep writing in the background and report its own result once done")
+            else:
+                self._write_thread = None
         if self._camera is not None:
             self._camera.close()
             self._camera = None
@@ -325,10 +380,32 @@ class CameraWorker:
     def _handle_set_roi(self, payload: dict) -> None:
         if self._camera is None:
             return
+        if self._ser_writer is not None:
+            # Refused, not silently allowed: the in-progress SerWriter was
+            # constructed with the OLD width/height, so the very next frame
+            # after a live ROI change has a shape that no longer matches --
+            # SerWriter.add_frame() raises on that (by design, to catch
+            # exactly this), which used to kill the write thread silently
+            # (no error surfaced, writer.close() never ran, so the file's
+            # FrameCount header stayed 0 and stop_recording() still reported
+            # a clean success) -- confirmed by reproducing it directly.
+            self._emit("log", message="[warn] ROI change refused while recording is active -- stop recording first")
+            return
         self._camera.set_roi(payload["x"], payload["y"], payload["width"], payload["height"])
 
     def _handle_set_bit_depth(self, payload: dict) -> None:
         if self._camera is None:
+            return
+        if self._ser_writer is not None:
+            # Same rationale as _handle_set_roi's own guard, different
+            # failure mode: SerWriter.add_frame() doesn't validate bit
+            # depth, it just casts every frame to the pixel dtype fixed at
+            # recording-start time -- a live switch to 16-bit gets silently
+            # truncated to 8-bit (numpy's low-byte-only downcast, not a
+            # rescale) with no exception and no error anywhere, corrupting
+            # pixel data with zero indication anything went wrong
+            # (confirmed: a mid-range value of 2048 silently became 0).
+            self._emit("log", message="[warn] Bit depth change refused while recording is active -- stop recording first")
             return
         self._camera.set_bit_depth(payload["bit_depth"])
         self._emit("bit_depth_changed", bit_depth=self._camera.bit_depth)
@@ -355,7 +432,15 @@ class CameraWorker:
         if self._camera is None:
             self._emit("log", message="[error] can't start recording: not connected")
             return
-        self._stop_write_thread()  # in case a previous recording is still draining
+        if self._write_thread is not None and self._write_thread.is_alive():
+            # Refused, not blocked: a previous recording's write thread is
+            # still draining/closing (a slow disk, or the join-timeout
+            # case documented in _handle_disconnect/_write_loop) -- used
+            # to block here waiting for it, which is exactly the kind of
+            # stall a real operator starting a new recording mid-pass
+            # can't afford. It'll finish and report itself; try again.
+            self._emit("log", message="[warn] can't start recording: previous recording is still finishing (disk busy) -- try again shortly")
+            return
         path = Path(payload["path"])
         path.parent.mkdir(parents=True, exist_ok=True)
         self._ser_writer = SerWriter(
@@ -372,23 +457,30 @@ class CameraWorker:
         queue_len = max(WRITE_BUFFER_MIN_FRAMES, min(WRITE_BUFFER_MAX_FRAMES, WRITE_BUFFER_TARGET_BYTES // max(bytes_per_frame, 1)))
         self._write_queue = queue.Queue(maxsize=queue_len)
         self._buffer_dropped_frames = 0
+        # Fresh per-recording Event -- see __init__'s own comment on why
+        # this must never be reused/shared across recordings.
+        self._write_stop_event = threading.Event()
         self._write_thread = threading.Thread(
             target=self._write_loop, args=(self._ser_writer, self._write_queue, self._write_stop_event), daemon=True,
         )
         self._write_thread.start()
-        self._recording_path = path
         self._emit("recording_started", path=str(path))
 
     def _handle_stop_recording(self, payload: dict) -> None:
         if self._ser_writer is None:
             return
-        self._stop_write_thread()  # drains whatever's still queued, in order, then closes the writer
-        frame_count = self._ser_writer.frame_count
-        self._ser_writer = None
+        # Signal and hand off ownership to the write thread -- it drains
+        # the queue, closes the writer, and emits "recording_stopped"
+        # itself once that's actually done (see _write_loop's own
+        # docstring for why this handler doesn't wait for it or report
+        # the result itself anymore). Nulling these now (not waiting)
+        # marks the session as over for the main capture loop's own stats
+        # and for CameraPanel's ROI/bit-depth guard immediately, which is
+        # correct regardless of how long the write thread itself takes to
+        # actually finish closing the file.
+        self._write_stop_event.set()
         self._write_queue = None
-        self._emit("recording_stopped", path=str(self._recording_path), frame_count=frame_count,
-                    buffer_dropped_frames=self._buffer_dropped_frames)
-        self._recording_path = None
+        self._ser_writer = None
 
     def _handle_save_fits_snapshot(self, payload: dict) -> None:
         if self._camera is None:

@@ -12,12 +12,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import ttk
 
+from am5.gui.finder_window import FinderWindow
 from am5.gui.jog_window import JogWindow
 from am5.gui.panels import (
     CameraControlVars,
     ConnectionPanel,
     ExposurePanel,
     CalibrationPanel,
+    FinderCameraPanel,
     PassesPanel,
     SerPlayerPanel,
     SiteVars,
@@ -26,7 +28,8 @@ from am5.gui.panels import (
 from am5.gui.theme import apply_dark_theme
 from am5.gui.worker import MountWorker
 from am5.tracker import AxisSigns, LiveOffsets
-from camera.worker import CameraWorker
+from camera.finder import FinderState
+from camera.worker import CameraWorker, pgm_to_array
 
 # Events after which the operator has just confirmed/reset "on target" --
 # the idle-mode camera reference re-acquires from the next position sample
@@ -42,6 +45,11 @@ class App:
         self.root = root
         self.worker = MountWorker()
         self.camera_worker = CameraWorker()
+        # Second camera (finder scope) -- entirely optional, stays
+        # disconnected/disabled if not plugged in. Owns a separate
+        # CameraWorker so the finder and main cameras run independently.
+        self.finder_worker = CameraWorker()
+        self.finder_state = FinderState()
 
         root.title("AM3/AM5 ISS Tracker")
         # Applied once, here, before any widget below is built -- ttk.Style
@@ -87,12 +95,14 @@ class App:
         self.connection_panel = ConnectionPanel(
             self.notebook, self.worker, self.camera_worker, self._on_connection_change,
             get_optical_train=self.exposure_panel.get_optical_train, site_vars=self.site_vars,
+            finder_worker=self.finder_worker, finder_state=self.finder_state,
         )
         self.passes_panel = PassesPanel(self.notebook, self._on_pass_selected, site_vars=self.site_vars)
         self.transit_panel = TransitPanel(
             self.notebook, self.worker, self.camera_worker, out_dir, self.live_offsets,
             axis_signs=self.axis_signs, auto_guide_var=self.auto_guide_var, camera_vars=self.camera_vars,
             mount_lag_var=self.mount_lag_var, feedback_enabled_var=self.feedback_enabled_var,
+            finder_state=self.finder_state,
         )
         # on_calibration_ready: CalibrationPanel finishes calibration entirely
         # on its own (button click -> internal timers), so it has to tell
@@ -109,6 +119,15 @@ class App:
         # wiring into _pump_events below.
         self.ser_player_panel = SerPlayerPanel(self.notebook)
 
+        # Finder camera panel -- optional wide-field second camera for ISS
+        # acquisition.  Created unconditionally but greyed out until a
+        # finder camera is actually connected via its own Connect button.
+        self.finder_panel = FinderCameraPanel(
+            self.notebook, self.finder_worker, self.finder_state,
+            live_offsets=self.live_offsets,
+            on_calibration_ready=lambda: self.transit_panel.set_finder_correction_available(True),
+        )
+
         # Plain geometric-shape glyphs (Unicode "Geometric Shapes" block) --
         # unlike pictographic emoji, these render reliably in Tk without
         # depending on a color-emoji font being installed/mapped.
@@ -117,6 +136,7 @@ class App:
         self.notebook.add(self.calibration_panel, text="⊙ Calibration")
         self.notebook.add(self.exposure_panel, text="▣ Exposure calc")
         self.notebook.add(self.transit_panel, text="◎ Transit")
+        self.notebook.add(self.finder_panel, text="🔭 Finder")
         self.notebook.add(self.ser_player_panel, text="▶ SER player")
 
         self._panels = [self.connection_panel]
@@ -126,6 +146,14 @@ class App:
         # JogWindow.protocol("WM_DELETE_WINDOW", ...).
         self.jog_window = JogWindow(root, self.worker, self.camera_worker, self.axis_signs, camera_vars=self.camera_vars)
         self.jog_window.withdraw()
+
+        self.finder_window = FinderWindow(
+            root,
+            self.finder_worker,
+            self.finder_state,
+            on_sync=lambda ra, dec: self.worker.sync(ra / 15.0, dec),
+        )
+        self.finder_window.withdraw()
 
         # Packed BEFORE the notebook below, even though it's created after
         # -- pack() gives space priority in packing order, not creation
@@ -138,7 +166,12 @@ class App:
         # front, so the notebook is always the one that gives way.
         jog_button_frame = ttk.Frame(root)
         jog_button_frame.pack(fill="x", side="bottom")
-        ttk.Button(jog_button_frame, text="◆ Jog control...", command=self._show_jog_window).pack(anchor="w", padx=10, pady=4)
+        ttk.Button(jog_button_frame, text="◆ Jog control...", command=self._show_jog_window).pack(
+            side="left", padx=10, pady=4,
+        )
+        ttk.Button(jog_button_frame, text="🔭 Finder...", command=self._show_finder_window).pack(
+            side="left", pady=4,
+        )
 
         log_frame = ttk.LabelFrame(root, text="Log", padding=(6, 2))
         log_frame.pack(fill="x", side="bottom", padx=6, pady=(4, 6))
@@ -171,6 +204,11 @@ class App:
         self.jog_window.lift()
         self.jog_window.focus_force()
 
+    def _show_finder_window(self) -> None:
+        self.finder_window.deiconify()
+        self.finder_window.lift()
+        self.finder_window.focus_force()
+
     def _on_tab_changed(self, _event: object) -> None:
         if self.notebook.select() == str(self.transit_panel):
             self.transit_panel.focus_preview()
@@ -197,6 +235,12 @@ class App:
             self._camera_target_radec = (ra_deg, dec_deg)
         target_ra_deg, target_dec_deg = self._camera_target_radec
         self.camera_worker.set_sky_context(ra_deg, dec_deg, target_ra_deg, target_dec_deg)
+        # Finder shares the same mount/boresight as the main camera (it's
+        # bolted to the same tube) -- same sky context, just rendered at
+        # the finder's own wider plate scale/FOV (see MockAsiCamera's own
+        # _plate_scale, set from ConnectionPanel.FINDER_PLATE_SCALE at
+        # connect time).
+        self.finder_worker.set_sky_context(ra_deg, dec_deg, target_ra_deg, target_dec_deg)
 
     def _log(self, message: str) -> None:
         self._log_text.configure(state="normal")
@@ -238,11 +282,16 @@ class App:
                     event.payload["actual_ra_deg"], event.payload["actual_dec_deg"],
                     event.payload["target_ra_deg"], event.payload["target_dec_deg"],
                 )
+                self.finder_worker.set_sky_context(
+                    event.payload["actual_ra_deg"], event.payload["actual_dec_deg"],
+                    event.payload["target_ra_deg"], event.payload["target_dec_deg"],
+                )
             for panel in self._panels:
                 panel.handle_event(event)
             self.transit_panel.handle_mount_event(event)
             self.calibration_panel.handle_mount_event(event)
             self.jog_window.handle_mount_event(event)
+            self.finder_window.handle_mount_event(event)
 
         while True:
             try:
@@ -251,16 +300,39 @@ class App:
                 break
             if event.kind in LOG_EVENT_KINDS:
                 self._log(f"[camera:{event.kind}] {event.payload.get('message', '')}")
+            if event.kind == "preview_frame":
+                # Feeds FinderState.last_main_frame so "Calibrate fields"
+                # (FinderCameraPanel._on_calibrate) can correlate the finder
+                # against a REAL main-camera frame instead of silently
+                # falling back to correlating the finder against itself.
+                self.finder_state.update_main_frame(pgm_to_array(event.payload["pgm"]))
             self.connection_panel.handle_camera_event(event)
             self.transit_panel.handle_camera_event(event)
             self.calibration_panel.handle_camera_event(event)
             self.jog_window.handle_camera_event(event)
+
+        while True:
+            try:
+                event = self.finder_worker.events.get_nowait()
+            except queue.Empty:
+                break
+            if event.kind in LOG_EVENT_KINDS:
+                self._log(f"[finder:{event.kind}] {event.payload.get('message', '')}")
+            if event.kind == "disconnected":
+                # Clears any stale ISS-blob detection so a dropped finder
+                # connection can't keep silently driving cross-track
+                # corrections mid-pass (see FinderState.reset_blob).
+                self.finder_state.reset_blob()
+            self.connection_panel.handle_finder_camera_event(event)
+            self.finder_panel.handle_camera_event(event)
+            self.finder_window.handle_camera_event(event)
 
         self.root.after(EVENT_POLL_MS, self._pump_events)
 
     def _on_close(self) -> None:
         self.worker.shutdown()
         self.camera_worker.shutdown()
+        self.finder_worker.shutdown()
         self.root.destroy()
 
 

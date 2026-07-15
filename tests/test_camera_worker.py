@@ -1,5 +1,6 @@
 import queue
 import struct
+import threading
 import time
 
 import numpy as np
@@ -182,6 +183,235 @@ def test_disconnect_while_recording_closes_a_valid_ser_file(worker, tmp_path):
     assert frame_count > 0
     frame_bytes = 640 * 480
     assert len(remaining) == frame_count * frame_bytes + frame_count * 8
+
+
+def test_roi_change_is_refused_while_recording_and_file_stays_valid(worker, tmp_path):
+    # Regression: a live ROI change used to reach the mock camera mid-
+    # recording, so the very next frame had a shape mismatching the
+    # already-open SerWriter -- add_frame() raised, killing the write
+    # thread with no exception handling anywhere: the file was left with
+    # FrameCount=0 in its header despite real frame bytes on disk (see
+    # CameraWorker._handle_set_roi's own comment). Now the change is
+    # refused outright (logged, not applied) while a recording is active,
+    # and the resulting file must still be a normal, valid SER file.
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    worker.set_exposure_us(1000)
+
+    path = tmp_path / "roi_guard.ser"
+    worker.start_recording(path)
+    _wait_for(worker, "recording_started")
+    time.sleep(0.2)
+
+    worker.set_roi(10, 10, 320, 240)
+    warning = _wait_for(worker, "log", timeout=2.0)
+    assert "ROI change refused" in warning.payload["message"]
+
+    time.sleep(0.2)
+    worker.stop_recording()
+    stopped = _wait_for(worker, "recording_stopped", timeout=3.0)
+    assert stopped.payload["frame_count"] > 0
+    assert stopped.payload.get("error") is None
+
+    with open(path, "rb") as fh:
+        raw_header = fh.read(HEADER_SIZE)
+        frame_count = struct.unpack("<i", raw_header[14 + 6 * 4 : 14 + 7 * 4])[0]
+        remaining = fh.read()
+    assert frame_count == stopped.payload["frame_count"]
+    frame_bytes = 640 * 480  # ROI change was refused -- still full-frame 8-bit
+    assert len(remaining) == frame_count * frame_bytes + frame_count * 8
+
+
+def test_bit_depth_change_is_refused_while_recording_and_pixels_stay_correct(worker, tmp_path):
+    # Regression: a live bit-depth switch used to reach the mock camera
+    # mid-recording; SerWriter.add_frame() doesn't validate bit depth, it
+    # just casts to the dtype fixed at recording-start, silently
+    # truncating 16-bit pixel values to 8-bit with no error anywhere (see
+    # CameraWorker._handle_set_bit_depth's own comment). Now refused
+    # outright while recording is active.
+    worker.connect("mock", mock_seed=1, bit_depth=16)
+    _wait_for(worker, "connected")
+    worker.set_exposure_us(1000)
+
+    path = tmp_path / "bitdepth_guard.ser"
+    worker.start_recording(path)
+    _wait_for(worker, "recording_started")
+    time.sleep(0.2)
+
+    worker.set_bit_depth(8)
+    warning = _wait_for(worker, "log", timeout=2.0)
+    assert "Bit depth change refused" in warning.payload["message"]
+
+    time.sleep(0.2)
+    worker.stop_recording()
+    stopped = _wait_for(worker, "recording_stopped", timeout=3.0)
+    assert stopped.payload["frame_count"] > 0
+
+    with open(path, "rb") as fh:
+        raw_header = fh.read(HEADER_SIZE)
+        pixel_depth = struct.unpack("<i", raw_header[14 + 5 * 4 : 14 + 6 * 4])[0]
+    assert pixel_depth == 16  # change was refused -- still recording at the depth set at start_recording
+
+
+def test_write_thread_failure_still_closes_a_readable_ser_file_and_reports_error(worker, tmp_path, monkeypatch):
+    # Regression: _write_loop previously had no exception handling at all
+    # -- any add_frame() failure (disk full, permissions, or the ROI/
+    # bit-depth corruption above if it ever slipped past the new guards)
+    # killed the thread before writer.close() ran, leaving FrameCount=0
+    # and no trailer despite real frame bytes already on disk. Now the
+    # loop always closes the writer and surfaces the failure instead of
+    # reporting a clean stop.
+    from camera.ser_writer import SerWriter
+
+    real_add_frame = SerWriter.add_frame
+    call_count = {"n": 0}
+
+    def flaky_add_frame(self, frame, timestamp=None):
+        call_count["n"] += 1
+        if call_count["n"] == 3:
+            raise OSError("simulated disk failure")
+        real_add_frame(self, frame, timestamp=timestamp)
+
+    monkeypatch.setattr(SerWriter, "add_frame", flaky_add_frame)
+
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    worker.set_exposure_us(1000)
+
+    path = tmp_path / "flaky.ser"
+    worker.start_recording(path)
+    _wait_for(worker, "recording_started")
+    time.sleep(0.5)  # let the flaky write happen and kill the write thread
+
+    worker.stop_recording()
+    stopped = _wait_for(worker, "recording_stopped", timeout=3.0)
+
+    assert stopped.payload.get("error") is not None
+    assert "simulated disk failure" in stopped.payload["error"]
+    # The 2 frames written before the failure must still be a valid,
+    # readable file -- close() ran despite the exception.
+    assert stopped.payload["frame_count"] == 2
+    with open(path, "rb") as fh:
+        raw_header = fh.read(HEADER_SIZE)
+        frame_count = struct.unpack("<i", raw_header[14 + 6 * 4 : 14 + 7 * 4])[0]
+        remaining = fh.read()
+    assert frame_count == 2
+    frame_bytes = 640 * 480
+    assert len(remaining) == frame_count * frame_bytes + frame_count * 8
+
+
+def test_start_recording_is_refused_while_a_previous_recordings_write_thread_is_still_draining(worker, tmp_path, monkeypatch):
+    # Regression: _handle_start_recording used to block (join with a
+    # timeout) waiting for a previous recording's write thread, then
+    # proceed either way -- if that join timed out (a genuinely stalled
+    # disk), the new recording would start concurrently with an orphaned
+    # old write thread, and the two used to share a single reused
+    # threading.Event for their stop signal, letting one clear the
+    # other's. Now start_recording refuses outright while the previous
+    # write thread is still alive, and the old recording finishes and
+    # reports itself once it actually can.
+    from camera.ser_writer import SerWriter
+
+    real_add_frame = SerWriter.add_frame
+    release = threading.Event()
+
+    def blocking_add_frame(self, frame, timestamp=None):
+        release.wait(timeout=5.0)
+        real_add_frame(self, frame, timestamp=timestamp)
+
+    monkeypatch.setattr(SerWriter, "add_frame", blocking_add_frame)
+
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    worker.set_exposure_us(1000)
+
+    path1 = tmp_path / "first.ser"
+    worker.start_recording(path1)
+    _wait_for(worker, "recording_started")
+    time.sleep(0.2)  # let a frame reach add_frame and block there
+
+    worker.stop_recording()
+    time.sleep(0.2)  # the write thread is signaled to stop but still blocked inside add_frame
+
+    path2 = tmp_path / "second.ser"
+    worker.start_recording(path2)
+    warning = _wait_for(worker, "log", timeout=2.0)
+    assert "previous recording is still finishing" in warning.payload["message"]
+    assert not path2.exists()
+
+    release.set()  # unblock the stalled write -- the first recording can now actually finish
+    stopped = _wait_for(worker, "recording_stopped", timeout=3.0)
+    assert stopped.payload["path"] == str(path1)
+    assert stopped.payload["frame_count"] > 0
+    assert stopped.payload["error"] is None
+
+    # A second recording now succeeds normally.
+    worker.start_recording(path2)
+    _wait_for(worker, "recording_started")
+    time.sleep(0.2)
+    worker.stop_recording()
+    stopped2 = _wait_for(worker, "recording_stopped", timeout=3.0)
+    assert stopped2.payload["path"] == str(path2)
+    assert stopped2.payload["frame_count"] > 0
+
+
+def test_disconnect_with_a_stalled_write_thread_warns_instead_of_reporting_false_success(worker, tmp_path, monkeypatch):
+    # Regression, confirmed by direct reproduction before this fix: with a
+    # shortened join timeout and add_frame() forced to hang past it,
+    # stop_recording() (and disconnect, which shared the same code path)
+    # reported recording_stopped with frame_count=0/error=None -- a
+    # fabricated clean result -- while the file on disk already held real
+    # frame bytes and its header FrameCount stayed unpatched, because the
+    # write thread was still alive and hadn't reached close() yet. Now
+    # disconnect warns instead of lying, and the write thread reports the
+    # real result itself whenever it actually finishes.
+    import camera.worker as worker_module
+    from camera.ser_writer import SerWriter
+
+    monkeypatch.setattr(worker_module, "DISCONNECT_WRITE_JOIN_TIMEOUT_S", 0.2)
+
+    real_add_frame = SerWriter.add_frame
+    release = threading.Event()
+
+    def blocking_add_frame(self, frame, timestamp=None):
+        release.wait(timeout=5.0)
+        real_add_frame(self, frame, timestamp=timestamp)
+
+    monkeypatch.setattr(SerWriter, "add_frame", blocking_add_frame)
+
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    worker.set_exposure_us(1000)
+
+    path = tmp_path / "stalled.ser"
+    worker.start_recording(path)
+    _wait_for(worker, "recording_started")
+    time.sleep(0.2)  # let the write thread block on add_frame
+
+    worker.disconnect()
+    saw_warning = False
+    saw_disconnected = False
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and not saw_disconnected:
+        try:
+            event = worker.events.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        if event.kind == "log" and "still finishing" in event.payload.get("message", ""):
+            saw_warning = True
+        if event.kind == "disconnected":
+            saw_disconnected = True
+    assert saw_disconnected
+    assert saw_warning  # honest about not having actually finalized the file yet
+
+    release.set()  # the stalled write thread can now actually finish, in the background
+    stopped = _wait_for(worker, "recording_stopped", timeout=3.0)
+    assert stopped.payload["frame_count"] > 0
+    assert stopped.payload["error"] is None
+    with open(path, "rb") as fh:
+        raw_header = fh.read(HEADER_SIZE)
+        frame_count = struct.unpack("<i", raw_header[14 + 6 * 4 : 14 + 7 * 4])[0]
+    assert frame_count == stopped.payload["frame_count"]  # the eventual report matches what's actually on disk
 
 
 def test_connect_with_bit_depth_16_is_reflected_in_connected_event(worker):
