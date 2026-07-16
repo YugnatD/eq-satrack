@@ -121,7 +121,13 @@ def test_calibration_panel_shares_the_same_mount_lag_var_as_transit_panel(app):
 
 def test_mount_lag_result_event_updates_the_shared_mount_lag_var(app):
     app._pump_events()  # drain startup events first
-    app.worker.events.put(WorkerEvent("mount_lag_result", {"lag_s": 0.42, "steady_rate_arcsec_s": 900.0, "samples": 20}))
+    ra_payload = {
+        "lag_s": 0.42, "steady_rate_arcsec_s": 900.0, "samples": 20,
+        "decel_lag_s": 0.5, "stop_command_t": 2.0, "velocity_samples": ((0.1, 90.0), (2.1, 850.0)),
+        "axis": "ra",
+    }
+    dec_payload = {**ra_payload, "axis": "dec"}
+    app.worker.events.put(WorkerEvent("mount_lag_result", {"ra": ra_payload, "dec": dec_payload}))
     app._pump_events()
 
     assert app.mount_lag_var.get() == pytest.approx(0.42)

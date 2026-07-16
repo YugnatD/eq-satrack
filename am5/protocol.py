@@ -140,10 +140,36 @@ def parse_gza(raw: str) -> AzAlt:
 
 
 def build_rv(rate_x_sidereal: float) -> bytes:
-    """':Rv#' variable slew rate, 0.00-1440.00 x sidereal, no zero-padding."""
+    """':Rv#' variable slew rate, 0.00-1440.00 x sidereal, no zero-padding.
+    Confirmed on real AM5 hardware (docs/AM5_UART_protocol_1.8.8.md) that
+    this writes BOTH axes' stored manual speed at once -- fine for a
+    caller that only ever moves one axis at a time (jog_start, calibrate_
+    directions), but see build_rv_ra/build_rv_dec for simultaneous-both-
+    axes callers (run_tracking_loop, measure_mount_lag), which use the
+    independent per-axis setters instead so setting one axis's rate can
+    never race with the other's already-latched motion."""
     if not 0.0 <= rate_x_sidereal <= 1440.0:
         raise ValueError(f"rate {rate_x_sidereal} out of range [0, 1440]")
     return f":Rv{rate_x_sidereal:.2f}#".encode("ascii")
+
+
+def build_rv_ra(rate_x_sidereal: float) -> bytes:
+    """':Rvr#' — firmware extension (docs/AM5_UART_protocol_1.8.8.md, not
+    in the official v1.7 PDF): sets RA's manual variable speed
+    independently of DEC's. Confirmed live on real AM5 hardware: changing
+    Rvr alone left Rvd (and DEC's already-latched motion) completely
+    unaffected, unlike build_rv's shared ':Rv#' which writes both axes at
+    once."""
+    if not 0.0 <= rate_x_sidereal <= 1440.0:
+        raise ValueError(f"rate {rate_x_sidereal} out of range [0, 1440]")
+    return f":Rvr{rate_x_sidereal:.2f}#".encode("ascii")
+
+
+def build_rv_dec(rate_x_sidereal: float) -> bytes:
+    """':Rvd#' — DEC equivalent of build_rv_ra(); see its docstring."""
+    if not 0.0 <= rate_x_sidereal <= 1440.0:
+        raise ValueError(f"rate {rate_x_sidereal} out of range [0, 1440]")
+    return f":Rvd{rate_x_sidereal:.2f}#".encode("ascii")
 
 
 def build_move(direction: str) -> bytes:
@@ -167,10 +193,27 @@ def build_go_home() -> bytes:
 
 
 def build_park() -> bytes:
-    """:hP# — ZWO's native park (untested against real hardware — INDI's own
-    driver avoids it, see Mount.park()'s docstring). Replies '1#'/'0#',
-    unlike :hC#."""
+    """:hP# — ZWO's native park. Confirmed on real AM5 hardware (tube
+    removed) that this locks a PERSISTED state -- it survives a power
+    cycle, and a plain :hC# (home) afterward silently does not move the
+    mount at all (see build_unpark_native's docstring for the fix). Replies
+    '1#'/'0#', unlike :hC#."""
     return b":hP#"
+
+
+def build_unpark_native() -> bytes:
+    """:Spu# — clears :hP#'s persisted parked state (docs/AM5_UART_
+    protocol_1.8.8.md: "Clears the completed-park state and returns
+    success as a boolean"). This is the missing wire-level unpark for
+    park_native() that Mount.park_native()'s docstring used to call
+    UNKNOWN -- confirmed live on real AM5 hardware: after :hP#, :GU#'s
+    trailing state digit read '5' and :Gps# read '2#'; a plain :hC# then
+    moved nothing at all (not even after a power cycle -- the parked state
+    survives it). Sending :Spu# (reply '1') immediately dropped the state
+    digit to '0' and :Gps# to '0#', and a subsequent :hC# then moved the
+    mount for real. Not needed after park() (:hC#) -- that's just a GOTO,
+    not a locked state, per Mount.park()'s own docstring."""
+    return b":Spu#"
 
 
 # The brief's original "SMeq#/SMMC#" table entries do not exist on the wire
@@ -200,6 +243,33 @@ def build_slew() -> bytes:
 def build_sync() -> bytes:
     """:CM# — sync to the previously staged :Sr#/:Sd# target, no motion."""
     return b":CM#"
+
+
+def build_set_alignment_mode(enabled: bool) -> bytes:
+    """:SSM<n># — firmware extension (docs/AM5_UART_protocol_1.8.8.md, not
+    in the official v1.7 PDF). Value 1 installs an alternate sync callback
+    so each subsequent :CM# (build_sync) records a point into the
+    firmware's 100-entry alignment/model table instead of doing an
+    ordinary flat sync. Any OTHER value restores normal sync behavior AND
+    CLEARS ALL 100 IN-RAM RECORDS -- turning this off is destructive to
+    whatever model has been built up so far. Deliberately not live-tested
+    against real hardware by either this project or the reverse-
+    engineering doc it comes from (both explicitly avoided writing this
+    command) -- treat with the same caution as any other undocumented
+    write."""
+    return f":SSM{1 if enabled else 0}#".encode("ascii")
+
+
+def build_get_alignment_mode() -> bytes:
+    """:GSM# — reads back the mode :SSM# sets. Firmware extension, not in
+    the official v1.7 PDF."""
+    return b":GSM#"
+
+
+def build_get_alignment_point_count() -> bytes:
+    """:NSc# — active-record count in the alignment/model table. Firmware
+    extension, not in the official v1.7 PDF."""
+    return b":NSc#"
 
 
 # The commands and :GU# field meanings below come from ZWO's own protocol
@@ -301,16 +371,27 @@ def parse_meridian_behavior(raw: str) -> tuple[bool, bool, float]:
 
 @dataclass(frozen=True)
 class MountStatus:
-    """Best-effort parse of a :GU# reply. The doc lists which characters
-    can appear (each individually documented as "or not shown", i.e. the
-    string is variable-length depending on which conditions are active) but
-    never gives a fixed field layout — so rather than guess at character
-    positions, this checks for presence of each flag character. Safe: the
-    letter-flags (n/N/L/H/G/Z/S/s/T/t/P) never collide with the numeric
-    rate/state fields also present in the string."""
+    """Best-effort parse of a :GU# reply. Most fields are letter-flags that
+    appear (or don't) in an optional, variable-length prefix -- checking
+    for presence of each character is safe there, since none of them
+    collide with the numeric rate/state fields also present in the string.
+
+    is_parked is the one exception: it used to also check for a "P"
+    character (per the official v1.7 PDF), but that was never confirmed
+    against real hardware and turned out wrong -- confirmed instead
+    (docs/AM5_UART_protocol_1.8.8.md, cross-checked live against a real
+    AM5: :GU# read 'nGM040000895#' immediately after a real :hP# park,
+    with :Gps# independently reporting a nonzero/changed park state, and
+    "P" nowhere in the string) that parked state is the trailing STATE
+    DIGIT (the last character of the fixed-format tail) equal to '5', a
+    completely different encoding. With the old "P"-search logic,
+    is_parked was always False -- silently defeating the unpark cross-
+    check in am5/gui/worker.py's _handle_unpark (never able to warn that
+    the mount still reports parked after an attempted unpark)."""
 
     raw: str
     is_parked: bool
+    state: int | None  # trailing state digit: 0=idle 1=tracking 2=GOTO 3=manual 4=homing 5=parking; None if unparseable
     is_equatorial: bool | None  # None if neither G nor Z was found
     is_at_home: bool
     ra_stalled: bool
@@ -319,9 +400,12 @@ class MountStatus:
 
 def parse_gu_status(raw: str) -> MountStatus:
     body = _strip_frame(raw)
+    last = body[-1:]
+    state = int(last) if last.isdigit() else None
     return MountStatus(
         raw=raw,
-        is_parked="P" in body,
+        is_parked=state == 5,
+        state=state,
         is_equatorial=True if "G" in body else (False if "Z" in body else None),
         is_at_home="H" in body,
         ra_stalled="S" in body,

@@ -14,9 +14,9 @@ from tkinter import ttk
 
 import numpy as np
 
-from am5.gui.panels import format_exposure_us
+from am5.gui.panels import format_exposure_us, show_frame_on_canvas
 from am5.gui.theme import PALETTE
-from camera.finder import MAX_FINDER_EXPOSURE_US, FinderState, downsample_for_display
+from camera.finder import MAX_FINDER_EXPOSURE_US, FinderState
 from camera.platesolve import PlateSolver
 from camera.worker import CameraEvent, CameraWorker, pgm_to_array
 
@@ -204,18 +204,11 @@ class FinderWindow(tk.Toplevel):
     # ------------------------------------------------------------------
 
     def _show_preview(self, frame: np.ndarray) -> None:
-        cw = self._canvas.winfo_width()
-        ch = self._canvas.winfo_height()
-        if cw < 2 or ch < 2:
+        drawn = show_frame_on_canvas(self._canvas, frame)
+        if drawn is None:
             return
-        gray = frame if frame.ndim == 2 else frame.mean(axis=2).astype(frame.dtype)
-        dw, dh, scale, display = downsample_for_display(gray, cw, ch)
-        header = f"P5\n{dw} {dh}\n255\n".encode()
-        self._photo = tk.PhotoImage(data=header + display.tobytes())
-        self._canvas.delete("all")
-        xoff = (cw - dw) // 2
-        yoff = (ch - dh) // 2
-        self._canvas.create_image(xoff, yoff, anchor="nw", image=self._photo)
+        self._photo = drawn.photo  # keep a reference -- Tk drops images with none
+        scale, xoff, yoff = drawn.scale, drawn.x_offset, drawn.y_offset
         corners = self._finder_state.main_fov_corners_px()
         if corners is not None:
             points = []

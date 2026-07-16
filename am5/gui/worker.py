@@ -28,7 +28,7 @@ from am5.mock_mount import MockConfig, MockMount
 from am5.mount import Mount
 from am5.protocol import ProtocolError
 from am5.safety import SafetyGuard
-from am5.tracker import LIMIT_CODE_MEANINGS, TRACKING_CSV_FIELDS, AxisSigns, LiveOffsets, TrackingConfig, _pick_direction, calibrate_directions, measure_mount_lag, run_tracking_loop
+from am5.tracker import LIMIT_CODE_MEANINGS, TRACKING_CSV_FIELDS, AxisSigns, LiveOffsets, MountLagResult, TrackingConfig, _pick_direction, calibrate_directions, measure_mount_lag, run_tracking_loop
 from am5.transport import SerialTransport, TCPTransport, Transport
 
 # Same heuristic as characterize.py test (f): no encoders, so "arrived" can
@@ -103,6 +103,11 @@ class MountWorker:
         self._connected = threading.Event()
         self._idle_poll_enabled = threading.Event()
         self._parked = False
+        # Which park() variant is currently active -- "home" (:hC#) or
+        # "native" (:hP#), or None. Only native park needs a wire-level
+        # unpark (:Spu#, see Mount.unpark_native()'s docstring); tracked
+        # here so _handle_unpark knows whether to send it.
+        self._park_method: str | None = None
         self._tracking_stop_event: threading.Event | None = None
         # Set by emergency_stop() to break the closed-loop motion handlers
         # (jog_goto, calibrate) that would otherwise re-issue a move command
@@ -177,6 +182,17 @@ class MountWorker:
         of fixing one."""
         self._commands.put(("sync", {"ra_hours": ra_hours, "dec_deg": dec_deg}))
 
+    def set_alignment_mode(self, enabled: bool) -> None:
+        """:SSM# — see Mount.set_alignment_mode's docstring, including the
+        destructive "turning it off clears the whole table" behavior and
+        that this is undocumented/never live-tested against real
+        hardware. No motion either way."""
+        self._commands.put(("set_alignment_mode", {"enabled": enabled}))
+
+    def read_alignment_status(self) -> None:
+        """Reads :GSM#+:NSc# -- current alignment mode and point count."""
+        self._commands.put(("read_alignment_status", {}))
+
     def calibrate(self) -> None:
         self._commands.put(("calibrate", {}))
 
@@ -188,8 +204,14 @@ class MountWorker:
         actual connected transport, not trusted from the caller."""
         self._commands.put(("inject_training_pointing_error", {"ra_bias_deg": ra_bias_deg, "dec_bias_deg": dec_bias_deg}))
 
-    def measure_mount_lag(self, rate_x: float = 100.0, duration_s: float = 1.5) -> None:
+    def measure_mount_lag(self, rate_x: float = 1440.0, duration_s: float = 2.5) -> None:
         self._commands.put(("measure_mount_lag", {"rate_x": rate_x, "duration_s": duration_s}))
+
+    def read_mount_health(self) -> None:
+        """Reads stall load, temperature, and motor current -- all
+        firmware extensions (docs/AM5_UART_protocol_1.8.8.md, not in the
+        official v1.7 PDF), read-only, no motion."""
+        self._commands.put(("read_mount_health", {}))
 
     def start_tracking(
         self, trajectory: Trajectory, axis_signs: AxisSigns, offsets: LiveOffsets,
@@ -246,9 +268,12 @@ class MountWorker:
             "set_altitude_limits": self._handle_set_altitude_limits,
             "goto": self._handle_goto,
             "sync": self._handle_sync,
+            "set_alignment_mode": self._handle_set_alignment_mode,
+            "read_alignment_status": self._handle_read_alignment_status,
             "jog_goto": self._handle_jog_goto,
             "calibrate": self._handle_calibrate,
             "measure_mount_lag": self._handle_measure_mount_lag,
+            "read_mount_health": self._handle_read_mount_health,
             "start_tracking": self._handle_start_tracking,
             "inject_training_pointing_error": self._handle_inject_training_pointing_error,
         }
@@ -353,6 +378,25 @@ class MountWorker:
                 f"the mount's time was just set from this clock regardless."
             ))
 
+        # :GRl# is a firmware extension (docs/AM5_UART_protocol_1.8.8.md,
+        # not in the official v1.7 PDF) -- read-only, so a failure here
+        # (older firmware, unsupported transport) must never block
+        # connecting. Cross-checks THIS mount's own configured max manual
+        # rate against TrackingConfig's hardcoded max_rate_x safety margin,
+        # confirmed matching (1440) on this project's own AM5, but not
+        # guaranteed to hold on a different unit/configuration.
+        try:
+            mount_max_rate_x = mount.get_max_rate_x()
+            configured_max_rate_x = TrackingConfig().max_rate_x
+            if mount_max_rate_x < configured_max_rate_x:
+                self._emit("log", message=(
+                    f"[warn] mount reports its own max rate as {mount_max_rate_x:.0f}x sidereal, below "
+                    f"TrackingConfig's max_rate_x={configured_max_rate_x:.0f}x -- tracking may try to command "
+                    f"rates this mount will refuse or clamp on its own."
+                ))
+        except (ProtocolError, ValueError):
+            pass  # older firmware or unsupported transport -- not fatal, just no cross-check
+
         self._mount = mount
         # Runs on this worker thread, not the main thread — can't install
         # signal handlers (see SafetyGuard docstring / am5/safety.py). The
@@ -375,6 +419,7 @@ class MountWorker:
         self._mock_mount = None
         self._connected.clear()
         self._parked = False
+        self._park_method = None
         self._emit("disconnected")
 
     def _blocked_while_parked(self, action: str) -> bool:
@@ -394,6 +439,7 @@ class MountWorker:
         if self._safety is not None:
             self._safety.notify_command(movement_active=False)
         self._parked = True
+        self._park_method = "home"
         self._emit("parked", method="home", reply=None)
 
     def _handle_park_native(self, payload: dict) -> None:
@@ -410,23 +456,31 @@ class MountWorker:
         if self._safety is not None:
             self._safety.notify_command(movement_active=False)
         self._parked = True
+        self._park_method = "native"
         self._emit("parked", method="native", reply=reply.strip())
-        # Cross-check against the mount's own P flag rather than trusting
-        # only this local software flag.
+        # Cross-check against the mount's own :GU# state digit rather than
+        # trusting only this local software flag (see MountStatus's own
+        # docstring for why it's the state digit, not a "P" character).
         after = self._mount.get_status()
         if not after.is_parked:
-            self._emit("log", message="[warn] :hP# replied success but :GU# does not report the P flag")
+            self._emit("log", message="[warn] :hP# replied success but :GU#'s state digit does not report parked")
 
     def _handle_unpark(self, payload: dict) -> None:
-        # No wire command -- confirmed true for park() (:hC#, see its
-        # docstring). UNVERIFIED for park_native() (:hP#): if the mount
-        # still refuses motion after this, :hP# needs a real unpark command
-        # we don't know yet -- cross-check the P flag below to find out.
         self._parked = False
         if self._mount is not None:
+            if self._park_method == "native":
+                # :hC# (park()) has no wire-level unpark -- confirmed, it's
+                # just a GOTO, not a locked state. :hP# (park_native())
+                # DOES leave a real, PERSISTED locked state (survives a
+                # power cycle) that silently blocks even :hC# afterward --
+                # confirmed live on real AM5 hardware, see Mount.
+                # unpark_native()'s docstring for the full story.
+                reply = self._mount.unpark_native()
+                self._emit("log", message=f"[info] :Spu# (native unpark) replied {reply.strip()!r}")
             status = self._mount.get_status()
             if status.is_parked:
-                self._emit("log", message="[warn] :GU# still reports P after unpark -- :hP# likely needs a real wire-level unpark command")
+                self._emit("log", message="[warn] :GU# still reports parked after unpark -- :hP# likely needs a real wire-level unpark command")
+        self._park_method = None
         self._emit("unparked")
 
     def _handle_jog_start(self, payload: dict) -> None:
@@ -561,17 +615,60 @@ class MountWorker:
         signs = calibrate_directions(self._mount, abort=self._abort)
         self._emit("calibration_done", ra_sign=signs.ra, dec_sign=signs.dec, pier_side=signs.calibrated_pier_side)
 
+    @staticmethod
+    def _lag_result_payload(result: MountLagResult) -> dict:
+        return {
+            "lag_s": result.lag_s, "steady_rate_arcsec_s": result.steady_rate_arcsec_s,
+            "samples": result.samples, "decel_lag_s": result.decel_lag_s,
+            "stop_command_t": result.stop_command_t, "velocity_samples": result.velocity_samples,
+            "axis": result.axis,
+        }
+
     def _handle_measure_mount_lag(self, payload: dict) -> None:
         if self._mount is None or self._blocked_while_parked("measuring mount lag"):
             return
         self._abort.clear()
-        result = measure_mount_lag(
+        ra_result, dec_result = measure_mount_lag(
             self._mount, rate_x=payload["rate_x"], duration_s=payload["duration_s"], abort=self._abort,
+            safety=self._safety,  # so the watchdog covers the slew -- see measure_mount_lag's own docstring
         )
         self._emit(
-            "mount_lag_result", lag_s=result.lag_s,
-            steady_rate_arcsec_s=result.steady_rate_arcsec_s, samples=result.samples,
+            "mount_lag_result",
+            ra=self._lag_result_payload(ra_result), dec=self._lag_result_payload(dec_result),
         )
+
+    def _handle_read_mount_health(self, payload: dict) -> None:
+        # Read-only, no motion -- unlike measure_mount_lag, deliberately
+        # NOT gated by _blocked_while_parked, and each field is read
+        # independently so one unsupported/malformed selector (older
+        # firmware) doesn't blank out the rest.
+        if self._mount is None:
+            return
+        health: dict[str, float | None] = {
+            "ra_stall_load": None, "dec_stall_load": None, "temperature_c": None,
+            "ra_current": None, "dec_current": None,
+        }
+        try:
+            health["ra_stall_load"] = self._mount.get_axis_stall_load("ra")
+        except (ProtocolError, ValueError):
+            pass
+        try:
+            health["dec_stall_load"] = self._mount.get_axis_stall_load("dec")
+        except (ProtocolError, ValueError):
+            pass
+        try:
+            health["temperature_c"] = self._mount.get_temperature_c()
+        except (ProtocolError, ValueError):
+            pass
+        try:
+            health["ra_current"] = self._mount.get_axis_current("ra")
+        except (ProtocolError, ValueError):
+            pass
+        try:
+            health["dec_current"] = self._mount.get_axis_current("dec")
+        except (ProtocolError, ValueError):
+            pass
+        self._emit("mount_health", **health)
 
     def _handle_goto(self, payload: dict) -> None:
         if self._mount is None or self._blocked_while_parked("a GOTO"):
@@ -606,6 +703,30 @@ class MountWorker:
             self._emit("sync_result", ok=False, message=str(exc), ra_hours=ra_hours, dec_deg=dec_deg)
             return
         self._emit("sync_result", ok=True, message="Synced", ra_hours=ra_hours, dec_deg=dec_deg)
+
+    def _handle_set_alignment_mode(self, payload: dict) -> None:
+        # Not gated by _blocked_while_parked -- no motion either way.
+        if self._mount is None:
+            return
+        enabled = payload["enabled"]
+        try:
+            self._mount.set_alignment_mode(enabled)
+            count = self._mount.get_alignment_point_count()
+        except ProtocolError as exc:
+            self._emit("log", message=f"[warn] :SSM# failed: {exc}")
+            return
+        self._emit("alignment_status", enabled=enabled, point_count=count)
+
+    def _handle_read_alignment_status(self, payload: dict) -> None:
+        if self._mount is None:
+            return
+        try:
+            enabled = self._mount.get_alignment_mode()
+            count = self._mount.get_alignment_point_count()
+        except ProtocolError as exc:
+            self._emit("log", message=f"[warn] could not read alignment status: {exc}")
+            return
+        self._emit("alignment_status", enabled=enabled, point_count=count)
 
     def _check_goto_landed_on_target(self, target_ra_hours: float, target_dec_deg: float, arrived: tuple[float, float]) -> None:
         """Cross-checks a "0#, then position stopped changing" GOTO against

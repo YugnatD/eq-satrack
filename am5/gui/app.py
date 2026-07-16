@@ -15,6 +15,7 @@ from tkinter import ttk
 from am5.gui.finder_window import FinderWindow
 from am5.gui.jog_window import JogWindow
 from am5.gui.panels import (
+    AlignmentPanel,
     CameraControlVars,
     ConnectionPanel,
     ExposurePanel,
@@ -107,6 +108,11 @@ class App:
         # Shared with CalibrationPanel: "Measure mount lag" there writes it,
         # TransitPanel's start/simulate read it into TrackingConfig.
         self.mount_lag_var = tk.DoubleVar(value=0.0)
+        # Shared the same way as mount_lag_var -- "Measure mount lag" also
+        # derives this (steady_rate/lag_s) alongside it. 0.0 means "not
+        # measured", which TrackingConfig.max_accel_deg_s2=None (the old
+        # flat mount_lag_s behavior) treats the same as "disabled".
+        self.mount_max_accel_var = tk.DoubleVar(value=0.0)
         # Owned by TransitPanel's checkbox alone (no writer elsewhere), but
         # held here so it's alongside the other cross-panel tracking state.
         self.feedback_enabled_var = tk.BooleanVar(value=False)
@@ -133,7 +139,8 @@ class App:
         self.transit_panel = TransitPanel(
             self.notebook, self.worker, self.camera_worker, out_dir, self.live_offsets,
             axis_signs=self.axis_signs, auto_guide_var=self.auto_guide_var, camera_vars=self.camera_vars,
-            mount_lag_var=self.mount_lag_var, feedback_enabled_var=self.feedback_enabled_var,
+            mount_lag_var=self.mount_lag_var, mount_max_accel_var=self.mount_max_accel_var,
+            feedback_enabled_var=self.feedback_enabled_var,
             finder_state=self.finder_state,
         )
         # on_calibration_ready: CalibrationPanel finishes calibration entirely
@@ -144,8 +151,13 @@ class App:
             self.notebook, self.worker, self.camera_worker, self.live_offsets,
             auto_guide_var=self.auto_guide_var,
             on_calibration_ready=lambda: self.transit_panel.set_auto_guide_available(True),
-            mount_lag_var=self.mount_lag_var, axis_signs=self.axis_signs,
+            mount_lag_var=self.mount_lag_var, mount_max_accel_var=self.mount_max_accel_var,
+            axis_signs=self.axis_signs,
         )
+        self.alignment_panel = AlignmentPanel(
+            self.notebook, self.worker, self.axis_signs, self.site_vars, finder_state=self.finder_state,
+        )
+
         # Pure local file I/O, no worker/device -- doesn't need any of the
         # constructor args above, and (unlike every other panel) needs no
         # wiring into _pump_events below.
@@ -166,6 +178,7 @@ class App:
         self.notebook.add(self.connection_panel, text="◆ Connection")
         self.notebook.add(self.passes_panel, text="▲ Passes")
         self.notebook.add(self.calibration_panel, text="⊙ Calibration")
+        self.notebook.add(self.alignment_panel, text="✦ Alignment")
         self.notebook.add(self.exposure_panel, text="▣ Exposure calc")
         self.notebook.add(self.transit_panel, text="◎ Transit")
         self.notebook.add(self.finder_panel, text="🔭 Finder")
@@ -248,12 +261,14 @@ class App:
     def _on_connection_change(self, connected: bool) -> None:
         self.jog_window.set_connected(connected)
         self.calibration_panel.set_connected(connected)
+        self.alignment_panel.set_connected(connected)
         self.transit_panel.set_mount_connected(connected)
 
     def _on_pass_selected(self, trajectory, window, crossings, site, satellite_name) -> None:
         self.transit_panel.set_trajectory(trajectory, window, crossings, site, satellite_name)
         self.exposure_panel.set_pass(trajectory, window)
         self.calibration_panel.set_trajectory(trajectory)
+        self.alignment_panel.set_trajectory(trajectory, window, satellite_name)
 
     def _on_mount_position(self, ra_deg: float, dec_deg: float) -> None:
         """Idle-poll/manual-jog path: the first position sample after a
@@ -322,6 +337,7 @@ class App:
                 panel.handle_event(event)
             self.transit_panel.handle_mount_event(event)
             self.calibration_panel.handle_mount_event(event)
+            self.alignment_panel.handle_mount_event(event)
             self.jog_window.handle_mount_event(event)
             self.finder_window.handle_mount_event(event)
 

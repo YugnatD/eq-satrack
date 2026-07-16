@@ -104,6 +104,25 @@ def test_connect_warns_in_log_when_system_clock_not_synchronized(worker):
     assert any("2.50s" in e.payload["message"] for e in log_events)
 
 
+def test_connect_warns_when_mount_max_rate_is_below_configured(worker):
+    # :GRl# (docs/AM5_UART_protocol_1.8.8.md, not in the official v1.7
+    # PDF) lets us cross-check the mount's own configured max manual rate
+    # against TrackingConfig's hardcoded max_rate_x -- soft warning only,
+    # connecting must still succeed.
+    with patch("am5.mount.Mount.get_max_rate_x", return_value=720.0):
+        worker.connect("mock", mock_seed=1)
+        seen = _collect_until(worker, "connected", timeout=3.0)
+    log_events = [e for e in seen if e.kind == "log"]
+    assert any("max rate" in e.payload["message"] for e in log_events)
+
+
+def test_connect_does_not_warn_when_mount_max_rate_is_at_least_configured(worker):
+    worker.connect("mock", mock_seed=1)  # mock's default :GRl# reply is 1440
+    seen = _collect_until(worker, "connected", timeout=3.0)
+    log_events = [e for e in seen if e.kind == "log"]
+    assert not any("max rate" in e.payload["message"] for e in log_events)
+
+
 def test_connect_warns_in_log_when_clock_sync_status_is_unknown(worker):
     status = ClockSyncStatus(synchronized=None, offset_s=None, source="none", detail="no clock-sync tool available")
     with patch("am5.gui.worker.check_clock_sync", return_value=status):
@@ -357,8 +376,66 @@ def test_measure_mount_lag_emits_result(worker):
 
     worker.measure_mount_lag(rate_x=100.0, duration_s=0.5)
     event = _wait_for(worker, "mount_lag_result", timeout=5.0)
-    assert event.payload["lag_s"] >= 0.0
-    assert event.payload["samples"] > 0
+    assert event.payload["ra"]["lag_s"] >= 0.0
+    assert event.payload["ra"]["samples"] > 0
+
+
+def test_read_mount_health_emits_result(worker):
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+
+    worker.read_mount_health()
+    event = _wait_for(worker, "mount_health", timeout=3.0)
+    assert event.payload["ra_stall_load"] == 0
+    assert event.payload["dec_stall_load"] == 0
+    assert event.payload["temperature_c"] == pytest.approx(25.0)
+    assert event.payload["ra_current"] == 15
+    assert event.payload["dec_current"] == 15
+
+
+def test_read_mount_health_works_while_parked(worker):
+    # Read-only, no motion -- unlike measure_mount_lag, must not be gated
+    # by _blocked_while_parked.
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    worker.park()
+    _wait_for(worker, "parked", timeout=3.0)
+
+    worker.read_mount_health()
+    event = _wait_for(worker, "mount_health", timeout=3.0)
+    assert event.payload["temperature_c"] == pytest.approx(25.0)
+
+
+def test_alignment_mode_toggle_emits_status_with_point_count(worker):
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+
+    worker.set_alignment_mode(True)
+    event = _wait_for(worker, "alignment_status", timeout=3.0)
+    assert event.payload["enabled"] is True
+    assert event.payload["point_count"] == 0
+
+    worker.sync(ra_hours=1.0, dec_deg=45.0)
+    _wait_for(worker, "sync_result", timeout=3.0)
+    worker.read_alignment_status()
+    event = _wait_for(worker, "alignment_status", timeout=3.0)
+    assert event.payload["point_count"] == 1
+
+    worker.set_alignment_mode(False)
+    event = _wait_for(worker, "alignment_status", timeout=3.0)
+    assert event.payload["enabled"] is False
+    assert event.payload["point_count"] == 0  # turning it off clears the table
+
+
+def test_alignment_mode_works_while_parked(worker):
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    worker.park()
+    _wait_for(worker, "parked", timeout=3.0)
+
+    worker.set_alignment_mode(True)
+    event = _wait_for(worker, "alignment_status", timeout=3.0)
+    assert event.payload["enabled"] is True
 
 
 def test_disconnect_emits_disconnected(worker):
@@ -450,18 +527,40 @@ def test_park_native_refused_in_altaz_mode(worker):
     assert "Alt-Az" in log_event.payload["message"]
 
 
-def test_unpark_warns_if_p_flag_still_set(worker):
+def test_unpark_after_native_park_sends_spu(worker):
+    # Regression: :hP# (native park) locks a real, PERSISTED state on real
+    # hardware -- confirmed live, it survives a power cycle and silently
+    # blocks even :hC# (home) afterward. :Spu# is the wire-level unpark
+    # this needs (see Mount.unpark_native()'s docstring); it used to not be
+    # sent at all, leaving the mount stuck after park_native()+unpark().
     worker.connect("mock", mock_seed=1)
     _wait_for(worker, "connected")
     worker.park_native()
     _wait_for(worker, "parked", timeout=3.0)
 
-    # the mock has no real unpark side effect, so :GU# still reports P --
-    # exactly the scenario the warning exists to catch on real hardware.
     worker.unpark()
     log_event = _wait_for(worker, "log", timeout=3.0)
-    assert "P" in log_event.payload["message"]
+    assert "Spu" in log_event.payload["message"]
     _wait_for(worker, "unparked", timeout=3.0)
+
+    # And the mock genuinely cleared its parked state (mirrors real
+    # hardware's :Spu# reply) -- no lingering "still reports parked" warning.
+    assert worker._mount is not None
+    assert worker._mount.get_status().is_parked is False
+
+
+def test_unpark_after_home_park_does_not_send_spu(worker):
+    # :hC# (park()) is just a GOTO, not a locked state -- confirmed no
+    # wire-level unpark is needed for it, so unpark() after a plain park()
+    # must not send :Spu#.
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    worker.park()
+    _wait_for(worker, "parked", timeout=3.0)
+
+    worker.unpark()
+    seen = _collect_until(worker, "unparked", timeout=3.0)
+    assert not any(e.kind == "log" for e in seen)
 
 
 def test_goto_is_blocked_while_parked(worker):

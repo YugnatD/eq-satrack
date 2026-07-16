@@ -112,6 +112,22 @@ def test_build_rv():
     assert protocol.build_rv(1440.0) == b":Rv1440.00#"
 
 
+def test_build_rv_ra_and_dec():
+    assert protocol.build_rv_ra(150.0) == b":Rvr150.00#"
+    assert protocol.build_rv_dec(60.0) == b":Rvd60.00#"
+    with pytest.raises(ValueError):
+        protocol.build_rv_ra(-1.0)
+    with pytest.raises(ValueError):
+        protocol.build_rv_dec(1441.0)
+
+
+def test_build_alignment_mode_commands():
+    assert protocol.build_set_alignment_mode(True) == b":SSM1#"
+    assert protocol.build_set_alignment_mode(False) == b":SSM0#"
+    assert protocol.build_get_alignment_mode() == b":GSM#"
+    assert protocol.build_get_alignment_point_count() == b":NSc#"
+
+
 def test_build_rv_out_of_range():
     with pytest.raises(ValueError):
         protocol.build_rv(1440.01)
@@ -173,13 +189,38 @@ def test_build_set_date_time_timezone():
 def test_parse_gu_status_flags():
     status = protocol.parse_gu_status("nNG001000060#")
     assert status.is_parked is False
+    assert status.state == 0
     assert status.is_equatorial is True
     assert status.is_at_home is False
 
-    status = protocol.parse_gu_status("NHZP001000060#")
+    # Real :GU# read live from an AM5 immediately after a genuine :hP#
+    # native park (see am5/protocol.py's MountStatus docstring) -- trailing
+    # state digit '5' is what marks parked, not a "P" character (there
+    # isn't one, on real firmware).
+    status = protocol.parse_gu_status("nGM040000895#")
     assert status.is_parked is True
+    assert status.state == 5
+    assert status.is_equatorial is True
+    assert status.is_at_home is False  # DEC's own home flag cleared by the park slew (RAflags=04, DECflags=00)
+
+    status = protocol.parse_gu_status("NHZ001000060#")
+    assert status.is_parked is False
+    assert status.state == 0
     assert status.is_equatorial is False
     assert status.is_at_home is True
+
+
+def test_parse_gu_status_state_digit_across_real_examples():
+    # Real live :GU# reads, one per state, all from this project's own
+    # real-hardware sessions (docs/AM5_UART_protocol_1.8.8.md's state
+    # table: 0=idle 1=tracking 2=GOTO 3=manual 4=homing 5=parking).
+    assert protocol.parse_gu_status("nNGM000000990#").state == 0  # idle
+    assert protocol.parse_gu_status("nGM040000895#").state == 5  # parked
+    assert protocol.parse_gu_status("nNHGM040400880#").state == 0  # idle, referenced
+
+    status = protocol.parse_gu_status("garbage-no-digit#")
+    assert status.state is None
+    assert status.is_parked is False
 
 
 def test_parse_gu_status_stall_flags_case_sensitive():

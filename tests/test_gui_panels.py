@@ -19,6 +19,8 @@ from am5.gui.panels import (
     KNOWN_SATELLITES,
     MAX_CALIBRATION_PREVIEW_DIM,
     MAX_TRACKING_DURATION_S,
+    AlignmentPanel,
+    AlignmentSkyMapWidget,
     ConnectionPanel,
     ExposurePanel,
     CalibrationPanel,
@@ -30,10 +32,11 @@ from am5.gui.panels import (
     _local_and_utc,
     _meridian_detail_line,
     _sanitize_filename,
+    visible_named_stars,
 )
 from am5.gui.worker import MountWorker, WorkerEvent
 from am5.optics import OpticalTrain
-from am5.tracker import LiveOffsets
+from am5.tracker import AxisSigns, LiveOffsets
 from camera.finder import FinderCalibration, FinderState
 from camera.guiding import BlobDetection, GuidingCalibration
 from camera.worker import CameraEvent, CameraWorker, frame_to_pgm
@@ -241,6 +244,38 @@ def test_on_arm_click_arms_immediately_without_a_confirmation_dialog(panel):
     panel._on_arm_click()
     assert panel._armed is True
     assert str(panel._start_button["state"]) == "normal"
+
+
+def test_tracking_stopped_disarms_so_start_button_and_armed_flag_agree(panel):
+    # Regression: after tracking stopped, Start stayed disabled (its own
+    # _on_start_click disabled it and this branch never re-enables it)
+    # while _armed stayed True internally -- the flag and the button
+    # disagreed, and a later jog_goto_result/goto_result would then
+    # silently re-enable Start off that stale True without the operator
+    # re-confirming they're on target. Now a stop disarms, so a fresh ARM
+    # is required before tracking again.
+    _select_a_pass(panel)
+    panel.set_mount_connected(True)
+
+    for stop_kind in ("tracking_stopped", "tracking_error"):
+        # Reproduce the post-Start-click state directly (arming then
+        # clicking Start disables Start) -- _select_a_pass uses a fixed
+        # past window, so calling the real _on_start_click here would hit
+        # _check_pass_timing's "pass already over" messagebox and block a
+        # headless test; the branch under test doesn't depend on how Start
+        # got disabled, only on it being disabled with _armed True.
+        panel._on_arm_click()
+        panel._start_button.configure(state="disabled")
+        assert panel._armed is True
+
+        panel.handle_mount_event(WorkerEvent(stop_kind, {}))
+        assert panel._armed is False
+        assert str(panel._start_button["state"]) == "disabled"
+
+        # A later GOTO completing must NOT re-enable Start off a stale
+        # _armed -- it stays disabled until the operator ARMs again.
+        panel.handle_mount_event(WorkerEvent("jog_goto_result", {"arrived": True}))
+        assert str(panel._start_button["state"]) == "disabled"
 
 
 def test_set_auto_guide_available_enables_and_disables_the_checkbox(panel):
@@ -490,6 +525,32 @@ def test_transit_panel_set_trajectory_draws_sky_map_and_tracks_mount(panel):
     assert panel._sky_map._mount_marker is marker
     second_xy = (float(marker.get_data()[0][0]), float(marker.get_data()[1][0]))
     assert second_xy != first_xy
+
+
+def test_set_trajectory_resets_a_stale_delta_t_from_a_previous_pass(panel):
+    # Regression: delta_t_s used to persist for the whole app session --
+    # a clock-offset/along-track correction dialed in by hand during one
+    # pass silently carried over and applied from tick one of whatever
+    # pass got selected next. Measured impact (see LiveOffsets.reset's
+    # own docstring): the ISS moves at ~900-1400 arcsec/s, so even a
+    # small leftover delta_t is a real, large along-track offset at the
+    # new pass's start -- with nothing warning the operator beyond an
+    # easy-to-miss "+X.Xs" label.
+    window = _select_a_pass(panel)
+    panel._offsets.adjust_delta_t(1.5)
+    panel._offsets.trigger_perp_pulse(1.0, duration_s=30.0)  # still "active" if not cleared
+    assert panel._offsets.snapshot() == (1.5, 1.0)
+
+    # Selecting a pass again (same or different -- what matters is that
+    # set_trajectory is what the app calls on every fresh pass selection)
+    # must clear the stale offset.
+    ts = load.timescale()
+    satellite = EarthSatellite(_TLE_LINE1, _TLE_LINE2, "ISS (fixture)", ts)
+    crossings = meridian_crossings(compute_trajectory(satellite, panel._site, window.t_rise, window.t_set, step_s=0.2))
+    trajectory = compute_trajectory(satellite, panel._site, window.t_rise, window.t_set, step_s=0.2)
+    panel.set_trajectory(trajectory, window, crossings, panel._site, satellite.name)
+
+    assert panel._offsets.snapshot() == (0.0, 0.0)
 
 
 def test_sanitize_filename_collapses_unsafe_characters():
@@ -809,6 +870,373 @@ def calibration_panel():
     root.destroy()
 
 
+@pytest.fixture
+def alignment_panel():
+    root = tk.Tk()
+    root.withdraw()
+    mount_worker = MountWorker()
+    site_vars = SiteVars.create()
+    site_vars.lat.set("46.18")
+    site_vars.lon.set("6.14")
+    p = AlignmentPanel(root, mount_worker, AxisSigns(ra=1.0, dec=1.0), site_vars, finder_state=FinderState())
+    yield p
+    mount_worker.shutdown()
+    root.destroy()
+
+
+class _MplEvent:
+    def __init__(self, xdata, ydata, button=None, inaxes=True):
+        self.xdata = xdata
+        self.ydata = ydata
+        self.button = button
+        self.inaxes = inaxes
+
+
+@pytest.fixture
+def sky_map():
+    root = tk.Tk()
+    root.withdraw()
+    selected = []
+    w = AlignmentSkyMapWidget(root, on_star_selected=lambda star: selected.append(star))
+    w.selected = selected  # stash for tests to read
+    yield w
+    w.close()
+    root.destroy()
+
+
+def test_sky_map_scroll_zoom_is_centered_on_the_cursor_not_the_view_center(sky_map):
+    w = sky_map
+    w.ax.set_xlim(-90, 90)
+    w.ax.set_ylim(-90, 90)
+    # Scroll "up" (zoom in) with the cursor sitting off-center, near the
+    # edge of the view -- a naive concentric zoom (the old polar-axes
+    # implementation) would always shrink back toward (0, 0) regardless
+    # of where the cursor was, which is exactly the bug being fixed here.
+    cursor_x, cursor_y = 60.0, 60.0
+    w._on_scroll(_MplEvent(xdata=cursor_x, ydata=cursor_y, button="up", inaxes=w.ax))
+    new_xlim, new_ylim = w.ax.get_xlim(), w.ax.get_ylim()
+    assert new_xlim[1] - new_xlim[0] < 180.0  # actually zoomed in
+    # The cursor's data position should have stayed inside the new view
+    # AND close to the same fractional position within it (not re-centered).
+    assert new_xlim[0] < cursor_x < new_xlim[1]
+    assert new_ylim[0] < cursor_y < new_ylim[1]
+    old_fx, old_fy = (cursor_x - (-90.0)) / 180.0, (cursor_y - (-90.0)) / 180.0
+    new_fx = (cursor_x - new_xlim[0]) / (new_xlim[1] - new_xlim[0])
+    new_fy = (cursor_y - new_ylim[0]) / (new_ylim[1] - new_ylim[0])
+    assert new_fx == pytest.approx(old_fx, abs=0.05)
+    assert new_fy == pytest.approx(old_fy, abs=0.05)
+
+
+def test_sky_map_zoom_out_never_exceeds_the_full_sky_extent(sky_map):
+    w = sky_map
+    for _ in range(10):
+        w._on_scroll(_MplEvent(xdata=0.0, ydata=0.0, button="down", inaxes=w.ax))
+    x0, x1 = w.ax.get_xlim()
+    y0, y1 = w.ax.get_ylim()
+    assert x0 >= -90.0 - 1e-6 and x1 <= 90.0 + 1e-6
+    assert y0 >= -90.0 - 1e-6 and y1 <= 90.0 + 1e-6
+
+
+def test_sky_map_click_selects_the_nearest_star(sky_map):
+    from am5.named_stars import NAMED_STARS_BY_NAME
+    w = sky_map
+    sirius = NAMED_STARS_BY_NAME["Sirius"]
+    vega = NAMED_STARS_BY_NAME["Vega"]
+    w.set_stars([(sirius, 90.0, 40.0), (vega, 270.0, 60.0)])
+    from am5.gui.panels import _altaz_to_xy
+    x, y = _altaz_to_xy(90.0, 40.0)
+    w._on_click(_MplEvent(xdata=x, ydata=y, inaxes=w.ax))
+    assert w.selected == [sirius]
+
+
+def test_sky_map_click_far_from_any_star_selects_nothing(sky_map):
+    from am5.named_stars import NAMED_STARS_BY_NAME
+    w = sky_map
+    sirius = NAMED_STARS_BY_NAME["Sirius"]
+    w.set_stars([(sirius, 90.0, 40.0)])
+    w._on_click(_MplEvent(xdata=-80.0, ydata=-80.0, inaxes=w.ax))
+    assert w.selected == []
+
+
+def test_sky_map_update_mount_marker_does_not_raise(sky_map):
+    sky_map.update_mount_marker(az_deg=180.0, alt_deg=45.0)
+    assert sky_map._mount_marker is not None
+    sky_map.update_mount_marker(az_deg=190.0, alt_deg=50.0)  # move, not recreate
+
+
+def test_alignment_panel_position_event_updates_label_and_marker(alignment_panel):
+    p = alignment_panel
+    p.handle_mount_event(WorkerEvent("position", {"ra_hours": 5.5, "dec_deg": 45.0}))
+    assert "5.500h" in p._mount_position_var.get()
+    assert "45.00" in p._mount_position_var.get()
+    assert p._sky_map._mount_marker is not None
+
+
+def test_visible_named_stars_only_returns_stars_above_the_horizon():
+    from datetime import datetime, timezone
+    when = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    stars = visible_named_stars(46.18, 6.14, when, min_alt_deg=10.0)
+    assert stars  # some named star should be up at some point on a given night
+    for _star, _az, alt in stars:
+        assert alt >= 10.0
+
+
+def test_alignment_panel_selecting_a_star_enables_goto_and_sync(alignment_panel):
+    p = alignment_panel
+    assert str(p._goto_button["state"]) == "disabled"
+    assert str(p._sync_button["state"]) == "disabled"
+    p.set_connected(True)
+    assert p._sky_map._stars  # some star should be visible right now at this real site/time
+    star, _az, _alt = p._sky_map._stars[0]
+
+    p._on_star_selected(star)
+    assert p._selected_star is star
+    assert star.name in p._selected_var.get()
+    assert str(p._goto_button["state"]) == "normal"
+    assert str(p._sync_button["state"]) == "normal"
+
+
+def test_alignment_panel_sync_button_ignores_disconnected_state_for_sync_only(alignment_panel):
+    # Sync never moves the mount -- only needs a connection, not an
+    # unparked state (mirrors JogWindow's own sync button).
+    p = alignment_panel
+    p.set_connected(True)
+    star, _az, _alt = p._sky_map._stars[0]
+    p._on_star_selected(star)
+    p.handle_mount_event(WorkerEvent("parked", {}))
+    assert str(p._goto_button["state"]) == "disabled"  # GOTO IS blocked while parked
+    assert str(p._sync_button["state"]) == "normal"
+
+
+def test_alignment_panel_sync_click_queues_worker_sync_and_updates_status(alignment_panel):
+    p = alignment_panel
+    p.set_connected(True)
+    star, _az, _alt = p._sky_map._stars[0]
+    p._on_star_selected(star)
+    p._on_sync_click()
+    assert str(p._sync_button["state"]) == "disabled"
+    assert star.name in p._status_var.get()
+
+    p.handle_mount_event(WorkerEvent("sync_result", {
+        "ok": True, "message": "Synced", "ra_hours": star.ra_hours, "dec_deg": star.dec_deg,
+    }))
+    assert p._status_var.get() == "Synced"
+
+
+def test_alignment_panel_mode_toggle_updates_status_from_worker_event(alignment_panel):
+    p = alignment_panel
+    p.set_connected(True)
+    p.handle_mount_event(WorkerEvent("alignment_status", {"enabled": True, "point_count": 3}))
+    assert p._alignment_mode is True
+    assert p._alignment_mode_var.get() is True
+    assert "3 point" in p._alignment_status_var.get()
+
+    p.handle_mount_event(WorkerEvent("alignment_status", {"enabled": False, "point_count": 0}))
+    assert p._alignment_mode is False
+    assert "Off" in p._alignment_status_var.get()
+
+
+def test_alignment_panel_sync_requests_a_status_refresh_while_in_alignment_mode(alignment_panel):
+    p = alignment_panel
+    p.set_connected(True)
+    star, _az, _alt = p._sky_map._stars[0]
+    p._on_star_selected(star)
+    p._alignment_mode = True  # simulate the worker having already confirmed alignment mode is on
+
+    calls = []
+    p._mount_worker.read_alignment_status = lambda: calls.append(True)
+    p.handle_mount_event(WorkerEvent("sync_result", {
+        "ok": True, "message": "Synced", "ra_hours": star.ra_hours, "dec_deg": star.dec_deg,
+    }))
+    assert calls == [True]
+
+
+def test_alignment_panel_turning_off_alignment_mode_asks_for_confirmation(alignment_panel, monkeypatch):
+    p = alignment_panel
+    p.set_connected(True)
+    p._alignment_mode = True  # was on
+    p._alignment_mode_var.set(False)  # operator just unchecked it
+
+    from am5.gui import panels as panels_module
+    calls = []
+    monkeypatch.setattr(panels_module.messagebox, "askyesno", lambda *a, **k: (calls.append(1), False)[1])
+    p._on_alignment_mode_toggle()
+    assert calls == [1]
+    assert p._alignment_mode_var.get() is True  # declined -- reverted the checkbox
+
+
+class _FakeSolveResult:
+    def __init__(self, ra_deg: float, dec_deg: float, success: bool = True, message: str = ""):
+        self.success = success
+        self.ra_deg = ra_deg
+        self.dec_deg = dec_deg
+        self.message = message
+
+
+def test_polar_alignment_reads_frame_and_scale_from_the_selected_camera(alignment_panel):
+    p = alignment_panel
+    p._finder_state.last_frame = np.zeros((10, 10), dtype=np.uint8)
+    p._finder_state.finder_plate_scale_arcsec = 5.0
+    p._finder_state.last_main_frame = np.ones((20, 20), dtype=np.uint8)
+    p._finder_state.main_plate_scale_arcsec = 2.0
+
+    p._polar_camera_var.set("finder")
+    frame, scale = p._current_frame_and_plate_scale()
+    assert frame.shape == (10, 10)
+    assert scale == 5.0
+
+    p._polar_camera_var.set("main")
+    frame, scale = p._current_frame_and_plate_scale()
+    assert frame.shape == (20, 20)
+    assert scale == 2.0
+
+
+def test_polar_alignment_refuses_to_start_without_a_frame(alignment_panel):
+    p = alignment_panel
+    p.set_connected(True)
+    p._finder_state.last_frame = None
+    p._on_polar_start_click()
+    assert "connected" in p._polar_status_var.get()
+    assert str(p._polar_start_button["state"]) == "normal"
+
+
+def test_polar_alignment_rejects_invalid_rotation_or_rate(alignment_panel):
+    p = alignment_panel
+    p._polar_rotation_deg_var.set("not-a-number")
+    p._on_polar_start_click()
+    assert "Invalid" in p._polar_status_var.get()
+
+    p._polar_rotation_deg_var.set("30")
+    p._polar_rate_var.set("-5")
+    p._on_polar_start_click()
+    assert "positive" in p._polar_status_var.get()
+
+    p._polar_rotation_deg_var.set("0")
+    p._polar_rate_var.set("150")
+    p._on_polar_start_click()
+    assert "nonzero" in p._polar_status_var.get()
+
+
+def test_polar_alignment_negative_rotation_jogs_west(alignment_panel, monkeypatch):
+    p = alignment_panel
+    p.set_connected(True)
+    p._finder_state.last_frame = np.zeros((10, 10), dtype=np.uint8)
+    p._finder_state.finder_plate_scale_arcsec = 5.0
+    monkeypatch.setattr(p, "after", lambda ms, cb: cb())
+    monkeypatch.setattr(
+        p._solvers[p._solver_engine_var.get()], "solve_async",
+        lambda frame, widget, on_done, **kw: on_done(_FakeSolveResult(0.0, 89.0)),
+    )
+    jog_calls = []
+    monkeypatch.setattr(p._mount_worker, "jog_start", lambda direction, rate_x: jog_calls.append(("start", direction)))
+    monkeypatch.setattr(p._mount_worker, "jog_stop", lambda direction: jog_calls.append(("stop", direction)))
+
+    p._polar_rotation_deg_var.set("-30")
+    p._polar_rate_var.set("150")
+    p._on_polar_start_click()
+
+    assert ("start", "w") in jog_calls
+    assert ("stop", "w") in jog_calls
+    assert ("start", "e") not in jog_calls
+    assert p._polar_rotation_deg == pytest.approx(30.0)  # stored as a positive magnitude
+
+
+def test_polar_alignment_aborts_cleanly_on_a_failed_solve(alignment_panel, monkeypatch):
+    p = alignment_panel
+    p.set_connected(True)
+    p._finder_state.last_frame = np.zeros((10, 10), dtype=np.uint8)
+    p._finder_state.finder_plate_scale_arcsec = 5.0
+    monkeypatch.setattr(
+        p._solvers[p._solver_engine_var.get()], "solve_async",
+        lambda frame, widget, on_done, **kw: on_done(_FakeSolveResult(0.0, 0.0, success=False, message="no stars found")),
+    )
+    p._on_polar_start_click()
+    assert "failed" in p._polar_status_var.get()
+    assert "no stars found" in p._polar_status_var.get()
+    assert str(p._polar_start_button["state"]) == "normal"
+
+
+def test_polar_alignment_full_workflow_computes_a_result(alignment_panel, monkeypatch):
+    p = alignment_panel
+    p.set_connected(True)
+    p._finder_state.last_frame = np.zeros((10, 10), dtype=np.uint8)
+    p._finder_state.finder_plate_scale_arcsec = 5.0
+
+    # Collapse the jog-rotation timer waits into immediate execution --
+    # the real defaults would otherwise make this test wait tens of
+    # real seconds for a scheduled self.after() callback.
+    monkeypatch.setattr(p, "after", lambda ms, cb: cb())
+
+    # 3 synthetic solves tracing a circle around the true celestial pole
+    # (same construction as tests/test_polar_alignment.py's own known-
+    # axis test) -- a perfectly-aligned mount, so the reported error
+    # should come out at ~0.
+    solved_points = iter([(0.0, 85.0), (120.0, 85.0), (240.0, 85.0)])
+    monkeypatch.setattr(
+        p._solvers[p._solver_engine_var.get()], "solve_async",
+        lambda frame, widget, on_done, **kw: on_done(_FakeSolveResult(*next(solved_points))),
+    )
+    jog_calls = []
+    monkeypatch.setattr(p._mount_worker, "jog_start", lambda direction, rate_x: jog_calls.append(("start", direction, rate_x)))
+    monkeypatch.setattr(p._mount_worker, "jog_stop", lambda direction: jog_calls.append(("stop", direction)))
+
+    p._polar_rotation_deg_var.set("30")
+    p._polar_rate_var.set("150")
+    p._on_polar_start_click()
+
+    assert "Total error" in p._polar_result_var.get()
+    assert jog_calls.count(("start", "e", 150.0)) == 2  # rotated between each of the 3 captures
+    assert jog_calls.count(("stop", "e")) == 2
+    assert str(p._polar_start_button["state"]) == "normal"
+
+
+def _pass_trajectory(n: int = 20) -> Trajectory:
+    # A simple rise-to-set arc: azimuth sweeps 90->270 while altitude rises
+    # then falls back to the horizon -- enough for set_pass_track to have
+    # a real multi-point line to draw, not just a single point.
+    t_unix = time.time() + np.linspace(0, 300, n)
+    az_deg = np.linspace(90.0, 270.0, n)
+    alt_deg = 60.0 * np.sin(np.linspace(0, np.pi, n))
+    return Trajectory(
+        t_unix=t_unix, ra_deg=np.full(n, 45.0), dec_deg=np.full(n, 45.0),
+        dra_dt_deg_s=np.full(n, 0.01), ddec_dt_deg_s=np.full(n, 0.005),
+        alt_deg=alt_deg, az_deg=az_deg, ha_hours=np.zeros(n),
+        distance_km=np.full(n, 500.0),
+    )
+
+
+def test_alignment_panel_set_trajectory_updates_status_and_forwards_to_sky_map(alignment_panel, monkeypatch):
+    p = alignment_panel
+    calls = []
+    monkeypatch.setattr(p._sky_map, "set_pass_track", lambda az, alt: calls.append((list(az), list(alt))))
+    trajectory = _pass_trajectory()
+    window = _window(datetime(2026, 7, 16, 20, 0, 0, tzinfo=timezone.utc), duration_s=300.0, max_elevation_deg=60.0)
+
+    p.set_trajectory(trajectory, window, "ISS (ZARYA)")
+
+    assert len(calls) == 1
+    assert calls[0][0] == list(trajectory.az_deg)
+    assert calls[0][1] == list(trajectory.alt_deg)
+    assert "ISS (ZARYA)" in p._pass_track_var.get()
+    assert "20:00:00" in p._pass_track_var.get()
+    assert "60" in p._pass_track_var.get()
+
+
+def test_sky_map_set_pass_track_draws_a_line_and_survives_set_stars(sky_map):
+    w = sky_map
+    trajectory = _pass_trajectory()
+    w.set_pass_track(trajectory.az_deg, trajectory.alt_deg)
+    assert w._pass_track_azalt is not None
+    lines_before = list(w.ax.get_lines())
+    assert len(lines_before) >= 1  # at least the track line itself
+
+    # set_stars clears+redraws the axes (periodic star refresh) -- the
+    # pass track must survive that, same as the star field/mount marker.
+    w.set_stars([])
+    lines_after = list(w.ax.get_lines())
+    assert len(lines_after) >= 1
+
+
 def _blob(x: float, y: float, found: bool = True) -> BlobDetection:
     return BlobDetection(found=found, centroid_x=x, centroid_y=y, peak_value=200.0, pixel_count=20)
 
@@ -1089,10 +1517,38 @@ def test_calibration_panel_mount_lag_result_updates_status_and_shared_var(calibr
     p = calibration_panel
     p.set_connected(True)
     p._lag_measure_button.configure(state="disabled")
-    p.handle_mount_event(WorkerEvent("mount_lag_result", {"lag_s": 0.345, "steady_rate_arcsec_s": 1200.0, "samples": 30}))
+    ra_payload = {
+        "lag_s": 0.345, "steady_rate_arcsec_s": 1200.0, "samples": 30,
+        "decel_lag_s": 0.4, "stop_command_t": 2.5, "velocity_samples": ((0.1, 100.0), (2.6, 1150.0), (3.0, 50.0)),
+        "axis": "ra",
+    }
+    dec_payload = {**ra_payload, "steady_rate_arcsec_s": -1190.0, "axis": "dec"}
+    p.handle_mount_event(WorkerEvent("mount_lag_result", {"ra": ra_payload, "dec": dec_payload}))
     assert "0.345" in p._lag_status_var.get()
     assert str(p._lag_measure_button["state"]) == "normal"
     assert p._mount_lag_var.get() == pytest.approx(0.345)
+
+
+def test_calibration_panel_mount_health_updates_status_and_reenables_button(calibration_panel):
+    p = calibration_panel
+    p.set_connected(True)
+    p._health_button.configure(state="disabled")
+    p.handle_mount_event(WorkerEvent("mount_health", {
+        "ra_stall_load": 0, "dec_stall_load": 3, "temperature_c": 36.694401,
+        "ra_current": 28, "dec_current": 15,
+    }))
+    text = p._health_var.get()
+    assert "36.7" in text
+    assert "28" in text and "15" in text
+    assert str(p._health_button["state"]) == "normal"
+
+
+def test_calibration_panel_read_health_click_disables_button_and_queues_worker_command(calibration_panel):
+    p = calibration_panel
+    p.set_connected(True)
+    p._on_read_health_click()
+    assert str(p._health_button["state"]) == "disabled"
+    assert "Reading" in p._health_var.get()
 
 
 def test_calibration_panel_measure_lag_click_rejects_invalid_input(calibration_panel):
@@ -1205,6 +1661,78 @@ def test_camera_connect_in_mock_mode_uses_this_panels_own_optics_fields():
     finally:
         mount_worker.shutdown()
         camera_worker.shutdown()
+        root.destroy()
+
+
+def test_camera_connect_in_mock_mode_recovers_cleanly_from_a_zero_focal_length():
+    # Regression: a "0" focal length parses fine as a float (no ValueError
+    # from the field-parsing guard), then dividing by it inside _plate_
+    # scale_arcsec_per_px raised an uncaught ZeroDivisionError -- confirmed
+    # to leave the connect button stuck disabled at "Connecting..." with
+    # no error shown and no way to retry short of restarting the app.
+    root = tk.Tk()
+    root.withdraw()
+    mount_worker = MountWorker()
+    camera_worker = CameraWorker()
+    try:
+        p = ConnectionPanel(root, mount_worker, camera_worker, lambda _connected: None, map_widget_cls=_StubMapWidget)
+        assert p._camera_kind_var.get() == "mock"  # default
+        p._main_focal_var.set("0")
+        p._camera_worker.connect = lambda *a, **kw: pytest.fail("must not attempt to connect with invalid optics")
+
+        p._on_camera_connect_click()  # must not raise
+
+        assert str(p._camera_connect_button["state"]) == "normal"
+        assert "Invalid" in p._camera_status_var.get()
+    finally:
+        mount_worker.shutdown()
+        camera_worker.shutdown()
+        root.destroy()
+
+
+def test_exposure_panel_get_optical_train_returns_none_for_a_zero_focal_length():
+    # Same regression, the real-camera branch's source: get_optical_train
+    # already caught ValueError from float(...) parsing, and now also
+    # catches the ValueError OpticalTrain.__post_init__ raises for a
+    # degenerate (zero) effective focal length -- so a "0" in the field
+    # yields None (the existing, already-handled "not configured" case)
+    # instead of a train that would raise ZeroDivisionError on first use
+    # of plate_scale_arcsec_per_px (see ConnectionPanel._on_camera_connect_
+    # click, which only checks `train is not None` before using it).
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        p = ExposurePanel(root)
+        p._focal_var.set("0")
+        assert p.get_optical_train() is None
+    finally:
+        root.destroy()
+
+
+def test_finder_connect_in_mock_mode_recovers_cleanly_from_a_zero_focal_length():
+    root = tk.Tk()
+    root.withdraw()
+    mount_worker = MountWorker()
+    camera_worker = CameraWorker()
+    finder_worker = CameraWorker()
+    finder_state = FinderState()
+    try:
+        p = ConnectionPanel(
+            root, mount_worker, camera_worker, lambda _connected: None,
+            finder_worker=finder_worker, finder_state=finder_state, map_widget_cls=_StubMapWidget,
+        )
+        assert p._finder_kind_var.get() == "mock"  # default
+        p._finder_focal_var.set("0")
+        p._finder_worker.connect = lambda *a, **kw: pytest.fail("must not attempt to connect with invalid optics")
+
+        p._on_finder_connect_click()  # must not raise
+
+        assert str(p._finder_connect_button["state"]) == "normal"
+        assert "Invalid" in p._finder_status_var.get()
+    finally:
+        mount_worker.shutdown()
+        camera_worker.shutdown()
+        finder_worker.shutdown()
         root.destroy()
 
 

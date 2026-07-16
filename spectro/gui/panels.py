@@ -39,6 +39,7 @@ from matplotlib.patches import Rectangle
 from am5.angles import angular_separation_deg
 from am5.gui.theme import PALETTE, style_axes
 from am5.gui.worker import MountWorker, WorkerEvent
+from camera.finder import downsample_for_display
 from camera.worker import CameraEvent, CameraWorker
 from spectro.alignment import angle_from_points, extract_aligned_crop, paste_star_trail
 from spectro.gui.live_camera import LiveCameraFeed, RealCaptureState, TabResyncTracker
@@ -130,6 +131,24 @@ _TYPICAL_GOTO_ACCURACY_ARCMIN = 3.0
 # player loop (_play_tick), since this mockup has no real camera worker
 # thread yet to push frames on its own schedule.
 _LIVE_INTERVAL_MS = 140
+
+# Full-frame imshow panels (AlignmentPanel, AcquisitionPanel) downsample
+# the source array to roughly this many pixels on the long edge before
+# handing it to matplotlib -- same fix, same rationale as camera/finder.py's
+# downsample_for_display (see its own docstring for the incident: a live
+# preview redrawn at full sensor resolution on every tick froze the whole
+# Tk main thread once the sensor got large enough, ~240ms/frame measured
+# at 3840x2160). Not yet triggered here in practice -- FRAME ACQUISITION
+# in this module is still synthetic (see this module's own docstring) and
+# the real camera this app targets (ASI290MC, ~1936x1096) is well under
+# the frame size that caused the original freeze -- but the fix is cheap,
+# the pattern is proven, and there's no reason to wait for a wider/higher-
+# res camera (or a real one, once FRAME ACQUISITION is wired up) to hit
+# the same wall. extent stays at the FULL sensor's own coordinate range
+# regardless of this downsample factor -- order0/trace marks (read from
+# event.xdata/ydata, in that same extent's data space) stay in real,
+# full-resolution sensor pixels; only the array handed to imshow shrinks.
+_FULL_FRAME_DISPLAY_MAX_DIM = 900
 
 
 # Fixed (not re-randomized on every redraw) relative line depths/widths for
@@ -1054,7 +1073,12 @@ class AlignmentPanel(ttk.Frame):
             return
         height, width = self._last_frame.shape
         self._ax.clear()
-        self._ax.imshow(self._last_frame, cmap="inferno", aspect="auto", extent=(0, width, height, 0))
+        # Downsample for display only -- width/height above (used for
+        # extent and the default zoom window below) stay the FULL sensor's
+        # own dimensions regardless; see _FULL_FRAME_DISPLAY_MAX_DIM's own
+        # comment.
+        _dw, _dh, _scale, display = downsample_for_display(self._last_frame, _FULL_FRAME_DISPLAY_MAX_DIM, _FULL_FRAME_DISPLAY_MAX_DIM)
+        self._ax.imshow(display, cmap="inferno", aspect="auto", extent=(0, width, height, 0))
         if self._order0_xy is not None:
             self._ax.plot(*self._order0_xy, marker="+", color=PALETTE.accent_ok, markersize=14, markeredgewidth=2)
         if self._trace_points is not None:
@@ -1918,7 +1942,12 @@ class AcquisitionPanel(ttk.Frame):
             return
         height, width = self._last_full_frame.shape
         self._full_frame_ax.clear()
-        self._full_frame_ax.imshow(self._last_full_frame, cmap="inferno", aspect="auto", extent=(0, width, height, 0))
+        # Downsample for display only -- width/height above (used for
+        # extent and the default zoom window below) stay the FULL sensor's
+        # own dimensions regardless; see _FULL_FRAME_DISPLAY_MAX_DIM's own
+        # comment.
+        _dw, _dh, _scale, display = downsample_for_display(self._last_full_frame, _FULL_FRAME_DISPLAY_MAX_DIM, _FULL_FRAME_DISPLAY_MAX_DIM)
+        self._full_frame_ax.imshow(display, cmap="inferno", aspect="auto", extent=(0, width, height, 0))
         if self._order0_full_xy is not None:
             self._full_frame_ax.plot(
                 *self._order0_full_xy, marker="+", color=PALETTE.accent_ok, markersize=14, markeredgewidth=2,

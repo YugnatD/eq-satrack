@@ -1,3 +1,36 @@
+[tool.poetry]
+name = "eq-satrack"
+version = "0.1.0"
+description = "ISS/satellite tracking for a ZWO AM3/AM5/AM7 mount + ASI camera, with a spectroscopy side project sharing the same GUI/worker patterns"
+authors = ["Tanguy Dietrich"]
+packages = [
+    { include = "am5" },
+    { include = "camera" },
+    { include = "spectro" },
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+numpy = ">=2.0"
+matplotlib = ">=3.8"
+skyfield = ">=1.49"
+astropy = ">=6.0"
+astroquery = ">=0.4.7"  # spectro/catalog.py -- SIMBAD lookups
+pyserial = ">=3.5"
+geopy = ">=2.4"
+tkintermapview = ">=1.29"
+zwoasi = ">=0.2"
+scikit-image = ">=0.22"  # camera/finder.py -- match_template/resize for finder<->main calibration
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0"
+pytest-rerunfailures = ">=14.0"
+ruff = ">=0.15"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
 [tool.ruff]
 target-version = "py310"
 

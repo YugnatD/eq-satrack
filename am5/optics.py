@@ -25,6 +25,28 @@ class OpticalTrain:
     barlow_multiplier: float
     pixel_size_um: float
 
+    def __post_init__(self) -> None:
+        # Regression fix: a fat-fingered "0" in the focal-length or pixel-
+        # size field parses cleanly as a float (no ValueError), so callers
+        # that only guard the float(...) parsing (get_optical_train,
+        # ExposurePanel._on_compute_click, both in am5/gui/panels.py) went
+        # on to divide by an effective focal length of zero inside
+        # plate_scale_arcsec_per_px -- an uncaught ZeroDivisionError,
+        # confirmed to leave ConnectionPanel's real-camera connect button
+        # stuck disabled at "Connecting..." with no error shown and no way
+        # to retry short of restarting the app. Raising here (a plain
+        # ValueError, the same exception type every existing call site
+        # already catches around its own float(...) parsing) turns the
+        # crash into the same "invalid input" message those call sites
+        # already show for a non-numeric field.
+        if self.focal_length_mm <= 0 or self.barlow_multiplier <= 0:
+            raise ValueError(
+                f"effective focal length must be positive (focal_length_mm={self.focal_length_mm}, "
+                f"barlow_multiplier={self.barlow_multiplier})"
+            )
+        if self.pixel_size_um <= 0:
+            raise ValueError(f"pixel_size_um must be positive (got {self.pixel_size_um})")
+
     @property
     def effective_focal_length_mm(self) -> float:
         return self.focal_length_mm * self.barlow_multiplier

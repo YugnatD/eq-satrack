@@ -14,22 +14,29 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-          cache: pip
 
       - name: Install system dependencies (tkinter GUI + virtual display)
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-tk xvfb
 
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry/virtualenvs
+          key: poetry-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
+
       - name: Install Python dependencies
-        run: pip install -r requirements.txt pytest-rerunfailures
+        run: poetry install --no-interaction
 
       # Fails fast, before spending time on the test jobs below. Only the
       # default rule set (unused imports/variables, undefined names,
       # syntax errors) -- see pyproject.toml for why line-length isn't
       # enforced.
       - name: Lint (ruff)
-        run: ruff check .
+        run: poetry run ruff check .
 
       # Split into a few separate `pytest` processes rather than one big
       # run: the GUI/mount tests spin up a lot of real threads (per-mock
@@ -43,7 +50,7 @@ jobs:
       # occasionally slow under CI's shared CPU, independent of the above.
       - name: Run core/astronomy tests (no Tk, no threads)
         run: >
-          pytest tests/test_angles.py tests/test_constellations.py
+          poetry run pytest tests/test_angles.py tests/test_constellations.py
           tests/test_ephemeris.py tests/test_optics.py tests/test_protocol.py
           tests/test_clock_sync.py tests/test_guiding.py
           tests/test_ser_writer.py tests/test_ser_reader.py tests/test_fits_writer.py
@@ -51,11 +58,11 @@ jobs:
           tests/test_camera_worker.py -v
 
       - name: Run mount/tracker tests (real threads, no Tk)
-        run: pytest tests/test_mount.py tests/test_tracker.py -v
+        run: poetry run pytest tests/test_mount.py tests/test_tracker.py -v
 
       - name: Run GUI tests (Tk + threads, under a virtual display)
         run: >
-          xvfb-run -a pytest --reruns 1 --reruns-delay 2
+          xvfb-run -a poetry run pytest --reruns 1 --reruns-delay 2
           tests/test_gui_worker.py tests/test_gui_panels.py
           tests/test_gui_app.py tests/test_jog_window.py
           tests/test_gui_dialogs.py tests/test_gui_ser_player.py -v

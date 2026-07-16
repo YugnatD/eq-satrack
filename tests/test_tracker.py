@@ -14,6 +14,7 @@ from am5.constants import SIDEREAL_DEG_PER_S
 from am5.ephemeris import Trajectory
 from am5.mock_mount import MockConfig, MockMount
 from am5.mount import Mount
+from am5.protocol import ProtocolError, RaDec
 from am5.safety import SafetyGuard
 from am5.tracker import (
     TRACKING_CSV_FIELDS,
@@ -155,6 +156,17 @@ def test_live_offsets_perp_pulse_expires():
     assert perp == 0.0
 
 
+def test_live_offsets_reset_clears_delta_t_and_any_active_perp_pulse():
+    offsets = LiveOffsets()
+    offsets.adjust_delta_t(1.5)
+    offsets.trigger_perp_pulse(sign=1.0, duration_s=30.0)
+    assert offsets.snapshot() == (1.5, 1.0)
+
+    offsets.reset()
+
+    assert offsets.snapshot() == (0.0, 0.0)
+
+
 def test_calibrate_directions_records_the_pier_side_it_calibrated_on():
     mock = MockMount(MockConfig(rv_mode="per_axis"))
     mount = Mount(mock)
@@ -189,11 +201,17 @@ def test_calibrate_directions_normalizes_home_pier_side_to_none():
 
 
 def test_measure_mount_lag_recovers_the_mocks_known_ramp_constant():
-    # MockMount simulates a real first-order mechanical ramp (tau_s=0.15,
-    # see mock_mount.py) -- a 1st-order step response reaches
-    # settle_fraction=0.9 of steady-state at t = -tau*ln(1-0.9) =~
-    # 2.303*tau =~ 0.345s. This is the one real ground truth available
-    # without hardware, so it's what the algorithm is checked against.
+    # MockMount simulates a real constant-acceleration ramp
+    # (max_accel_deg_s2=4.55, see mock_mount.py -- calibrated against real
+    # AM5 hardware, tube removed: measure_mount_lag run for real settled
+    # in ~0.9-1.3s at 1000x/1440x, matching a ~4.5-4.6 deg/s^2 constant
+    # acceleration far better than the earlier exponential model did). For
+    # a rate-limited ramp from rest, settle_fraction=0.9 of steady-state is
+    # reached at t = 0.9 * target_deg_s / max_accel_deg_s2. This is the one
+    # real ground truth available without hardware, so it's what the
+    # algorithm is checked against. rate_x=1000 (not the old 100) so the
+    # target speed is large enough for a meaningful number of polls before
+    # settling, same regime as the real-hardware measurement it mirrors.
     # Seeded: the mock's simulated serial latency is randomized per-call
     # (see MockMount._sample_latency), which is real enough noise on a
     # measurement that's inherently timing-sensitive that an unseeded run
@@ -202,16 +220,66 @@ def test_measure_mount_lag_recovers_the_mocks_known_ramp_constant():
     mock = MockMount(MockConfig(rv_mode="per_axis"), seed=1)
     mount = Mount(mock)
     try:
-        result = measure_mount_lag(mount, rate_x=100.0, duration_s=1.0)
+        ra_result, dec_result = measure_mount_lag(mount, rate_x=1000.0, duration_s=1.5)
     finally:
         mount.stop()
         mount.close()
 
-    assert isinstance(result, MountLagResult)
-    assert result.lag_s == pytest.approx(0.345, abs=0.1)
-    expected_rate_arcsec_s = 100.0 * SIDEREAL_DEG_PER_S * 3600.0
-    assert result.steady_rate_arcsec_s == pytest.approx(expected_rate_arcsec_s, rel=0.1)
-    assert result.samples > 4
+    assert isinstance(ra_result, MountLagResult)
+    assert ra_result.axis == "ra"
+    assert dec_result.axis == "dec"
+    target_deg_s = 1000.0 * SIDEREAL_DEG_PER_S
+    expected_lag_s = 0.9 * target_deg_s / MockConfig().max_accel_deg_s2
+    # Wider tolerance than the old exponential model needed: finite-
+    # differencing :GMEQ#'s limited ASCII precision over a 20ms poll
+    # produces real quantization noise on the velocity estimate (visible
+    # as jaggedness in the real-hardware plot too, not mock-specific) that
+    # can shift exactly when a noisy sample first crosses the threshold.
+    assert ra_result.lag_s == pytest.approx(expected_lag_s, abs=0.25)
+    assert ra_result.decel_lag_s == pytest.approx(expected_lag_s, abs=0.25)  # symmetric ramp, same as real hardware
+    expected_rate_arcsec_s = 1000.0 * SIDEREAL_DEG_PER_S * 3600.0
+    assert ra_result.steady_rate_arcsec_s == pytest.approx(expected_rate_arcsec_s, rel=0.1)
+    assert ra_result.samples > 4
+    # Both axes are driven simultaneously (see measure_mount_lag's own
+    # docstring) -- the mock applies the same max_accel_deg_s2 to both, so
+    # DEC should recover essentially the same numbers as RA.
+    assert dec_result.lag_s == pytest.approx(expected_lag_s, abs=0.25)
+    assert abs(dec_result.steady_rate_arcsec_s) == pytest.approx(expected_rate_arcsec_s, rel=0.1)
+
+
+def test_measure_mount_lag_measures_both_axes_simultaneously():
+    mock = MockMount(MockConfig(rv_mode="per_axis", start_dec_deg=0.0), seed=1)
+    mount = Mount(mock)
+    try:
+        ra_result, dec_result = measure_mount_lag(mount, rate_x=1000.0, duration_s=0.3, decel_duration_s=0.1)
+    finally:
+        mount.stop()
+        mount.close()
+    assert ra_result.axis == "ra"
+    assert dec_result.axis == "dec"
+    assert ra_result.steady_rate_arcsec_s != 0.0  # RA moved (jogs east)
+    assert dec_result.steady_rate_arcsec_s != 0.0  # DEC moved too, at the same time
+
+
+def test_measure_mount_lag_dec_picks_direction_away_from_the_pole():
+    # Manual jog rates aren't altitude-limit-checked like a GOTO is, and a
+    # few seconds at a high rate_x covers several real degrees -- moving
+    # toward whichever pole is already close risks a hard mechanical stop
+    # at speed. Starting near +90 must jog south (negative dec rate);
+    # starting near -90 must jog north (positive). RA's own direction
+    # (always east) is unaffected by dec's starting position.
+    for start_dec, expect_negative in [(80.0, True), (-80.0, False)]:
+        mock = MockMount(MockConfig(rv_mode="per_axis", start_dec_deg=start_dec), seed=1)
+        mount = Mount(mock)
+        try:
+            _ra_result, dec_result = measure_mount_lag(mount, rate_x=1000.0, duration_s=0.3, decel_duration_s=0.1)
+        finally:
+            mount.stop()
+            mount.close()
+        if expect_negative:
+            assert dec_result.steady_rate_arcsec_s < 0
+        else:
+            assert dec_result.steady_rate_arcsec_s > 0
 
 
 def test_measure_mount_lag_stops_the_manual_jog_when_done():
@@ -242,11 +310,80 @@ def test_measure_mount_lag_aborts_early_when_signalled():
     abort = threading.Event()
     abort.set()  # already set -- should bail after at most one sample
     try:
-        result = measure_mount_lag(mount, rate_x=100.0, duration_s=5.0, abort=abort)
+        ra_result, dec_result = measure_mount_lag(mount, rate_x=100.0, duration_s=5.0, abort=abort)
     finally:
         mount.stop()
         mount.close()
-    assert result.samples <= 2
+    assert ra_result.samples <= 2
+    assert dec_result.samples <= 2
+
+
+class _FlakyMount:
+    """Minimal Mount-shaped stand-in whose get_radec raises ProtocolError
+    on a chosen call, to exercise measure_mount_lag's mid-slew failure
+    handling without needing a real flaky serial link. Records stop()."""
+
+    def __init__(self, raise_on_call: int | None = None):
+        self._raise_on_call = raise_on_call
+        self._calls = 0
+        self.stop_calls: list[str | None] = []
+        self.moving = False
+
+    def set_rate(self, rate_x):
+        pass
+
+    def set_rate_ra(self, rate_x):
+        pass
+
+    def set_rate_dec(self, rate_x):
+        pass
+
+    def move(self, direction):
+        self.moving = True
+
+    def get_radec(self):
+        self._calls += 1
+        if self._raise_on_call is not None and self._calls == self._raise_on_call:
+            raise ProtocolError("simulated malformed :GMEQ# reply mid-slew")
+        return RaDec(ra_hours=3.0 + self._calls * 1e-4, dec_deg=45.0)
+
+    def stop(self, direction=None):
+        self.moving = False
+        self.stop_calls.append(direction)
+
+
+def test_measure_mount_lag_always_stops_the_axis_even_if_a_poll_raises():
+    # Regression (safety): get_radec used to be polled unprotected WHILE the
+    # RA axis was slewing, and a single ProtocolError propagated out,
+    # SKIPPING mount.stop('e') -- leaving a real mount slewing at rate_x
+    # indefinitely. Now a transient bad reply is skipped and, whatever
+    # happens, the finally always stops the axis.
+    mount = _FlakyMount(raise_on_call=2)  # 2nd poll glitches mid-measurement
+    ra_result, dec_result = measure_mount_lag(mount, rate_x=100.0, duration_s=0.2, poll_interval_s=0.01)
+    assert mount.moving is False           # axis was stopped
+    assert "e" in mount.stop_calls          # via the RA-axis stop, not just a blanket stop
+    assert isinstance(ra_result, MountLagResult)  # returned normally, did not propagate the ProtocolError
+    assert isinstance(dec_result, MountLagResult)
+
+
+class _RecordingSafety:
+    def __init__(self):
+        self.calls: list[bool] = []
+
+    def notify_command(self, movement_active: bool):
+        self.calls.append(movement_active)
+
+
+def test_measure_mount_lag_feeds_the_safety_watchdog_and_releases_it():
+    # Regression (safety): this routine never fed the SafetyGuard a
+    # movement_active heartbeat, so the watchdog's backup :Q# was disabled
+    # for exactly the routine that slews while polling. Now it heartbeats
+    # during the slew and releases (movement_active=False) on exit.
+    mount = _FlakyMount()
+    safety = _RecordingSafety()
+    measure_mount_lag(mount, rate_x=100.0, duration_s=0.15, poll_interval_s=0.01, safety=safety)
+    assert True in safety.calls           # heartbeated during the slew
+    assert safety.calls[-1] is False      # released the watchdog last
 
 
 def _make_constant_rate_trajectory(rate_x_sidereal: float, duration_s: float, start_ra: float, start_dec: float) -> Trajectory:
@@ -293,14 +430,58 @@ def test_tracking_loop_follows_constant_rate_trajectory():
     ra_error_arcsec = abs(actual.ra_hours * 15.0 - expected_ra) * 3600
     dec_error_arcsec = abs(actual.dec_deg - expected_dec) * 3600
 
-    # The mock's first-order velocity ramp (tau=0.15s, see mock_mount.py)
-    # never fully closes a step from 0 to the trajectory's rate: a 1st-order
-    # lag system tracking a velocity step settles at a fixed catch-up lag of
-    # rate * tau =~ 50x * SIDEREAL_DEG_PER_S * 0.15s =~ 113 arcsec. This test
-    # only needs to rule out gross regressions (wrong axis, exceptions,
-    # runaway divergence), not match that analytic figure exactly.
+    # The mock's constant-acceleration ramp (max_accel_deg_s2, see
+    # mock_mount.py) never fully closes a step from 0 to the trajectory's
+    # rate instantly -- there's a real, if small, catch-up lag while it
+    # ramps up. This test only needs to rule out gross regressions (wrong
+    # axis, exceptions, runaway divergence), not match an analytic figure.
     assert ra_error_arcsec < 300.0
     assert dec_error_arcsec < 300.0
+
+
+def test_tracking_loop_stops_axis_instead_of_creeping_at_a_near_zero_feedforward_rate():
+    # Regression: a feedforward rate that's (or rounds to) 0.00x used to
+    # still go through set_rate(0)+move(dir) every tick -- see
+    # MIN_COMMANDABLE_RATE_X's own comment in am5/tracker.py for why a real
+    # mount might not actually hold still at that command. Now it must call
+    # stop(dir) instead, with set_rate/move never invoked for that axis.
+    start_ra, start_dec = 10.0, 45.0
+    duration_s = 0.4
+    trajectory = _make_constant_rate_trajectory(0.0, duration_s + 1.0, start_ra, start_dec)
+    mock = MockMount(MockConfig(rv_mode="per_axis", tracking_adds=True, start_ra_deg=start_ra, start_dec_deg=start_dec))
+    mount = Mount(mock)
+    safety = SafetyGuard(mount, watchdog_timeout=5.0)
+
+    calls: list[tuple] = []
+    orig_stop = mount.stop
+
+    def recorder(name, orig):
+        def wrapper(*args, **kwargs):
+            calls.append((name, args))
+            return orig(*args, **kwargs)
+        return wrapper
+
+    mount.set_rate = recorder("set_rate", mount.set_rate)
+    mount.move = recorder("move", mount.move)
+    mount.stop = recorder("stop", orig_stop)
+
+    fh = io.StringIO()
+    writer = csv.DictWriter(fh, fieldnames=TRACKING_CSV_FIELDS)
+    writer.writeheader()
+    try:
+        run_tracking_loop(
+            mount, safety, trajectory, AxisSigns(ra=1.0, dec=1.0), LiveOffsets(), writer,
+            duration_s=duration_s, config=TrackingConfig(loop_hz=20.0, error_log_hz=20.0),
+        )
+    finally:
+        orig_stop()  # unwrapped -- cleanup, not part of what's under test
+        safety.shutdown()
+        mount.close()
+
+    assert not any(name == "move" for name, _args in calls)  # never re-issued a move for a zero rate
+    assert not any(name == "set_rate" for name, _args in calls)  # never re-issued set_rate either
+    stop_directions = {args[0] for name, args in calls if name == "stop" and args}
+    assert stop_directions == {"e", "n"}  # both axes stopped via their own direction, every tick
 
 
 def test_tracking_loop_respects_axis_sign_flip():
@@ -487,6 +668,69 @@ def test_tracking_loop_mount_lag_s_shifts_target_query_forward():
     expected_shift_arcsec = rate_deg_s * mount_lag_s * 3600
     actual_shift_arcsec = (ticks_shifted[-1]["target_ra_deg"] - ticks_unshifted[-1]["target_ra_deg"]) * 3600
     assert actual_shift_arcsec == pytest.approx(expected_shift_arcsec, abs=20.0)
+
+
+def test_tracking_loop_max_accel_deg_s2_only_leads_the_first_tick_on_a_constant_rate_pass():
+    # With max_accel_deg_s2 set, the lead time is capped at how long THIS
+    # tick's rate CHANGE would take to physically ramp, not a flat
+    # mount_lag_s applied everywhere (see TrackingConfig.max_accel_deg_s2's
+    # docstring). A constant-rate trajectory is the cleanest way to show
+    # this: only the very first tick has a real rate change (0 -> rate_x),
+    # so only it should get (close to) the full mount_lag_s lead; every
+    # later tick's commanded rate barely changes tick-to-tick, so its
+    # needed lead collapses toward 0 -- unlike the flat model (previous
+    # test), which shifts EVERY tick's target by the same amount.
+    start_ra, start_dec = 10.0, 45.0
+    rate_x = 50.0
+    duration_s = 1.5
+    mount_lag_s = 0.3
+    # Small enough that even a full rate_x jump needs close to the full
+    # mount_lag_s to ramp (needed_lag_s = delta_deg_s / max_accel_deg_s2),
+    # so tick 1's lead is capped at mount_lag_s exactly like the flat model.
+    max_accel_deg_s2 = (rate_x * SIDEREAL_DEG_PER_S) / mount_lag_s
+
+    def run(lag_s, max_accel):
+        trajectory = _make_constant_rate_trajectory(rate_x, duration_s + 1.0, start_ra, start_dec)
+        mock = MockMount(MockConfig(rv_mode="per_axis", tracking_adds=True, start_ra_deg=start_ra, start_dec_deg=start_dec))
+        mount = Mount(mock)
+        safety = SafetyGuard(mount, watchdog_timeout=5.0)
+        fh = io.StringIO()
+        writer = csv.DictWriter(fh, fieldnames=TRACKING_CSV_FIELDS)
+        writer.writeheader()
+        ticks = []
+        try:
+            run_tracking_loop(
+                mount, safety, trajectory, AxisSigns(ra=1.0, dec=1.0), LiveOffsets(), writer,
+                duration_s=duration_s,
+                config=TrackingConfig(loop_hz=20.0, error_log_hz=20.0, mount_lag_s=lag_s, max_accel_deg_s2=max_accel),
+                on_tick=ticks.append,
+            )
+        finally:
+            mount.stop()
+            safety.shutdown()
+            mount.close()
+        return ticks
+
+    ticks_zero = run(0.0, None)  # baseline: no lead at all
+    ticks_flat = run(mount_lag_s, None)  # old model: full lead on every tick
+    ticks_accel_aware = run(mount_lag_s, max_accel_deg_s2)  # new model
+
+    rate_deg_s = rate_x * SIDEREAL_DEG_PER_S
+    full_shift_arcsec = rate_deg_s * mount_lag_s * 3600
+
+    # Tick 1: a real 0->rate_x jump needs the full lead either way.
+    first_shift_flat = (ticks_flat[0]["target_ra_deg"] - ticks_zero[0]["target_ra_deg"]) * 3600
+    first_shift_accel_aware = (ticks_accel_aware[0]["target_ra_deg"] - ticks_zero[0]["target_ra_deg"]) * 3600
+    assert first_shift_flat == pytest.approx(full_shift_arcsec, abs=20.0)
+    assert first_shift_accel_aware == pytest.approx(full_shift_arcsec, abs=20.0)
+
+    # Last tick: rate barely changed since the previous tick (constant-rate
+    # trajectory), so the accel-aware model should have collapsed its lead
+    # toward 0 -- unlike the flat model, still at the full lead here too.
+    last_shift_flat = (ticks_flat[-1]["target_ra_deg"] - ticks_zero[-1]["target_ra_deg"]) * 3600
+    last_shift_accel_aware = (ticks_accel_aware[-1]["target_ra_deg"] - ticks_zero[-1]["target_ra_deg"]) * 3600
+    assert last_shift_flat == pytest.approx(full_shift_arcsec, abs=20.0)
+    assert abs(last_shift_accel_aware) < 0.3 * abs(full_shift_arcsec)
 
 
 def test_tracking_loop_feedback_reduces_along_track_error_vs_feedforward_only():

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import pytest
 
 from am5.angles import gmst_deg
+from am5.constants import SIDEREAL_DEG_PER_S
 from am5.mock_mount import MockConfig, MockMount
 from am5.mount import Mount
 from am5.protocol import parse_error
@@ -283,3 +284,94 @@ def test_meridian_stop_only_freezes_ra_not_dec():
         assert m.get_radec().dec_deg > 0.05
     finally:
         m.close()
+
+
+def test_set_rate_ra_and_dec_are_independent(mount):
+    # Regression: confirmed live on real AM5 hardware (docs/AM5_UART_
+    # protocol_1.8.8.md, not in the official v1.7 PDF) that :Rvr#/:Rvd#
+    # store RA/DEC manual speed independently -- changing one must never
+    # affect the other's already-latched motion, unlike plain :Rv# (which
+    # writes both axes' stored speed at once).
+    mount.set_rate_ra(150.0)
+    mount.set_rate_dec(60.0)
+    mount.move("e")
+    mount.move("n")
+    time.sleep(0.2)
+    pos0 = mount.get_radec()
+
+    mount.set_rate_ra(250.0)  # must not touch DEC's stored 60.0
+    time.sleep(0.2)
+    pos1 = mount.get_radec()
+    ra_speed_arcsec_s = abs(pos1.ra_hours - pos0.ra_hours) * 15 * 3600 / 0.2
+    dec_speed_arcsec_s = abs(pos1.dec_deg - pos0.dec_deg) * 3600 / 0.2
+    sidereal_arcsec_s = SIDEREAL_DEG_PER_S * 3600.0
+    # DEC should still be moving at ~60x, RA not yet at 250x (needs a
+    # fresh :Me# to re-latch, same per-axis-latch model as plain :Rv#).
+    assert dec_speed_arcsec_s == pytest.approx(60.0 * sidereal_arcsec_s, rel=0.3)
+    assert ra_speed_arcsec_s < 200.0 * sidereal_arcsec_s
+
+    mount.move("e")  # re-latch RA onto the new 250x
+    time.sleep(0.2)
+    pos2 = mount.get_radec()
+    ra_speed_arcsec_s = abs(pos2.ra_hours - pos1.ra_hours) * 15 * 3600 / 0.2
+    assert ra_speed_arcsec_s == pytest.approx(250.0 * sidereal_arcsec_s, rel=0.3)
+
+
+def test_health_diagnostic_reads(mount):
+    assert mount.get_axis_stall_load("ra") == 0
+    assert mount.get_axis_stall_load("dec") == 0
+    assert mount.get_temperature_c() == pytest.approx(25.0)
+    assert mount.get_max_rate_x() == pytest.approx(1440.0)
+
+    # Motor current rises while an axis is actively driven vs. resting --
+    # confirmed live on real AM5 hardware (15 -> 28 on RA while jogging).
+    assert mount.get_axis_current("ra") == 15
+    mount.set_rate_ra(100.0)
+    mount.move("e")
+    assert mount.get_axis_current("ra") == 28
+    mount.stop("e")
+
+
+def test_alignment_mode_accumulates_sync_points(mount):
+    assert mount.get_alignment_mode() is False
+    assert mount.get_alignment_point_count() == 0
+
+    reply = mount.set_alignment_mode(True)
+    assert reply.strip().rstrip("#") == "1"
+    assert mount.get_alignment_mode() is True
+
+    mount.set_target_ra(1.0)
+    mount.set_target_dec(45.0)
+    mount.sync_to_target()
+    mount.set_target_ra(2.0)
+    mount.set_target_dec(50.0)
+    mount.sync_to_target()
+    assert mount.get_alignment_point_count() == 2
+
+
+def test_alignment_mode_off_clears_the_point_count(mount):
+    mount.set_alignment_mode(True)
+    mount.set_target_ra(1.0)
+    mount.set_target_dec(45.0)
+    mount.sync_to_target()
+    assert mount.get_alignment_point_count() == 1
+
+    mount.set_alignment_mode(False)
+    assert mount.get_alignment_point_count() == 0
+    # Re-enabling starts a fresh table, not a resumed one.
+    mount.set_alignment_mode(True)
+    assert mount.get_alignment_point_count() == 0
+
+
+def test_alignment_mode_sync_does_not_move_reported_position(mount):
+    # Documented as an unconfirmed guess (see _MountState.alignment_mode's
+    # own comment) -- locking in the mock's own conservative choice so a
+    # future change to it is a deliberate decision, not silent drift.
+    before = mount.get_radec()
+    mount.set_alignment_mode(True)
+    mount.set_target_ra(before.ra_hours + 5.0)
+    mount.set_target_dec(before.dec_deg + 10.0)
+    mount.sync_to_target()
+    after = mount.get_radec()
+    assert after.ra_hours == pytest.approx(before.ra_hours, abs=1e-6)
+    assert after.dec_deg == pytest.approx(before.dec_deg, abs=1e-6)

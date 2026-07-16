@@ -11,6 +11,35 @@ from am5.optics import (
 )
 
 
+def test_optical_train_rejects_zero_focal_length():
+    # Regression: a fat-fingered "0" focal length parses fine as a float
+    # (no ValueError from the GUI's own field parsing), so callers that
+    # only guarded that parsing went on to divide by an effective focal
+    # length of zero inside plate_scale_arcsec_per_px -- an uncaught
+    # ZeroDivisionError, confirmed to leave ConnectionPanel's connect
+    # button stuck disabled at "Connecting..." with no error and no way to
+    # retry short of restarting the app. Raising ValueError here instead
+    # (same exception type every call site already catches around its own
+    # float(...) parsing) turns the crash into an ordinary "invalid input".
+    with pytest.raises(ValueError):
+        OpticalTrain(aperture_mm=200, focal_length_mm=0.0, barlow_multiplier=1.0, pixel_size_um=2.9)
+
+
+def test_optical_train_rejects_zero_barlow():
+    with pytest.raises(ValueError):
+        OpticalTrain(aperture_mm=200, focal_length_mm=1000.0, barlow_multiplier=0.0, pixel_size_um=2.9)
+
+
+def test_optical_train_rejects_zero_pixel_size():
+    with pytest.raises(ValueError):
+        OpticalTrain(aperture_mm=200, focal_length_mm=1000.0, barlow_multiplier=1.0, pixel_size_um=0.0)
+
+
+def test_optical_train_rejects_negative_focal_length():
+    with pytest.raises(ValueError):
+        OpticalTrain(aperture_mm=200, focal_length_mm=-1000.0, barlow_multiplier=1.0, pixel_size_um=2.9)
+
+
 def test_suggest_gain_matches_real_verified_capture():
     # 200mm aperture, 1000mm FL, no barlow, 1ms exposure, mag -3.3 -> the
     # operator empirically used gain 220 (0.1dB units) for this real ISS

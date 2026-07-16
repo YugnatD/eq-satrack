@@ -35,6 +35,16 @@ class Mount:
     def set_rate(self, rate_x_sidereal: float) -> None:
         self._send(protocol.build_rv(rate_x_sidereal), expect_response=False)
 
+    def set_rate_ra(self, rate_x_sidereal: float) -> None:
+        """:Rvr# — RA-only, see protocol.build_rv_ra's docstring. Use this
+        (and set_rate_dec) instead of set_rate() when RA and DEC are being
+        commanded simultaneously (run_tracking_loop, measure_mount_lag)."""
+        self._send(protocol.build_rv_ra(rate_x_sidereal), expect_response=False)
+
+    def set_rate_dec(self, rate_x_sidereal: float) -> None:
+        """:Rvd# — DEC-only, see set_rate_ra's docstring."""
+        self._send(protocol.build_rv_dec(rate_x_sidereal), expect_response=False)
+
     def move(self, direction: str) -> None:
         self._send(protocol.build_move(direction), expect_response=False)
 
@@ -63,13 +73,20 @@ class Mount:
         """:hP# — ZWO's native park. Per the official protocol doc, this
         only works in equatorial mode — callers should check
         get_status().is_equatorial first (Mount itself does no client-side
-        validation, same as everywhere else in this class). Whether this
-        leaves the mount in a real locked hardware state that needs an
-        explicit wire-level unpark command is UNKNOWN — INDI's own driver
-        avoids this path entirely (see park()'s docstring), so there is no
-        reference implementation to confirm either way. Returns the raw
-        '1#'/'0#' reply."""
+        validation, same as everywhere else in this class). Confirmed on
+        real hardware that this DOES leave the mount in a real, persisted
+        locked state -- see unpark_native()'s docstring for the fix.
+        Returns the raw '1#'/'0#' reply."""
         return self._send(protocol.build_park(), expect_response=True)
+
+    def unpark_native(self) -> str:
+        """:Spu# — clears the persisted parked state :hP# leaves behind.
+        Confirmed necessary and sufficient on real hardware (see
+        protocol.build_unpark_native's docstring for the full story): call
+        this after park_native(), before expecting park()/move/tracking
+        commands to work again. Not needed after the plain park() (:hC#)
+        path. Returns the raw '1#'/'0#' reply."""
+        return self._send(protocol.build_unpark_native(), expect_response=True)
 
     def emergency_stop(self) -> None:
         """Best-effort :Q# — never raises, safe to call from a signal handler or `finally`."""
@@ -90,6 +107,30 @@ class Mount:
 
     def get_status_raw(self) -> str:
         return self._send(b":GU#", expect_response=True)
+
+    def set_alignment_mode(self, enabled: bool) -> str:
+        """:SSM# — see protocol.build_set_alignment_mode's docstring,
+        including the destructive "any other value clears the whole
+        table" behavior and the "never live-tested by anyone" caveat.
+        Reply framing (hash-terminated vs. bare, like set_tracking's :Te#/
+        :Td#) is UNCONFIRMED -- assumed hash-terminated here since that's
+        the framing for most of this protocol; if a real test finds it's
+        actually bare, this needs to switch to _send_single_char the same
+        way set_tracking did."""
+        return self._send(protocol.build_set_alignment_mode(enabled), expect_response=True)
+
+    def get_alignment_mode(self) -> bool:
+        """:GSM# — see set_alignment_mode's docstring for the framing caveat."""
+        raw = self._send(protocol.build_get_alignment_mode(), expect_response=True).strip().rstrip("#")
+        return raw == "1"
+
+    def get_alignment_point_count(self) -> int:
+        """:NSc# — active-record count in the alignment/model table."""
+        raw = self._send(protocol.build_get_alignment_point_count(), expect_response=True).strip().rstrip("#")
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise ProtocolError(f"malformed alignment point count reply {raw!r}") from exc
 
     def get_status(self) -> MountStatus:
         return protocol.parse_gu_status(self.get_status_raw())
@@ -131,6 +172,55 @@ class Mount:
         read-only, for the operator to check before committing to a
         tracking run."""
         return self._send(b":Gm#", expect_response=True).strip().rstrip("#")
+
+    def get_axis_stall_load(self, axis: str) -> int:
+        """:GSgr#/:GSgd# -- raw TMC2240 StallGuard2 load (0-1023, higher =
+        more mechanical resistance). Firmware extension (docs/AM5_UART_
+        protocol_1.8.8.md, not in the official v1.7 PDF). Read-only
+        diagnostic, not wired into any safety decision -- confirmed live it
+        reads 0 both at rest and under light, unloaded motion (no tube on
+        this project's test sessions), so its value as an early stall/
+        binding warning under real mechanical load is unverified."""
+        cmd = b":GSgr#" if axis == "ra" else b":GSgd#"
+        raw = self._send(cmd, expect_response=True).strip().rstrip("#")
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise ProtocolError(f"malformed stall-load reply {raw!r}") from exc
+
+    def get_temperature_c(self) -> float:
+        """:GTS# -- ESP32-S3 internal temperature sensor, degrees Celsius.
+        Firmware extension, not in the official v1.7 PDF."""
+        raw = self._send(b":GTS#", expect_response=True).strip().rstrip("#")
+        try:
+            return float(raw)
+        except ValueError as exc:
+            raise ProtocolError(f"malformed temperature reply {raw!r}") from exc
+
+    def get_axis_current(self, axis: str) -> int:
+        """:GMCR#/:GMCD# -- TMC2240 DRV_STATUS.CS_ACTUAL, the current-
+        scaling value actually in use (0-31). Firmware extension, not in
+        the official v1.7 PDF. Confirmed live that it rises during active
+        motion (15 -> 28 on RA while jogging) vs. holding current at rest
+        -- a real, live signal, unlike get_axis_stall_load above."""
+        cmd = b":GMCR#" if axis == "ra" else b":GMCD#"
+        raw = self._send(cmd, expect_response=True).strip().rstrip("#")
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise ProtocolError(f"malformed motor-current reply {raw!r}") from exc
+
+    def get_max_rate_x(self) -> float:
+        """:GRl# -- the mount's own configured maximum manual rate (x
+        sidereal). Firmware extension, not in the official v1.7 PDF.
+        Confirmed live at 1440 on this project's own AM5, matching the
+        hard ceiling build_rv enforces and sitting just above
+        TrackingConfig's own max_rate_x=1400 safety margin."""
+        raw = self._send(b":GRl#", expect_response=True).strip().rstrip("#")
+        try:
+            return float(raw)
+        except ValueError as exc:
+            raise ProtocolError(f"malformed max-rate reply {raw!r}") from exc
 
     def set_meridian_behavior(self, track_past_meridian: bool, limit_deg: float, flip: bool = False) -> None:
         """:ST<nnsnn># -- see protocol.build_set_meridian_behavior's

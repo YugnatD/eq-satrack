@@ -162,70 +162,219 @@ class MountLagResult:
     lag_s: float  # time from the :Rv#+:Me# command to ~settle_fraction of steady-state rate
     steady_rate_arcsec_s: float  # measured steady-state rate, to sanity-check against the commanded rate_x
     samples: int
+    decel_lag_s: float = 0.0  # time from the stop command to velocity dropping below (1-settle_fraction)*steady_rate
+    stop_command_t: float = 0.0  # offset (seconds since the move command) at which stop() was issued -- for plotting
+    velocity_samples: tuple[tuple[float, float], ...] = ()  # (t_since_command, velocity_arcsec_s), accel then decel
+    axis: str = "ra"  # which axis was actually stepped -- "ra" or "dec"
 
 
-def measure_mount_lag(
-    mount: Mount, rate_x: float = 100.0, duration_s: float = 1.5, poll_interval_s: float = 0.02,
-    settle_fraction: float = 0.9, abort: threading.Event | None = None,
+def _lag_result_from_samples(
+    samples: list[tuple[float, float]], stop_command_t: float, decel_duration_s: float,
+    settle_fraction: float, axis: str,
 ) -> MountLagResult:
-    """Empirically measures how long the mount takes to reach commanded
-    angular rate after a step :Rv#+:Me# command -- a real motor doesn't
-    reach the commanded rate instantaneously, and that ramp is a plausible
-    contributor to the small, stable along-track lag seen on a real
-    tracking run (confirmed present, ~20 arcsec at 20x/10x-sidereal rates,
-    on real AM3 hardware -- see run_tracking_loop's module docstring;
-    whether it's this ramp, serial round-trip latency, or a clock offset
-    wasn't distinguished by that one test).
-
-    Steps the RA axis (arbitrary choice -- DEC is mechanically identical
-    on this mount) at rate_x for duration_s, polling :GMEQ# as fast as the
-    real round trip allows (measured ~5ms by characterize.py, so
-    poll_interval_s's real cadence is round-trip-bound, not this value),
-    then finds when velocity first reaches settle_fraction of its own
-    steady-state average (the last third of samples). This is a rise-time
-    measurement, not a fitted transfer-function model -- it's meant to
-    feed a single feedforward time-shift (TrackingConfig.mount_lag_s), not
-    drive a real control model.
-
-    Real-hardware behavior as of this writing: unvalidated. Written and
-    tested against MockMount only -- run it for real and sanity-check
-    steady_rate_arcsec_s against rate_x * SIDEREAL_ARCSEC_PER_S before
-    trusting lag_s for anything.
-    """
-    samples: list[tuple[float, float]] = []  # (t_since_command, ra_hours)
-    mount.set_rate(rate_x)
-    mount.move("e")
-    command_t = time.monotonic()
-    while time.monotonic() - command_t < duration_s:
-        if abort is not None and abort.is_set():
-            break
-        radec = mount.get_radec()
-        samples.append((time.monotonic() - command_t, radec.ra_hours))
-        time.sleep(poll_interval_s)
-    mount.stop("e")
-
+    """Shared rise-time/fall-time analysis for one axis's (t_since_command,
+    position_deg) samples -- see measure_mount_lag's docstring for the
+    method. Factored out so both axes (measured simultaneously) get
+    identical treatment."""
     if len(samples) < 4:
-        return MountLagResult(lag_s=0.0, steady_rate_arcsec_s=0.0, samples=len(samples))
+        return MountLagResult(lag_s=0.0, steady_rate_arcsec_s=0.0, samples=len(samples), axis=axis)
 
     velocities_arcsec_s = [
-        (t_b, (ra_b - ra_a) * 15.0 * 3600.0 / (t_b - t_a))
-        for (t_a, ra_a), (t_b, ra_b) in zip(samples, samples[1:])
+        (t_b, (p_b - p_a) * 3600.0 / (t_b - t_a))
+        for (t_a, p_a), (t_b, p_b) in zip(samples, samples[1:])
         if t_b > t_a
     ]
     if not velocities_arcsec_s:
-        return MountLagResult(lag_s=0.0, steady_rate_arcsec_s=0.0, samples=len(samples))
+        return MountLagResult(lag_s=0.0, steady_rate_arcsec_s=0.0, samples=len(samples), axis=axis)
 
-    tail = velocities_arcsec_s[-max(1, len(velocities_arcsec_s) // 3):]
+    accel_velocities = [(t, v) for t, v in velocities_arcsec_s if t <= stop_command_t]
+    decel_velocities = [(t, v) for t, v in velocities_arcsec_s if t > stop_command_t]
+    if not accel_velocities:
+        accel_velocities = velocities_arcsec_s
+
+    tail = accel_velocities[-max(1, len(accel_velocities) // 3):]
     steady_rate = sum(v for _, v in tail) / len(tail)
 
     threshold = abs(steady_rate) * settle_fraction
-    lag_s = duration_s  # fallback: never clearly reached the threshold within the test window
-    for t, v in velocities_arcsec_s:
+    lag_s = stop_command_t  # fallback: never clearly reached the threshold before the axis stopped
+    for t, v in accel_velocities:
         if abs(v) >= threshold:
             lag_s = t
             break
 
-    return MountLagResult(lag_s=lag_s, steady_rate_arcsec_s=steady_rate, samples=len(samples))
+    decel_threshold = abs(steady_rate) * (1.0 - settle_fraction)
+    decel_lag_s = decel_duration_s  # fallback: never clearly settled within the decel window
+    for t, v in decel_velocities:
+        if abs(v) <= decel_threshold:
+            decel_lag_s = t - stop_command_t
+            break
+
+    return MountLagResult(
+        lag_s=lag_s, steady_rate_arcsec_s=steady_rate, samples=len(samples),
+        decel_lag_s=decel_lag_s, stop_command_t=stop_command_t,
+        velocity_samples=tuple(velocities_arcsec_s), axis=axis,
+    )
+
+
+def measure_mount_lag(
+    mount: Mount, rate_x: float = 1440.0, duration_s: float = 2.5, poll_interval_s: float = 0.02,
+    settle_fraction: float = 0.9, decel_duration_s: float | None = None,
+    abort: threading.Event | None = None, safety: SafetyGuard | None = None,
+) -> tuple[MountLagResult, MountLagResult]:
+    """Empirically measures how long the mount takes to reach commanded
+    angular rate after a step :Rv#+:Me#/:Mn#/:Ms# command -- a real motor
+    doesn't reach the commanded rate instantaneously, and that ramp is a
+    plausible contributor to the small, stable along-track lag seen on a
+    real tracking run (confirmed present, ~20 arcsec at 20x/10x-sidereal
+    rates, on real AM3 hardware -- see run_tracking_loop's module
+    docstring; whether it's this ramp, serial round-trip latency, or a
+    clock offset wasn't distinguished by that one test).
+
+    Steps RA and DEC SIMULTANEOUSLY, returning (ra_result, dec_result).
+    This costs nothing extra over stepping one axis: a single :GMEQ# poll
+    already reports both ra_hours and dec_deg together, and "per_axis"
+    :Rv latching (confirmed on real hardware, see test (a) in
+    characterize.py) means each axis's commanded rate is independent of
+    when the other axis's :Me#/:Mn# was sent -- so interleaving the two
+    move commands measures the same real ramp as moving them one at a
+    time (confirmed: DEC alone measured 1.33s/1.34s accel/decel and a
+    4.56 deg/s^2 implied acceleration on real AM5 hardware, matching RA's
+    1.32s/1.33s and ~4.5-4.6 deg/s^2 within measurement noise), while also
+    matching how run_tracking_loop actually drives both axes together
+    rather than one at a time.
+
+    DEC jogs north or south, chosen dynamically from the CURRENT dec
+    reading -- away from whichever pole is closer. That dynamic pick
+    matters because manual jog rates aren't altitude-limit-checked the way
+    a GOTO is (characterize.py test h's "e2" error is :MS#-only), and a few
+    seconds at rate_x=1440 (~6 deg/s) covers several degrees -- a real risk
+    of driving into a hard mechanical stop near the pole at speed if the
+    direction were fixed.
+
+    Polls :GMEQ# as fast as the real round trip allows (measured ~5ms by
+    characterize.py, so poll_interval_s's real cadence is round-trip-bound,
+    not this value), then finds when each axis's velocity first reaches
+    settle_fraction of its own steady-state average (the last third of
+    samples). This is a rise-time measurement, not a fitted transfer-
+    function model -- it's meant to feed a single feedforward time-shift
+    (TrackingConfig.mount_lag_s), not drive a real control model.
+
+    Safety (added after a real audit finding): this is the only motion-
+    commanding routine that polls :GMEQ# WHILE the axes are slewing, so
+    it must protect against a mid-poll failure leaving the mount running.
+    Two guards: (1) the whole move/poll is in a try/finally that ALWAYS
+    stops both axes, even if the loop raises for any reason -- before this,
+    a single ProtocolError from get_radec() propagated out and skipped the
+    stop, leaving the mount slewing at rate_x indefinitely; (2) a transient
+    ProtocolError on one poll is caught and the sample skipped rather than
+    aborting the whole measurement (same resilience as run_tracking_loop's
+    own poll). `safety`, if given, is fed a movement_active heartbeat each
+    poll and reset to inactive on exit, so the SafetyGuard watchdog
+    actually covers this slew -- run_tracking_loop and jog_goto both do
+    this; this routine silently didn't, so the watchdog's backup :Q# was
+    disabled for exactly the routine that most needed it.
+
+    Real-hardware behavior, confirmed on real AM5 hardware (tube removed):
+    at rate_x=1000, RA's lag_s~=0.92s and steady_rate_arcsec_s matched
+    rate_x * SIDEREAL_ARCSEC_PER_S within 0.3% -- both the rise-time
+    measurement and the rate sanity-check hold up against real motion. The
+    reverse-engineered protocol notes (docs/AM5_UART_protocol_1.8.8.md,
+    selector 5) independently confirm *why* it's not instantaneous: the
+    firmware ramps its internal rate scalar by one integer per control
+    update toward the requested value, both accelerating and decelerating
+    -- so the deceleration phase below is expected to be a comparably
+    gradual ramp, not a step, exactly like :Q#'s "pending stop" flag
+    (selector 8) implies.
+
+    After the accel phase, also commands a stop on both axes and keeps
+    polling for `decel_duration_s` (defaults to `duration_s`, i.e. the same
+    window) to capture the ramp-down the same way -- gives `decel_lag_s`
+    (time from the stop command to velocity dropping back below
+    (1-settle_fraction) of steady_rate) and lets a caller plot the full
+    accel+decel speed curve from `velocity_samples` (e.g. the GUI's
+    Diagnostics panel).
+    """
+    decel_duration_s = duration_s if decel_duration_s is None else decel_duration_s
+    baseline_dec = mount.get_radec().dec_deg
+    dec_dir = "s" if baseline_dec > 0 else "n"
+
+    ra_samples: list[tuple[float, float]] = []  # (t_since_command, ra_deg), accel then decel
+    dec_samples: list[tuple[float, float]] = []  # (t_since_command, dec_deg), accel then decel
+    stop_command_t = duration_s  # fallback if aborted before the accel phase completes
+    # Back on the shared set_rate() (:Rv#), not set_rate_ra/set_rate_dec
+    # (:Rvr#/:Rvd#) -- :Rvr#/:Rvd# are undocumented in the official v1.7
+    # PDF and, per a real-hardware re-test, their OWN readback (:GFR3#/
+    # :GFD3#) showed real anomalies (RA consistently reading 1.00 below
+    # what was just commanded; DEC's readback appeared frozen across a
+    # later cross-clobber check) even though the actual commanded MOTION
+    # matched correctly in every trial. Given that uncertainty (and that
+    # ZWO's own forum reportedly says this isn't officially finished),
+    # reverted to the thoroughly-proven shared approach here. Mount.
+    # set_rate_ra/set_rate_dec and protocol.build_rv_ra/build_rv_dec are
+    # kept fully implemented and tested (see test_mount.py's
+    # test_set_rate_ra_and_dec_are_independent) -- swap the two lines
+    # below back to them if :Rvr#/:Rvd# get more confidence later.
+    mount.set_rate(rate_x)
+    try:
+        mount.move("e")
+        mount.set_rate(rate_x)
+        mount.move(dec_dir)
+        command_t = time.monotonic()
+        while time.monotonic() - command_t < duration_s:
+            if abort is not None and abort.is_set():
+                break
+            if safety is not None:
+                safety.notify_command(movement_active=True)  # heartbeat -- keeps the watchdog covering this slew
+            try:
+                radec = mount.get_radec()
+            except ProtocolError:
+                # A transient bad reply must not abort the measurement
+                # (which would skip the stop in the finally is moot now,
+                # but would still throw away the whole run) -- skip this
+                # one sample and keep going.
+                time.sleep(poll_interval_s)
+                continue
+            t = time.monotonic() - command_t
+            ra_samples.append((t, radec.ra_hours * 15.0))
+            dec_samples.append((t, radec.dec_deg))
+            time.sleep(poll_interval_s)
+
+        stop_command_t = time.monotonic() - command_t
+        mount.stop("e")
+        mount.stop(dec_dir)
+        if safety is not None:
+            safety.notify_command(movement_active=False)
+        decel_start = time.monotonic()
+        while time.monotonic() - decel_start < decel_duration_s:
+            if abort is not None and abort.is_set():
+                break
+            try:
+                radec = mount.get_radec()
+            except ProtocolError:
+                time.sleep(poll_interval_s)
+                continue
+            t = time.monotonic() - command_t
+            ra_samples.append((t, radec.ra_hours * 15.0))
+            dec_samples.append((t, radec.dec_deg))
+            time.sleep(poll_interval_s)
+    finally:
+        # Always stop both axes, whatever happened above -- a mount left
+        # slewing after a lag measurement is a real hazard (the incident
+        # this guards). Harmless to call again if the decel phase above
+        # already stopped them. Best-effort so a failing stop() can't mask
+        # an in-flight exception, and the watchdog is released last.
+        try:
+            mount.stop("e")
+        finally:
+            try:
+                mount.stop(dec_dir)
+            finally:
+                if safety is not None:
+                    safety.notify_command(movement_active=False)
+
+    ra_result = _lag_result_from_samples(ra_samples, stop_command_t, decel_duration_s, settle_fraction, axis="ra")
+    dec_result = _lag_result_from_samples(dec_samples, stop_command_t, decel_duration_s, settle_fraction, axis="dec")
+    return ra_result, dec_result
 
 
 @dataclass
@@ -250,6 +399,26 @@ class LiveOffsets:
     def adjust_delta_t(self, delta: float) -> None:
         with self._lock:
             self.delta_t_s += delta
+
+    def reset(self) -> None:
+        """Clears delta_t_s and any in-flight perp pulse -- call this
+        whenever a NEW pass is selected (see TransitPanel.set_trajectory).
+
+        Regression fix: delta_t_s used to persist for the whole app
+        session with no reset anywhere -- a clock-offset/along-track
+        correction dialed in by hand during one pass silently carried
+        over and got applied to the very first tick of the NEXT pass's
+        trajectory query (run_tracking_loop's t_query = now + delta_t_s +
+        mount_lag_s). The ISS moves at roughly 900-1400 arcsec/s during a
+        typical pass (measured against a real trajectory), so even a
+        leftover 0.5s of stale delta_t already produces a ~7.5 arcmin
+        along-track offset at the new pass's start -- larger than a
+        typical narrow-FOV main camera's entire field -- with nothing
+        warning the operator beyond a small, easy-to-miss "+X.Xs" label."""
+        with self._lock:
+            self.delta_t_s = 0.0
+            self._perp_sign = 0.0
+            self._perp_until = 0.0
 
     def trigger_perp_pulse(self, sign: float, duration_s: float = 0.15) -> None:
         with self._lock:
@@ -375,8 +544,27 @@ class TrackingConfig:
     # From measure_mount_lag() -- shifts the feedforward query time earlier
     # by this much, so the trajectory is queried for "where the target will
     # be by the time the mount actually gets there" instead of "now".
-    # Defaults to 0.0 (no change from prior behavior) until measured.
+    # Defaults to 0.0 (no change from prior behavior) until measured. Used
+    # as-is (a flat per-tick shift) when max_accel_deg_s2 is None; otherwise
+    # treated as an upper bound -- see max_accel_deg_s2 below.
     mount_lag_s: float = 0.0
+
+    # Optional refinement on top of mount_lag_s, also from measure_mount_lag()
+    # (steady_rate_arcsec_s / lag_s, roughly -- the GUI's Diagnostics panel
+    # fills this in automatically alongside mount_lag_s). mount_lag_s alone
+    # was measured from the single biggest possible rate change (a 0-to-max
+    # step at pass acquisition) and applied identically on every tick,
+    # including mid-pass ticks where the ISS's rate barely changes from one
+    # tick to the next -- a real risk of overcorrecting the ticks that need
+    # it least (characterize.py's relatch-smoothness test showed small
+    # mid-slew rate changes settle much faster than a full 0-to-max ramp).
+    # When set, run_tracking_loop instead estimates how big THIS tick's
+    # rate change actually is and leads by only as much time as that change
+    # would take to physically ramp at this rate, capped at mount_lag_s --
+    # so a big acquisition-time jump still gets the full lead, while a
+    # small mid-pass adjustment gets a proportionally smaller one. None
+    # (default) keeps the old flat-mount_lag_s behavior unchanged.
+    max_accel_deg_s2: float | None = None
 
     # Closed-loop trim on top of the feedforward rate -- opt-in (default
     # off) and unvalidated on real hardware as of this writing. A slow
@@ -425,6 +613,12 @@ class TrackingRunaway(RuntimeError):
     """Raised by run_tracking_loop when pointing error exceeds
     TrackingConfig.runaway_stop_deg -- the mount is diverging, not
     following. run_tracking_loop stops the mount before raising."""
+
+
+# Below this, build_rv's ":Rv%.2f#" formatting rounds to "0.00" -- see
+# run_tracking_loop's own comment on why a rate this small is sent as
+# stop(dir) instead of set_rate(rate)+move(dir).
+MIN_COMMANDABLE_RATE_X = 0.005
 
 
 def run_tracking_loop(
@@ -481,10 +675,36 @@ def run_tracking_loop(
     integral_along_deg = 0.0
     integral_cross_deg = 0.0
     last_feedback_t = t_loop_start
+    # Previous tick's commanded rate (x sidereal) -- only used when
+    # max_accel_deg_s2 is set, to size this tick's lead time off how big a
+    # rate CHANGE it's actually asking for (see TrackingConfig.max_accel_
+    # deg_s2's docstring). Starts at 0: tracking typically begins from rest
+    # or plain sidereal, so the first tick's jump to the ISS's rate is
+    # correctly treated as the big acquisition-time transient it is.
+    prev_ra_rate_x = 0.0
+    prev_dec_rate_x = 0.0
     while (stop_event is None or not stop_event.is_set()) and time.monotonic() - t_loop_start < duration_s:
         now_wall = time.time()
         delta_t_s, perp_sign = offsets.snapshot()
-        t_query = now_wall + delta_t_s + cfg.mount_lag_s
+
+        lag_s = cfg.mount_lag_s
+        if cfg.max_accel_deg_s2:
+            # Probe at the full (worst-case) lag first, purely to see how
+            # large a rate change that would imply versus last tick's
+            # commanded rate -- a small mid-pass adjustment ramps up in a
+            # fraction of the full acquisition-time settle, so leading by
+            # the full mount_lag_s would overcorrect it.
+            probe_ra_deg, probe_dec_deg, probe_dra_dt, probe_ddec_dt = trajectory.interpolate(
+                now_wall + delta_t_s + cfg.mount_lag_s
+            )
+            probe_ra_rate_x = probe_dra_dt / SIDEREAL_DEG_PER_S
+            probe_dec_rate_x = probe_ddec_dt / SIDEREAL_DEG_PER_S
+            delta_ra_deg_s = abs(probe_ra_rate_x - prev_ra_rate_x) * SIDEREAL_DEG_PER_S
+            delta_dec_deg_s = abs(probe_dec_rate_x - prev_dec_rate_x) * SIDEREAL_DEG_PER_S
+            needed_lag_s = max(delta_ra_deg_s, delta_dec_deg_s) / cfg.max_accel_deg_s2
+            lag_s = min(cfg.mount_lag_s, needed_lag_s)
+
+        t_query = now_wall + delta_t_s + lag_s
 
         ra_deg, dec_deg, dra_dt, ddec_dt = trajectory.interpolate(t_query)
         extra_dra, extra_ddec = _perp_rate_components(dec_deg, dra_dt, ddec_dt, perp_sign)
@@ -498,13 +718,33 @@ def run_tracking_loop(
         dec_rate_x = ddec_dt / SIDEREAL_DEG_PER_S
         ra_rate_x_clamped = math.copysign(min(abs(ra_rate_x), cfg.max_rate_x), ra_rate_x) if ra_rate_x else 0.0
         dec_rate_x_clamped = math.copysign(min(abs(dec_rate_x), cfg.max_rate_x), dec_rate_x) if dec_rate_x else 0.0
+        prev_ra_rate_x, prev_dec_rate_x = ra_rate_x_clamped, dec_rate_x_clamped
 
         ra_dir = _pick_direction(ra_rate_x_clamped, axis_signs.ra, "e", "w")
         dec_dir = _pick_direction(dec_rate_x_clamped, axis_signs.dec, "n", "s")
-        mount.set_rate(abs(ra_rate_x_clamped))
-        mount.move(ra_dir)
-        mount.set_rate(abs(dec_rate_x_clamped))
-        mount.move(dec_dir)
+        # Regression fix: a feedforward rate that's (or rounds to, under
+        # build_rv's %.2f formatting) zero used to still go through
+        # set_rate(0)+move(dir) -- the reverse-engineered protocol notes
+        # (docs/AM5_UART_protocol_1.8.8.md, GFR/GFD selector 5) say the
+        # firmware's internal rate scalar floors fractional/very-low rates
+        # at a minimum of 1x sidereal, meaning ":Rv0.00#"+":Me#" may not
+        # actually hold the axis still -- it could creep at ~1x in
+        # whatever direction _pick_direction picked for a zero-magnitude
+        # rate. Unconfirmed on real hardware (never tested at near-zero
+        # rates), but stop(dir) costs nothing and removes the risk either way.
+        # Back on the shared set_rate() (:Rv#) -- see measure_mount_lag's
+        # matching comment for why set_rate_ra/set_rate_dec (:Rvr#/:Rvd#)
+        # were reverted here despite being fully implemented and tested.
+        if abs(ra_rate_x_clamped) < MIN_COMMANDABLE_RATE_X:
+            mount.stop(ra_dir)
+        else:
+            mount.set_rate(abs(ra_rate_x_clamped))
+            mount.move(ra_dir)
+        if abs(dec_rate_x_clamped) < MIN_COMMANDABLE_RATE_X:
+            mount.stop(dec_dir)
+        else:
+            mount.set_rate(abs(dec_rate_x_clamped))
+            mount.move(dec_dir)
         safety.notify_command(movement_active=True)
 
         actual_ra_deg = actual_dec_deg = ""

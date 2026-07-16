@@ -40,7 +40,19 @@ _SIGN_OF_DIR = {"e": 1.0, "w": -1.0, "n": 1.0, "s": -1.0}
 class MockConfig:
     rv_mode: str = "per_axis"  # "per_axis" or "global" — the question this whole rig exists to answer
     tracking_adds: bool = True  # True: :Me adds to sidereal. False: :Me replaces it.
-    tau_s: float = 0.15  # mechanical ramp time constant toward commanded velocity
+    # Constant-acceleration ramp toward the commanded velocity, replacing an
+    # earlier first-order-exponential model (tau_s=0.15, decayed to 90% of
+    # target in ~0.35s regardless of the target's size). That shape/speed
+    # was never validated against real hardware and turned out wrong on
+    # both counts: measure_mount_lag run for real on an AM5 (tube removed)
+    # measured a roughly LINEAR ramp (accel ~4.5-4.6 deg/s^2, consistent
+    # between a 1000x and a 1440x step, and matching accel/decel almost
+    # exactly) taking ~0.9-1.3s to settle -- confirmed independently by the
+    # reverse-engineered firmware notes (docs/AM5_UART_protocol_1.8.8.md,
+    # selector 5: the internal rate scalar increments by a fixed amount per
+    # control update, i.e. constant acceleration, not a decaying delta).
+    max_accel_deg_s2: float = 4.55
+    max_rate_x: float = 1440.0  # :GRl#'s reply -- see Mount.get_max_rate_x's docstring
     latency_profile: str = "serial"  # "serial" or "tcp"
     latitude_deg: float = 46.18
     longitude_deg: float = 6.14
@@ -75,7 +87,7 @@ class MockConfig:
 class _AxisState:
     moving_dir: str | None = None  # e.g. 'e'/'w' for ra, 'n'/'s' for dec, or None
     vel_target: float = 0.0  # deg/s, signed
-    vel_actual: float = 0.0  # deg/s, signed (ramps toward target with tau_s)
+    vel_actual: float = 0.0  # deg/s, signed (ramps toward target at max_accel_deg_s2)
     latched_rate: float = 1.0  # x sidereal, used only in per_axis mode
 
 
@@ -111,6 +123,14 @@ class _MountState:
     # further :Rv#/:Me#/:Mw# commands once this happens (see
     # protocol.build_set_meridian_behavior's docstring).
     meridian_stopped: bool = False
+    # :SSM1#/:SSM0# -- see protocol.build_set_alignment_mode's docstring.
+    # Whether a real :CM# under alignment_mode still updates ra_deg/dec_deg
+    # the way an ordinary sync does is UNCONFIRMED (the doc itself never
+    # tested this) -- this mock conservatively does NOT move reported
+    # position while in this mode, only counts the point, so a test can't
+    # accidentally rely on unconfirmed real behavior.
+    alignment_mode: bool = False
+    alignment_point_count: int = 0
 
     @property
     def site_time_synced(self) -> bool:
@@ -218,9 +238,15 @@ class MockMount(Transport):
 
     def _step(self, dt: float) -> None:
         s = self._state
+        max_dv = self._cfg.max_accel_deg_s2 * dt
         for axis_name, axis in s.axes.items():
-            alpha = min(dt / self._cfg.tau_s, 1.0)
-            axis.vel_actual += (axis.vel_target - axis.vel_actual) * alpha
+            delta = axis.vel_target - axis.vel_actual
+            if delta > max_dv:
+                axis.vel_actual += max_dv
+            elif delta < -max_dv:
+                axis.vel_actual -= max_dv
+            else:
+                axis.vel_actual = axis.vel_target
 
         sidereal = SIDEREAL_DEG_PER_S if s.tracking else 0.0
         ra_axis, dec_axis = s.axes["ra"], s.axes["dec"]
@@ -319,6 +345,21 @@ class MockMount(Transport):
                 return self._fake_status(s), True
             if cmd == ":GLC#":
                 return "1#", True
+            if cmd in (":GSgr#", ":GSgd#"):
+                # Real hardware read 0 at rest and under light unloaded
+                # motion (no tube) -- mirrored as a constant here since
+                # this mock has no mechanical load model to vary it by.
+                return "0#", True
+            if cmd == ":GTS#":
+                return "25.000000#", True
+            if cmd in (":GMCR#", ":GMCD#"):
+                axis_name = "ra" if cmd == ":GMCR#" else "dec"
+                # Confirmed live: current-scaling rises while the axis is
+                # actively driven vs. its resting/holding value.
+                active = s.axes[axis_name].moving_dir is not None
+                return (f"{28 if active else 15}#"), True
+            if cmd == ":GRl#":
+                return f"{self._cfg.max_rate_x:.0f}#", True
             if cmd == ":Gm#":
                 # NOTE this readout is intentionally NOT coupled to
                 # _SIGN_OF_DIR below: real hardware's DEC motor response
@@ -337,9 +378,26 @@ class MockMount(Transport):
                 lst_deg = (gmst_deg(datetime.now(timezone.utc)) + self._cfg.longitude_deg) % 360.0
                 ha_deg = ((lst_deg - s.ra_deg) + 180.0) % 360.0 - 180.0
                 return ("E#" if ha_deg < 0 else "W#"), True
+            if cmd.startswith(":Rv") and cmd.endswith("#") and cmd[3:4] in ("r", "d"):
+                # Firmware extension (docs/AM5_UART_protocol_1.8.8.md, not
+                # in the official v1.7 PDF): independent per-axis manual
+                # speed storage, confirmed live on real AM5 hardware --
+                # changing one axis's Rvr/Rvd leaves the other's completely
+                # untouched, unlike plain :Rv# below.
+                axis_name = "ra" if cmd[3] == "r" else "dec"
+                s.axes[axis_name].latched_rate = float(cmd[4:-1])
+                return "", False
             if cmd.startswith(":Rv") and cmd.endswith("#"):
                 rate = float(cmd[3:-1])
                 s.rv_global = rate
+                # Confirmed on real hardware that plain :Rv# (no axis
+                # selector) writes BOTH axes' stored manual speed at once,
+                # not a single register some OTHER mechanism reads --
+                # mirrored here so a caller that only ever used :Rv# (jog,
+                # calibrate_directions) sees the same per-axis latch
+                # behavior as one using :Rvr#/:Rvd# on just one axis.
+                s.axes["ra"].latched_rate = rate
+                s.axes["dec"].latched_rate = rate
                 if self._cfg.rv_mode == "global":
                     # The shared register is read continuously by whichever
                     # axes are already moving, not just latched at :M<dir># time.
@@ -352,8 +410,6 @@ class MockMount(Transport):
                 axis_name = _AXIS_OF_DIR[direction]
                 axis = s.axes[axis_name]
                 axis.moving_dir = direction
-                if self._cfg.rv_mode == "per_axis":
-                    axis.latched_rate = s.rv_global
                 rate = axis.latched_rate if self._cfg.rv_mode == "per_axis" else s.rv_global
                 axis.vel_target = _SIGN_OF_DIR[direction] * rate * SIDEREAL_DEG_PER_S
                 s.at_home = False
@@ -400,6 +456,12 @@ class MockMount(Transport):
                 s.at_home = False
                 s.parked = True
                 return "1#", True
+            if cmd == ":Spu#":
+                # Confirmed live on real AM5 hardware: this is the wire-
+                # level unpark :hP# needs (see protocol.build_unpark_
+                # native's docstring) -- clears the persisted parked state.
+                s.parked = False
+                return "1", True
             if cmd == ":SLD#":
                 s.alt_limits_enabled = False
                 return "1", True  # bare, no '#' -- confirmed against real hardware
@@ -464,6 +526,15 @@ class MockMount(Transport):
                 return self._handle_slew(s)
             if cmd == ":CM#":
                 return self._handle_sync(s)
+            if cmd in (":SSM1#", ":SSM0#"):
+                s.alignment_mode = cmd == ":SSM1#"
+                if not s.alignment_mode:
+                    s.alignment_point_count = 0  # destructive, see build_set_alignment_mode's docstring
+                return "1#", True
+            if cmd == ":GSM#":
+                return f"{1 if s.alignment_mode else 0}#", True
+            if cmd == ":NSc#":
+                return f"{s.alignment_point_count}#", True
             if cmd.startswith(":Mg") and cmd.endswith("#"):
                 return "", False
             if cmd.startswith(":Rg") and cmd.endswith("#"):
@@ -499,25 +570,45 @@ class MockMount(Transport):
     def _handle_sync(self, s: _MountState) -> tuple[str, bool]:
         if s.pending_target_ra_hours is None or s.pending_target_dec_deg is None:
             return "N/A#", True
+        if s.alignment_mode:
+            # :SSM1#'s "alternate synchronization callback" -- see
+            # _MountState.alignment_mode's own comment for why this
+            # deliberately does NOT move ra_deg/dec_deg (unconfirmed real
+            # behavior either way), only records the point.
+            s.alignment_point_count = min(100, s.alignment_point_count + 1)
+            return "N/A#", True
         s.ra_deg = s.pending_target_ra_hours * 15.0
         s.dec_deg = s.pending_target_dec_deg
         s.meridian_stopped = False  # a fresh sync lands well clear of any limit
         return "N/A#", True
 
     def _fake_status(self, s: _MountState) -> str:
-        # Flag characters per the official protocol doc (see protocol.py's
-        # parse_gu_status), which lists them but not a fixed field layout —
-        # each is "or not shown", so this just includes whichever apply.
-        # The doc doesn't pin down the exact n/N distinction ("no tracking"
-        # vs "stop or tracking"); this picks N when tracking is on, n when
-        # it's off, as a reasonable best-effort reading.
+        # Flag characters per the reverse-engineered protocol doc
+        # (docs/AM5_UART_protocol_1.8.8.md), confirmed live against a real
+        # AM5 -- see protocol.py's MountStatus docstring for the "P" vs
+        # trailing-state-digit story. The doc doesn't pin down the exact
+        # n/N distinction ("no tracking" vs "stop or tracking"); this picks
+        # N when tracking is on, n when it's off, as a reasonable
+        # best-effort reading.
         chars = ["N" if s.tracking else "n"]
         if s.at_home:
             chars.append("H")
         chars.append("G" if s.equatorial_mode else "Z")
+        # Trailing state digit -- real hardware confirmed live: '1' with
+        # sidereal tracking on and no manual move, '3' with a manual axis
+        # actively moving, '5' immediately after a genuine :hP#, '0'
+        # otherwise. GOTO (2) and homing (4) aren't distinctly simulated
+        # here -- this mock's park()/goto() don't model an in-progress
+        # phase the way real hardware's multi-second slew does.
         if s.parked:
-            chars.append("P")
-        return "".join(chars) + "001000060#"
+            state_digit = "5"
+        elif any(axis.moving_dir is not None for axis in s.axes.values()):
+            state_digit = "3"
+        elif s.tracking:
+            state_digit = "1"
+        else:
+            state_digit = "0"
+        return "".join(chars) + f"00100006{state_digit}#"
 
     def _compute_azalt(self, ra_deg: float, dec_deg: float) -> tuple[float, float]:
         # Real wall-clock sidereal time, not an arbitrary counter from mock

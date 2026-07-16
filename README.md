@@ -86,8 +86,8 @@ mount and the pass predictor:
 ```bash
 git clone <this repo>
 cd eq-satrack
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+poetry install
+poetry run python3 gui.py   # or: poetry shell, then run scripts directly
 ```
 
 Real camera support additionally needs the ZWO ASI SDK
