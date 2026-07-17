@@ -70,7 +70,7 @@ class App:
         self.alignment_panel = AlignmentPanel(
             self.notebook, connection_panel=self.connection_panel, live_camera_feed=self.live_camera_feed,
         )
-        self.target_panel = TargetPanel(self.notebook)
+        self.target_panel = TargetPanel(self.notebook, connection_panel=self.connection_panel)
         # Reference/Target: two acquisition tabs, not one shared Capture +
         # one shared Calibration tab -- darks must match each capture's
         # own exposure/gain, which can differ between a bright standard

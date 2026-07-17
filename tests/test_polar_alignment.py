@@ -3,9 +3,16 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pytest
+from astropy.wcs import WCS
 
 from am5.angles import angular_separation_deg, equatorial_to_altaz
-from am5.polar_alignment import fit_rotation_axis, polar_alignment_error
+from am5.polar_alignment import (
+    correction_triangle_radec,
+    fit_rotation_axis,
+    polar_alignment_error,
+    project_radec_to_pixel,
+    true_pole_radec,
+)
 
 
 def _unit_vector(ra_deg: float, dec_deg: float) -> np.ndarray:
@@ -93,3 +100,132 @@ def test_polar_alignment_error_matches_a_direct_altaz_conversion():
     expected_az_error_deg = ((az_deg - 0.0 + 180.0) % 360.0) - 180.0
     assert result.error_az_deg == pytest.approx(expected_az_error_deg)
     assert result.error_deg > 0.0
+
+
+def test_true_pole_radec_gives_plus_90_north_minus_90_south():
+    assert true_pole_radec(46.18) == (0.0, 90.0)
+    assert true_pole_radec(-33.0) == (0.0, -90.0)
+
+
+def _wcs_matching_this_projects_own_pixel_convention(crval1, crval2, pixel_scale_deg, rotation_deg) -> WCS:
+    # A CD matrix constructed to match THIS project's own pixel layout
+    # (column increases east, row increases south -- see
+    # camera/mock_camera.py's _render_stars) at rotation_deg=0, then
+    # generalized to a nonzero rotation the same way a real solver would
+    # report one, with rotation_deg extracted via atan2(CD1_2, CD1_1) --
+    # exactly matching camera/platesolve.py's own extraction convention.
+    # Ground truth for project_radec_to_pixel: independent of this
+    # project's own projection code, using astropy.wcs's authoritative
+    # TAN-projection math instead.
+    w = WCS(naxis=2)
+    w.wcs.crpix = [1000.5, 500.5]  # arbitrary reference pixel, deliberately not the frame centre
+    w.wcs.crval = [crval1, crval2]
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    rot = math.radians(rotation_deg)
+    s = pixel_scale_deg
+    w.wcs.cd = [[s * math.cos(rot), s * math.sin(rot)], [s * math.sin(rot), -s * math.cos(rot)]]
+    return w
+
+
+@pytest.mark.parametrize("rotation_deg", [0.0, 15.0, 90.0, -45.0, 180.0])
+def test_project_radec_to_pixel_matches_astropy_wcs_for_a_small_offset(rotation_deg):
+    pixel_scale_arcsec = 1.72
+    center_ra_deg, center_dec_deg = 30.0, 60.0
+    w = _wcs_matching_this_projects_own_pixel_convention(center_ra_deg, center_dec_deg, pixel_scale_arcsec / 3600.0, rotation_deg)
+    crpix_x, crpix_y = w.wcs.crpix
+    cd11, cd12 = w.wcs.cd[0]
+    extracted_rotation_deg = math.degrees(math.atan2(cd12, cd11))
+    extracted_scale_arcsec = math.sqrt(cd11 ** 2 + w.wcs.cd[1][0] ** 2) * 3600.0
+
+    test_ra_deg, test_dec_deg = center_ra_deg + 0.002, center_dec_deg + 0.001  # small -- exact within the linear (small-angle) regime
+    px, py = w.all_world2pix([[test_ra_deg, test_dec_deg]], 1)[0]
+    expected_delta_col, expected_delta_row = px - crpix_x, py - crpix_y
+
+    delta_col, delta_row = project_radec_to_pixel(
+        test_ra_deg, test_dec_deg, center_ra_deg, center_dec_deg, extracted_scale_arcsec, extracted_rotation_deg,
+    )
+    assert delta_col == pytest.approx(expected_delta_col, abs=0.01)
+    assert delta_row == pytest.approx(expected_delta_row, abs=0.01)
+
+
+def test_project_radec_to_pixel_matches_astropy_wcs_for_a_large_offset():
+    # Half a degree offset -- big enough that the flat small-angle
+    # approximation (circular_diff_deg-based) used elsewhere in this
+    # project would visibly diverge from the true TAN projection; this
+    # confirms project_radec_to_pixel doesn't have that limitation.
+    pixel_scale_arcsec = 1.72
+    center_ra_deg, center_dec_deg = 30.0, 89.3
+    w = _wcs_matching_this_projects_own_pixel_convention(center_ra_deg, center_dec_deg, pixel_scale_arcsec / 3600.0, 20.0)
+    crpix_x, crpix_y = w.wcs.crpix
+    cd11, cd12 = w.wcs.cd[0]
+    extracted_rotation_deg = math.degrees(math.atan2(cd12, cd11))
+    extracted_scale_arcsec = math.sqrt(cd11 ** 2 + w.wcs.cd[1][0] ** 2) * 3600.0
+
+    test_ra_deg, test_dec_deg = center_ra_deg + 0.5, center_dec_deg - 0.3
+    px, py = w.all_world2pix([[test_ra_deg, test_dec_deg]], 1)[0]
+    expected_delta_col, expected_delta_row = px - crpix_x, py - crpix_y
+
+    delta_col, delta_row = project_radec_to_pixel(
+        test_ra_deg, test_dec_deg, center_ra_deg, center_dec_deg, extracted_scale_arcsec, extracted_rotation_deg,
+    )
+    assert delta_col == pytest.approx(expected_delta_col, abs=0.5)
+    assert delta_row == pytest.approx(expected_delta_row, abs=0.5)
+
+
+def test_project_radec_to_pixel_is_ra_independent_exactly_at_the_pole():
+    # The true celestial pole's RA is meaningless -- project_radec_to_pixel
+    # must give the SAME pixel offset no matter which arbitrary RA
+    # true_pole_radec (or a caller) happens to pass alongside dec=+-90.
+    # Verified against astropy.wcs as ground truth, not just self-
+    # consistency, since a wrong-but-self-consistent formula would still
+    # pass a same-vs-same comparison.
+    pixel_scale_arcsec = 1.72
+    center_ra_deg, center_dec_deg = 30.0, 89.3
+    w = _wcs_matching_this_projects_own_pixel_convention(center_ra_deg, center_dec_deg, pixel_scale_arcsec / 3600.0, 20.0)
+    crpix_x, crpix_y = w.wcs.crpix
+    cd11, cd12 = w.wcs.cd[0]
+    extracted_rotation_deg = math.degrees(math.atan2(cd12, cd11))
+    extracted_scale_arcsec = math.sqrt(cd11 ** 2 + w.wcs.cd[1][0] ** 2) * 3600.0
+
+    px, py = w.all_world2pix([[0.0, 90.0]], 1)[0]
+    expected = (px - crpix_x, py - crpix_y)
+
+    for ra_deg in (0.0, 123.4, 250.0):
+        delta_col, delta_row = project_radec_to_pixel(
+            ra_deg, 90.0, center_ra_deg, center_dec_deg, extracted_scale_arcsec, extracted_rotation_deg,
+        )
+        assert delta_col == pytest.approx(expected[0], abs=0.01)
+        assert delta_row == pytest.approx(expected[1], abs=0.01)
+
+
+def test_correction_triangle_az_leg_changes_only_azimuth_not_altitude():
+    when = datetime(2026, 6, 15, 3, 0, 0, tzinfo=timezone.utc)
+    lat_deg, lon_deg = 46.18, 6.14
+    axis_ra_deg, axis_dec_deg = 10.0, 89.3
+
+    az0, alt0 = equatorial_to_altaz(axis_ra_deg, axis_dec_deg, lat_deg, lon_deg, when)
+
+    (az_ra, az_dec), (pole_ra, pole_dec) = correction_triangle_radec(
+        axis_ra_deg, axis_dec_deg, lat_deg, lon_deg, when,
+    )
+
+    az1, alt1 = equatorial_to_altaz(az_ra, az_dec, lat_deg, lon_deg, when)
+    target_az_deg = 0.0 if lat_deg >= 0 else 180.0
+    # Altitude unchanged by a pure-azimuth correction...
+    assert alt1 == pytest.approx(alt0, abs=1e-3)
+    # ...and the azimuth error is now fully corrected.
+    assert ((az1 - target_az_deg + 180.0) % 360.0) - 180.0 == pytest.approx(0.0, abs=1e-3)
+    assert (pole_ra, pole_dec) == true_pole_radec(lat_deg)
+
+
+def test_correction_triangle_is_idempotent_once_azimuth_is_already_corrected():
+    # Once at the az-corrected point (already on the target azimuth,
+    # unchanged altitude), running the same solve again should be a
+    # near no-op -- it's already the fixed point Newton's iteration
+    # converges to.
+    when = datetime(2026, 6, 15, 3, 0, 0, tzinfo=timezone.utc)
+    lat_deg, lon_deg = 46.18, 6.14
+    (az_ra, az_dec), _pole = correction_triangle_radec(10.0, 89.3, lat_deg, lon_deg, when)
+    (az_ra2, az_dec2), _pole2 = correction_triangle_radec(az_ra, az_dec, lat_deg, lon_deg, when)
+    assert az_ra2 == pytest.approx(az_ra, abs=1e-4)
+    assert az_dec2 == pytest.approx(az_dec, abs=1e-4)

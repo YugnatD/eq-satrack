@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from am5.clock_sync import ClockSyncStatus
-from am5.gui.worker import MountWorker, WorkerEvent
+from am5.gui.worker import GOTO_POLL_TIMEOUT_S, MountWorker, WorkerEvent
 from am5.mock_mount import MockConfig, MockMount
 from am5.mount import Mount
 from am5.safety import SafetyGuard
@@ -238,6 +238,89 @@ def test_jog_goto_aborts_on_divergence_from_wrong_axis_sign(worker):
     assert result.payload["arrived"] is False
 
 
+def test_jog_start_held_past_the_watchdog_timeout_keeps_moving(worker):
+    # Real incident: AlignmentPanel's polar-alignment rotation (tens of
+    # seconds) and JogWindow's press-and-hold buttons both call
+    # jog_start() exactly ONCE and rely on it running until jog_stop() --
+    # but SafetyGuard.notify_command(movement_active=True) was ALSO only
+    # called that one time, at jog_start. SafetyGuard's watchdog treats a
+    # stale notify_command as "operator went silent" and fires its own
+    # :Q# -- confirmed directly, before this fix: RA advanced smoothly for
+    # exactly watchdog_timeout seconds then completely flatlined, no error
+    # shown anywhere. _idle_poll_tick now re-kicks the watchdog every poll
+    # for as long as a jog is active (see _jog_active_directions), so a
+    # held jog reads as continuous "yes, still moving" rather than silence.
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    # Replace the real (5s) watchdog with a much shorter one so this test
+    # doesn't need to wait 5+ real seconds -- same SafetyGuard class/logic,
+    # just a faster clock for the test.
+    worker._safety.shutdown()
+    worker._safety = SafetyGuard(worker._mount, watchdog_timeout=0.6, poll_interval=0.1, install_signal_handlers=False)
+
+    worker.jog_start("e", 150.0)
+    try:
+        # Both samples are already past the watchdog timeout -- the bug
+        # this guards against isn't "no motion at all" (there's always
+        # some before the watchdog first fires), it's "motion silently
+        # stops partway through", which only shows up by comparing two
+        # points that both come AFTER the timeout would have already
+        # fired once.
+        time.sleep(0.6 * 2.0)
+        ra_at_2x = worker._mount.get_radec().ra_hours
+        time.sleep(0.6 * 2.0)
+        ra_at_4x = worker._mount.get_radec().ra_hours
+    finally:
+        worker.jog_stop("e")
+    assert ra_at_4x > ra_at_2x + 0.01  # still moving well past the timeout -- not silently stopped
+
+
+def test_native_goto_poll_survives_past_the_watchdog_timeout(worker, monkeypatch):
+    # Same bug, different code path: _handle_goto's _poll_until_arrived
+    # (the native :MS# GOTO path) set movement_active=True once before
+    # polling and once after, but never DURING the poll loop -- the mock's
+    # own :MS# teleports instantly (see MockMount._handle_slew's
+    # docstring), so this never showed up against the mock the way the
+    # jog_start case did, but a real GOTO genuinely takes time. Simulates
+    # a GOTO that takes longer than the (shortened, for a fast test)
+    # watchdog timeout to settle, and confirms goto_arrived still fires
+    # instead of the watchdog silently killing the slew partway through.
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    worker._safety.shutdown()
+    worker._safety = SafetyGuard(worker._mount, watchdog_timeout=0.6, poll_interval=0.1, install_signal_handlers=False)
+
+    from am5.protocol import RaDec
+    t0 = time.monotonic()
+    target_ra_hours, target_dec_deg = 5.0, 30.0
+    settle_s = 0.6 * 4  # comfortably past 2 watchdog periods
+
+    def fake_get_radec():
+        elapsed = time.monotonic() - t0
+        if elapsed < settle_s:
+            frac = elapsed / settle_s
+            return RaDec(ra_hours=3.0 + frac * (target_ra_hours - 3.0), dec_deg=45.0 + frac * (target_dec_deg - 45.0))
+        return RaDec(ra_hours=target_ra_hours, dec_deg=target_dec_deg)
+
+    # fake_get_radec ignores real mount state (it's a pure elapsed-time
+    # function), so a stray :Q# wouldn't show up as "stopped converging"
+    # the way it would against the mock's own latched-rate motion model
+    # (see the jog_start version of this test) -- check directly whether
+    # the watchdog actually fired instead.
+    emergency_stop_calls = []
+    monkeypatch.setattr(worker._mount, "emergency_stop", lambda: emergency_stop_calls.append(time.monotonic()))
+    monkeypatch.setattr(worker._mount, "get_radec", fake_get_radec)
+    monkeypatch.setattr(worker._mount, "set_target_ra", lambda h: True)
+    monkeypatch.setattr(worker._mount, "set_target_dec", lambda d: True)
+    monkeypatch.setattr(worker._mount, "slew_to_target", lambda: 0)
+
+    worker.goto(target_ra_hours, target_dec_deg)
+    seen = _collect_until(worker, "goto_arrived", timeout=GOTO_POLL_TIMEOUT_S)
+    assert seen[-1].kind == "goto_arrived"
+    assert seen[-1].payload["ra_hours"] == pytest.approx(target_ra_hours, abs=0.01)
+    assert emergency_stop_calls == []  # watchdog must not have fired mid-poll
+
+
 def test_jog_goto_converges_over_a_large_initial_separation(worker):
     # Real incident this session: a GOTO to Deneb (~57 deg away, from
     # near the pole) tripped the divergence guard despite correct
@@ -303,6 +386,22 @@ def test_emergency_stop_aborts_a_running_jog_goto(worker):
     worker.emergency_stop()
     result = _wait_for(worker, "jog_goto_result", timeout=3.0)
     assert result.payload["arrived"] is False
+
+
+def test_emergency_stop_clears_jog_active_directions(worker):
+    # Regression (safety): emergency_stop() sent :Q# but left a still-held
+    # jog direction in _jog_active_directions, so _idle_poll_tick kept
+    # re-notifying the watchdog forever (until ButtonRelease eventually
+    # fired, if it ever did) -- silently defeating the watchdog's own
+    # backup :Q# for exactly the case where the one emergency_stop() just
+    # sent doesn't actually stop the mount.
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    worker.jog_start("e", 150.0)
+    time.sleep(0.1)
+    worker.emergency_stop()
+    time.sleep(0.1)
+    assert worker._jog_active_directions == set()
 
 
 def test_emergency_stop_ends_a_tracking_pass(worker, tmp_path):

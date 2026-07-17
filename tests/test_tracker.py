@@ -200,6 +200,27 @@ def test_calibrate_directions_normalizes_home_pier_side_to_none():
         mount.close()
 
 
+def test_calibrate_directions_feeds_the_safety_watchdog_and_releases_it():
+    # Regression (safety): calibrate_directions never fed the SafetyGuard a
+    # movement_active heartbeat at all -- unlike every other motion-issuing
+    # path in this codebase (measure_mount_lag's own matching parameter,
+    # _handle_jog_goto's per-iteration heartbeat, _poll_until_arrived's
+    # own), the two real nudges here had zero watchdog coverage: a hang
+    # between move() and stop() would leave the mount jogging with no
+    # safety net. Now heartbeats around each nudge and releases
+    # (movement_active=False) after each stop.
+    mock = MockMount(MockConfig(rv_mode="per_axis"))
+    mount = Mount(mock)
+    safety = _RecordingSafety()
+    try:
+        calibrate_directions(mount, safety=safety)
+        assert True in safety.calls  # heartbeated during at least one nudge
+        assert safety.calls[-1] is False  # released the watchdog last
+    finally:
+        mount.stop()
+        mount.close()
+
+
 def test_measure_mount_lag_recovers_the_mocks_known_ramp_constant():
     # MockMount simulates a real constant-acceleration ramp
     # (max_accel_deg_s2=4.55, see mock_mount.py -- calibrated against real
@@ -775,6 +796,61 @@ def test_tracking_loop_feedback_reduces_along_track_error_vs_feedforward_only():
     # Observed gap is consistently ~10-14" across runs; require at least
     # half that margin so ordinary timing jitter doesn't flake the test.
     assert final_error_on < final_error_off - 5.0
+
+
+def test_tracking_loop_feedback_freezes_outside_the_trajectorys_active_window():
+    # Regression: an early start sitting at the trajectory's own boundary
+    # (see Trajectory.interpolate's own docstring -- explicitly supported:
+    # dra_dt/ddec_dt are zeroed outside [t_unix[0], t_unix[-1]]) hits
+    # decompose_error's zero-speed branch, which returns a signless
+    # MAGNITUDE for cross_deg (always >= 0, no directional information --
+    # same bug fixed on the GUI auto-guide/finder-correction paths in
+    # am5/gui/panels.py). Before this fix, run_tracking_loop's optional
+    # feedback trim integrated that every tick, winding up a spurious,
+    # fabricated-direction correction while just waiting for the pass to
+    # start. feedback_dra_dt/feedback_ddec_dt must stay frozen at 0 for
+    # the whole run instead.
+    start_ra, start_dec = 10.0, 45.0
+    duration_s = 1.0
+    n = 20
+    # Trajectory starts 100s in the future -- "now" (and the whole test
+    # run) stays well before t_unix[0] throughout, so every tick hits the
+    # zeroed-rate boundary case. The trajectory's own boundary RA differs
+    # from the mount's actual start RA, so there's a real, nonzero
+    # along/cross error for decompose_error to (mis)compute from -- not a
+    # degenerate all-zeros case that would trivially pass regardless.
+    t0 = time.time() + 100.0
+    t_unix = t0 + np.linspace(0.0, 50.0, n)
+    trajectory = Trajectory(
+        t_unix=t_unix, ra_deg=np.full(n, start_ra + 0.5), dec_deg=np.full(n, start_dec),
+        dra_dt_deg_s=np.zeros(n), ddec_dt_deg_s=np.zeros(n),
+        alt_deg=np.zeros(n), az_deg=np.zeros(n), ha_hours=np.zeros(n), distance_km=np.full(n, 500.0),
+    )
+    mock = MockMount(
+        MockConfig(rv_mode="per_axis", tracking_adds=True, start_ra_deg=start_ra, start_dec_deg=start_dec),
+        seed=1,
+    )
+    mount = Mount(mock)
+    safety = SafetyGuard(mount, watchdog_timeout=5.0)
+    fh = io.StringIO()
+    writer = csv.DictWriter(fh, fieldnames=TRACKING_CSV_FIELDS)
+    writer.writeheader()
+    ticks = []
+    try:
+        run_tracking_loop(
+            mount, safety, trajectory, AxisSigns(ra=1.0, dec=1.0), LiveOffsets(), writer,
+            duration_s=duration_s, config=TrackingConfig(loop_hz=20.0, enable_feedback=True, error_log_hz=20.0),
+            on_tick=ticks.append,
+        )
+    finally:
+        mount.stop()
+        safety.shutdown()
+        mount.close()
+
+    assert len(ticks) > 1
+    for t in ticks:
+        assert t["feedback_dra_dt_arcsec_s"] == 0.0
+        assert t["feedback_ddec_dt_arcsec_s"] == 0.0
 
 
 

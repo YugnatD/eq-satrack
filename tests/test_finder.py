@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from camera.finder import FinderCalibration, FinderState
+from camera.guiding import GuidingCalibration
 
 
 def test_main_fov_corners_px_returns_none_when_not_calibrated():
@@ -70,21 +71,102 @@ def test_update_main_frame_populates_last_main_frame():
     assert state.last_main_frame is frame
 
 
-def test_get_correction_arcsec_defaults_to_the_real_configured_finder_scale():
+def test_finder_px_to_main_px_zero_at_the_main_cameras_own_centre():
+    # Regression: this used to ADD offset_row/offset_col instead of
+    # SUBTRACTING them -- inconsistent with this same class's own
+    # main_fov_corners_px (centre_row = fc_row + offset_row, verified by
+    # the synthetic-ground-truth tests below), which means the main
+    # camera's own optical centre, expressed in finder pixels, is
+    # (fc_row + offset_row, fc_col + offset_col). A blob sitting exactly
+    # there is BY DEFINITION at zero offset from the main camera's centre.
+    c = FinderCalibration()
+    c.calibrated = True
+    c.offset_row = 10.0
+    c.offset_col = -20.0
+    c.plate_scale_ratio = 2.0
+    c.rotation_rad = 0.0
+
+    finder_shape = (200, 300)
+    fc_row, fc_col = 100.0, 150.0
+    dx_px, dy_px = c.finder_px_to_main_px(fc_row + 10.0, fc_col - 20.0, finder_shape)
+    assert dx_px == pytest.approx(0.0)
+    assert dy_px == pytest.approx(0.0)
+
+
+def test_finder_px_to_main_px_scales_by_plate_ratio():
+    c = FinderCalibration()
+    c.calibrated = True
+    c.offset_row = 0.0
+    c.offset_col = 0.0
+    c.plate_scale_ratio = 2.0  # finder arcsec/px is 2x the main's
+    c.rotation_rad = 0.0
+
+    # 5 finder px east of the main centre -> 10 main px (main px are finer).
+    dx_px, dy_px = c.finder_px_to_main_px(100.0, 105.0, (200, 200))
+    assert dx_px == pytest.approx(10.0)
+    assert dy_px == pytest.approx(0.0)
+
+
+def test_finder_px_to_main_px_applies_rotation():
+    c = FinderCalibration()
+    c.calibrated = True
+    c.offset_row = 0.0
+    c.offset_col = 0.0
+    c.plate_scale_ratio = 1.0
+    c.rotation_rad = math.pi / 2.0
+
+    # Pure row offset (10 finder px "down" from main centre) should come
+    # out as a pure column offset after a 90deg roll.
+    dx_px, dy_px = c.finder_px_to_main_px(110.0, 100.0, (200, 200))
+    assert dx_px == pytest.approx(10.0)
+    assert dy_px == pytest.approx(0.0)
+
+
+def test_get_correction_arcsec_requires_the_main_cameras_own_sky_calibration():
+    # Regression: a finder-to-main geometric calibration alone (FinderCame
+    # raPanel's "Calibrate fields") only knows the finder's roll/scale
+    # relative to the MAIN camera's own pixel axes -- not how those axes
+    # relate to true sky directions. Only the main camera's own nudge-
+    # verified GuidingCalibration (CalibrationPanel's "Calibrate camera-
+    # to-sky mapping") establishes that, so get_correction_arcsec must
+    # refuse to answer without it rather than silently assuming the main
+    # camera's axes happen to already be sky-track-aligned.
     state = FinderState()
-    state.finder_plate_scale_arcsec = 1.72
     state.calibration.calibrated = True
     state.last_frame = np.zeros((100, 100), dtype=np.uint8)
     state.blob_found = True
-    state.last_blob_row = 60.0  # 10px below center
-    state.last_blob_col = 50.0  # centered horizontally
+    state.last_blob_row = 60.0
+    state.last_blob_col = 50.0
 
-    default_call = state.get_correction_arcsec()
-    explicit_call = state.get_correction_arcsec(finder_plate_scale_arcsec=1.72)
-    assert default_call == explicit_call
+    assert state.main_calibration is None
+    assert state.get_correction_arcsec() is None
 
-    wrong_scale_call = state.get_correction_arcsec(finder_plate_scale_arcsec=1.0)
-    assert default_call != wrong_scale_call
+    state.set_main_calibration(GuidingCalibration(
+        px_per_ra_arcsec_x=1.0, px_per_ra_arcsec_y=0.0, px_per_dec_arcsec_x=0.0, px_per_dec_arcsec_y=1.0,
+    ))
+    assert state.get_correction_arcsec() is not None
+
+
+def test_get_correction_arcsec_chains_through_the_main_calibration():
+    state = FinderState()
+    state.calibration.calibrated = True
+    state.calibration.offset_row = 0.0
+    state.calibration.offset_col = 0.0
+    state.calibration.plate_scale_ratio = 1.0
+    state.calibration.rotation_rad = 0.0
+    state.last_frame = np.zeros((100, 100), dtype=np.uint8)
+    state.blob_found = True
+    state.last_blob_row = 50.0  # exactly at finder centre == main centre here
+    state.last_blob_col = 60.0  # 10px east of main centre
+
+    calib = GuidingCalibration(
+        px_per_ra_arcsec_x=2.0, px_per_ra_arcsec_y=0.0, px_per_dec_arcsec_x=0.0, px_per_dec_arcsec_y=2.0,
+    )
+    state.set_main_calibration(calib)
+
+    result = state.get_correction_arcsec()
+    expected = calib.pixel_to_sky(10.0, 0.0)
+    assert result == pytest.approx(expected)
 
 
 def test_main_fov_corners_px_applies_roi_offset():
@@ -161,12 +243,14 @@ def test_reset_blob_clears_stale_detection():
 
 def test_reset_blob_prevents_stale_correction_after_disconnect():
     state = FinderState()
-    state.finder_plate_scale_arcsec = 1.72
     state.calibration.calibrated = True
     state.last_frame = np.zeros((100, 100), dtype=np.uint8)
     state.blob_found = True
     state.last_blob_row = 60.0
     state.last_blob_col = 50.0
+    state.set_main_calibration(GuidingCalibration(
+        px_per_ra_arcsec_x=1.0, px_per_ra_arcsec_y=0.0, px_per_dec_arcsec_x=0.0, px_per_dec_arcsec_y=1.0,
+    ))
     assert state.get_correction_arcsec() is not None
 
     state.reset_blob()

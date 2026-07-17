@@ -120,6 +120,13 @@ class App:
         # sliders and the Transit tab's stay in sync instead of drifting
         # apart -- see CameraControlVars' docstring.
         self.camera_vars = CameraControlVars.create()
+        # Same fix, for the finder camera's own two independent slider
+        # widgets (FinderCameraPanel's tab and the floating FinderWindow) --
+        # reported as a real bug: changing one didn't move the other, and
+        # each silently kept driving whatever it last showed.
+        self.finder_camera_vars = CameraControlVars.create(
+            FinderCameraPanel.FINDER_DEFAULT_EXPOSURE_US, FinderCameraPanel.FINDER_DEFAULT_GAIN,
+        )
         # Shared with PassesPanel (same instance) so the site entered once
         # is both what passes are searched for AND what the mount is told
         # on connect -- see SiteVars' docstring for the bug this fixes.
@@ -136,23 +143,34 @@ class App:
             finder_worker=self.finder_worker, finder_state=self.finder_state,
         )
         self.passes_panel = PassesPanel(self.notebook, self._on_pass_selected, site_vars=self.site_vars)
+        # on_tracking_trajectory_changed: CalibrationPanel's own auto-guide
+        # correction needs the trajectory ACTUALLY being tracked right now
+        # (possibly Simulate's own time-shifted copy), not just whichever
+        # pass is selected -- see TransitPanel._active_trajectory's own
+        # comment. A lambda, not a direct method reference, since
+        # self.calibration_panel doesn't exist yet at this point in
+        # construction (same pattern as on_calibration_ready below,
+        # resolved at call time instead).
         self.transit_panel = TransitPanel(
             self.notebook, self.worker, self.camera_worker, out_dir, self.live_offsets,
             axis_signs=self.axis_signs, auto_guide_var=self.auto_guide_var, camera_vars=self.camera_vars,
             mount_lag_var=self.mount_lag_var, mount_max_accel_var=self.mount_max_accel_var,
             feedback_enabled_var=self.feedback_enabled_var,
             finder_state=self.finder_state,
+            on_tracking_trajectory_changed=lambda t: self.calibration_panel.set_active_trajectory(t),
         )
-        # on_calibration_ready: CalibrationPanel finishes calibration entirely
-        # on its own (button click -> internal timers), so it has to tell
-        # TransitPanel directly when its checkbox should become enabled --
-        # there's no worker event to pump this through.
+        # on_calibration_ready/on_finder_calibration_ready: CalibrationPanel
+        # finishes each calibration entirely on its own (button click ->
+        # internal timers/FFT correlation), so it has to tell TransitPanel
+        # directly when each checkbox should become enabled -- there's no
+        # worker event to pump either through.
         self.calibration_panel = CalibrationPanel(
             self.notebook, self.worker, self.camera_worker, self.live_offsets,
             auto_guide_var=self.auto_guide_var,
             on_calibration_ready=lambda: self.transit_panel.set_auto_guide_available(True),
             mount_lag_var=self.mount_lag_var, mount_max_accel_var=self.mount_max_accel_var,
-            axis_signs=self.axis_signs,
+            axis_signs=self.axis_signs, finder_state=self.finder_state,
+            on_finder_calibration_ready=lambda: self.transit_panel.set_finder_correction_available(True),
         )
         self.alignment_panel = AlignmentPanel(
             self.notebook, self.worker, self.axis_signs, self.site_vars, finder_state=self.finder_state,
@@ -166,22 +184,30 @@ class App:
         # Finder camera panel -- optional wide-field second camera for ISS
         # acquisition.  Created unconditionally but greyed out until a
         # finder camera is actually connected via its own Connect button.
+        # Field calibration itself now lives in CalibrationPanel (see its
+        # on_finder_calibration_ready above), alongside the main camera's
+        # own calibration -- this panel keeps the live preview/exposure/
+        # tracking-offset controls only.
         self.finder_panel = FinderCameraPanel(
             self.notebook, self.finder_worker, self.finder_state,
             live_offsets=self.live_offsets,
-            on_calibration_ready=lambda: self.transit_panel.set_finder_correction_available(True),
+            camera_vars=self.finder_camera_vars,
         )
 
         # Plain geometric-shape glyphs (Unicode "Geometric Shapes" block) --
         # unlike pictographic emoji, these render reliably in Tk without
         # depending on a color-emoji font being installed/mapped.
+        #
         self.notebook.add(self.connection_panel, text="◆ Connection")
         self.notebook.add(self.passes_panel, text="▲ Passes")
-        self.notebook.add(self.calibration_panel, text="⊙ Calibration")
         self.notebook.add(self.alignment_panel, text="✦ Alignment")
+        self.notebook.add(self.calibration_panel, text="⊙ Calibration")
         self.notebook.add(self.exposure_panel, text="▣ Exposure calc")
-        self.notebook.add(self.transit_panel, text="◎ Transit")
         self.notebook.add(self.finder_panel, text="🔭 Finder")
+        self.notebook.add(self.transit_panel, text="◎ Transit")
+        # SER player is a standalone review tool (plays back a recorded
+        # file, no live device/session state involved) -- kept rightmost,
+        # separated from the live-tracking workflow tabs before it.
         self.notebook.add(self.ser_player_panel, text="▶ SER player")
 
         self._panels = [self.connection_panel]
@@ -197,6 +223,7 @@ class App:
             self.finder_worker,
             self.finder_state,
             on_sync=lambda ra, dec: self.worker.sync(ra / 15.0, dec),
+            camera_vars=self.finder_camera_vars,
         )
         self.finder_window.withdraw()
 
@@ -267,7 +294,14 @@ class App:
     def _on_pass_selected(self, trajectory, window, crossings, site, satellite_name) -> None:
         self.transit_panel.set_trajectory(trajectory, window, crossings, site, satellite_name)
         self.exposure_panel.set_pass(trajectory, window)
-        self.calibration_panel.set_trajectory(trajectory)
+        # CalibrationPanel no longer gets the trajectory here -- selecting
+        # a pass can happen hours before it starts, and its own auto-guide
+        # correction needs the trajectory ACTUALLY being tracked right
+        # now, not just whichever pass is selected (see TransitPanel.
+        # _active_trajectory's own comment). Wired instead from
+        # TransitPanel's own Start/Simulate/stop handling, via
+        # on_tracking_trajectory_changed in this file's own constructor
+        # wiring above.
         self.alignment_panel.set_trajectory(trajectory, window, satellite_name)
 
     def _on_mount_position(self, ra_deg: float, dec_deg: float) -> None:
@@ -364,6 +398,7 @@ class App:
                 # corrections mid-pass (see FinderState.reset_blob).
                 self.finder_state.reset_blob()
             self.connection_panel.handle_finder_camera_event(event)
+            self.calibration_panel.handle_finder_camera_event(event)
             self.finder_panel.handle_camera_event(event)
             self.finder_window.handle_camera_event(event)
 

@@ -9,12 +9,13 @@ closes.
 
 from __future__ import annotations
 
+import math
 import tkinter as tk
 from tkinter import ttk
 
 import numpy as np
 
-from am5.gui.panels import format_exposure_us, show_frame_on_canvas
+from am5.gui.panels import CameraControlVars, show_frame_on_canvas
 from am5.gui.theme import PALETTE
 from camera.finder import MAX_FINDER_EXPOSURE_US, FinderState
 from camera.platesolve import PlateSolver
@@ -24,6 +25,12 @@ from camera.worker import CameraEvent, CameraWorker, pgm_to_array
 class FinderWindow(tk.Toplevel):
     """Floating live view of the finder camera + plate-solve / sync."""
 
+    # Same ASI 678MM-ish defaults as FinderCameraPanel's own (see its
+    # FINDER_DEFAULT_EXPOSURE_US/FINDER_DEFAULT_GAIN) -- used only when no
+    # shared camera_vars is passed in (tests, or a standalone window).
+    DEFAULT_EXPOSURE_US = 50000.0
+    DEFAULT_GAIN = 100.0
+
     def __init__(
         self,
         parent: tk.Misc,
@@ -31,6 +38,7 @@ class FinderWindow(tk.Toplevel):
         finder_state: FinderState,
         on_sync,                        # callable(ra_deg, dec_deg) → MountWorker.sync(...)
         fov_deg_var: tk.StringVar | None = None,
+        camera_vars: CameraControlVars | None = None,
     ):
         super().__init__(parent)
         self.title("Finder camera — live view")
@@ -48,6 +56,14 @@ class FinderWindow(tk.Toplevel):
         self._photo: tk.PhotoImage | None = None
         self._camera_controls: list[str] = []  # control names reported at connection
         self._connected = False
+        # Shared with FinderCameraPanel (see App) so the two sliders show
+        # and drive the exact same value instead of two copies that only
+        # agreed at connect time and silently drifted apart afterwards --
+        # confirmed as a real, reported bug (same class CameraControlVars
+        # was originally built to fix for the main camera).
+        self._camera_vars = camera_vars if camera_vars is not None else CameraControlVars.create(
+            self.DEFAULT_EXPOSURE_US, self.DEFAULT_GAIN,
+        )
 
         # -- header status --
         self._status_var = tk.StringVar(value="Finder not connected -- connect in the Connection tab")
@@ -56,32 +72,26 @@ class FinderWindow(tk.Toplevel):
         )
 
         # -- exposure / gain sliders (same log-scale approach as main camera) --
-        import math as _math
-        self._exp_log = tk.DoubleVar(value=_math.log10(50000))  # 50ms default, ASI 678MM
-        self._exp_label = tk.StringVar(value=format_exposure_us(50000))
-        self._gain_var = tk.DoubleVar(value=100)
-        self._gain_label = tk.StringVar(value="100")
-
         ctrl_frame = ttk.LabelFrame(self, text="Exposure / gain", padding=6)
         ctrl_frame.pack(fill="x", padx=10, pady=(4, 0))
         exp_row = ttk.Frame(ctrl_frame)
         exp_row.pack(fill="x")
         ttk.Label(exp_row, text="Exp", width=4).pack(side="left")
         self._exp_scale = ttk.Scale(
-            exp_row, from_=1.5, to=_math.log10(MAX_FINDER_EXPOSURE_US), variable=self._exp_log, state="disabled",
+            exp_row, from_=1.5, to=math.log10(MAX_FINDER_EXPOSURE_US), variable=self._camera_vars.exposure_log, state="disabled",
             command=lambda _v: self._on_slider_change(),
         )
         self._exp_scale.pack(side="left", fill="x", expand=True, padx=(4, 4))
-        ttk.Label(exp_row, textvariable=self._exp_label, width=10).pack(side="left")
+        ttk.Label(exp_row, textvariable=self._camera_vars.exposure_value, width=10).pack(side="left")
         gain_row = ttk.Frame(ctrl_frame)
         gain_row.pack(fill="x", pady=(2, 0))
         ttk.Label(gain_row, text="Gain", width=4).pack(side="left")
         self._gain_scale = ttk.Scale(
-            gain_row, from_=0, to=570, variable=self._gain_var, state="disabled",
+            gain_row, from_=0, to=570, variable=self._camera_vars.gain, state="disabled",
             command=lambda _v: self._on_slider_change(),
         )
         self._gain_scale.pack(side="left", fill="x", expand=True, padx=(4, 4))
-        ttk.Label(gain_row, textvariable=self._gain_label, width=6).pack(side="left")
+        ttk.Label(gain_row, textvariable=self._camera_vars.gain_value, width=6).pack(side="left")
 
         # -- live preview canvas --
         self._canvas = tk.Canvas(self, bg="black", highlightthickness=0)
@@ -126,16 +136,18 @@ class FinderWindow(tk.Toplevel):
     # Public -- called from App._pump_events
 
     def _on_slider_change(self) -> None:
-        self._exp_label.set(format_exposure_us(10 ** self._exp_log.get()))
-        self._gain_label.set(str(round(self._gain_var.get())))
+        # exposure_value/gain_value's own display text updates via
+        # CameraControlVars' trace, regardless of which slider (this
+        # window's or FinderCameraPanel's) changed the value -- nothing
+        # to do here beyond pushing the new setting to the camera.
         if self._connected:
             self._apply_camera_settings()
 
     def _apply_camera_settings(self) -> None:
         if not self._connected:
             return
-        exp_us = round(10 ** self._exp_log.get())
-        gain = round(self._gain_var.get())
+        exp_us = round(10 ** self._camera_vars.exposure_log.get())
+        gain = round(self._camera_vars.gain.get())
         self._finder_worker.set_exposure_us(exp_us)
         self._finder_worker.set_gain(gain)
 

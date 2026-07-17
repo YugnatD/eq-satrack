@@ -3,7 +3,7 @@ import tkinter as tk
 
 import pytest
 
-from spectro.gui.panels import AcquisitionPanel, AlignmentPanel, _FULL_FRAME_DISPLAY_MAX_DIM
+from spectro.gui.panels import AcquisitionPanel, AlignmentPanel, TargetPanel, _FULL_FRAME_DISPLAY_MAX_DIM
 
 
 def _tk_available() -> bool:
@@ -24,8 +24,9 @@ class _ConnectionPanelStub:
     synthetic-frame path, everything else about a real ConnectionPanel is
     irrelevant here."""
 
-    def __init__(self, dimensions: tuple[int, int]):
+    def __init__(self, dimensions: tuple[int, int] = (0, 0), site: tuple[float, float, float] = (46.18, 6.14, 400.0)):
         self._dimensions = dimensions
+        self._site = site
 
     def get_sensor_dimensions(self):
         return self._dimensions
@@ -35,6 +36,15 @@ class _ConnectionPanelStub:
 
     def get_dispersion_a_per_px(self):
         return None
+
+    def get_site_lat_deg(self):
+        return self._site[0]
+
+    def get_site_lon_deg(self):
+        return self._site[1]
+
+    def get_site_elevation_m(self):
+        return self._site[2]
 
 
 class _Event:
@@ -139,3 +149,51 @@ def test_downsample_is_a_no_op_below_the_display_cap(root):
     panel._redraw_current()
     displayed = panel._ax.get_images()[0].get_array()
     assert displayed.shape == (480, 640)
+
+
+def test_target_panel_reads_the_live_site_from_connection_panel(root):
+    # Real bug: TargetPanel used to hardcode its own site lat/lon/elevation
+    # instead of reading ConnectionPanel's real, user-editable fields --
+    # unlike AlignmentPanel/AcquisitionPanel/ReductionPanel, which all take
+    # a connection_panel reference and call its live getters (see
+    # _current_site's own docstring). Changing the site in Connection tab
+    # must actually reach the standard-star search and altitude chart.
+    stub = _ConnectionPanelStub(site=(12.5, -34.5, 100.0))
+    panel = TargetPanel(root, connection_panel=stub)
+    assert panel._current_site() == (12.5, -34.5, 100.0)
+
+
+def test_target_panel_falls_back_to_defaults_without_a_connection_panel(root):
+    panel = TargetPanel(root, connection_panel=None)
+    assert panel._current_site() == (
+        TargetPanel._SITE_LAT_DEG, TargetPanel._SITE_LON_DEG, TargetPanel._SITE_ELEVATION_M,
+    )
+
+
+def test_target_panel_search_uses_the_live_site_not_the_hardcoded_default(root, monkeypatch):
+    stub = _ConnectionPanelStub(site=(12.5, -34.5, 100.0))
+    panel = TargetPanel(root, connection_panel=stub)
+
+    seen_sites = []
+
+    def fake_resolve_target(name):
+        from spectro.catalog import Star
+        return Star(name=name, ra_deg=10.0, dec_deg=20.0, vmag=5.0, spectral_type="G2V")
+
+    def fake_find_standard_candidates(target, lat_deg, lon_deg, elevation_m):
+        seen_sites.append((lat_deg, lon_deg, elevation_m))
+        return []
+
+    monkeypatch.setattr("spectro.gui.panels.resolve_target", fake_resolve_target)
+    monkeypatch.setattr("spectro.gui.panels.find_standard_candidates", fake_find_standard_candidates)
+
+    panel._search_var.set("Regulus")
+    panel._on_search()
+    # _search_thread runs on a background thread -- give it a moment, then
+    # drain the same way _poll_results does.
+    for _ in range(50):
+        if seen_sites:
+            break
+        time.sleep(0.02)
+
+    assert seen_sites == [(12.5, -34.5, 100.0)]

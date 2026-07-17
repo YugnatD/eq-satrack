@@ -21,6 +21,7 @@ from am5.gui.panels import (
     MAX_TRACKING_DURATION_S,
     AlignmentPanel,
     AlignmentSkyMapWidget,
+    CameraControlVars,
     ConnectionPanel,
     ExposurePanel,
     CalibrationPanel,
@@ -34,11 +35,12 @@ from am5.gui.panels import (
     _sanitize_filename,
     visible_named_stars,
 )
+from am5.gui.finder_window import FinderWindow
 from am5.gui.worker import MountWorker, WorkerEvent
 from am5.optics import OpticalTrain
-from am5.tracker import AxisSigns, LiveOffsets
+from am5.tracker import AxisSigns, LiveOffsets, _perp_rate_components
 from camera.finder import FinderCalibration, FinderState
-from camera.guiding import BlobDetection, GuidingCalibration
+from camera.guiding import BlobDetection, GuidingCalibration, calibrate_from_nudges
 from camera.worker import CameraEvent, CameraWorker, frame_to_pgm
 
 # Same fixed, network-free TLE as tests/test_ephemeris.py.
@@ -148,22 +150,185 @@ def test_tracking_tick_event_does_not_crash_the_event_pump(panel):
     panel.handle_mount_event(event)  # must not raise
 
 
-def test_maybe_apply_finder_correction_triggers_a_perp_pulse_when_enabled_and_off_target(panel):
+def test_maybe_apply_finder_correction_requires_the_main_cameras_own_sky_calibration(panel):
+    # A finder-to-main geometric calibration alone isn't enough -- see
+    # FinderState.main_calibration's own field docstring. Without it,
+    # get_correction_arcsec returns None and nothing should trigger, even
+    # with a blob locked and the checkbox on.
     state = FinderState()
-    state.calibration = FinderCalibration(calibrated=True)  # offset_row/col=0, plate_scale_ratio=1, rotation=0
+    state.calibration = FinderCalibration(calibrated=True)
     state.blob_found = True
-    state.last_blob_row = 100.0  # frame centre row -- no along-track component
-    state.last_blob_col = 250.0  # 100px right of frame centre (300-wide) -- clear cross-track offset
+    state.last_blob_row = 100.0
+    state.last_blob_col = 250.0
     state.last_frame = np.zeros((200, 300), dtype=np.uint8)
     panel._finder_state = state
     panel._finder_correct_var.set(True)
+    panel._active_trajectory = _guiding_trajectory()
 
     triggered = []
     panel._offsets.trigger_perp_pulse = lambda sign, **kw: triggered.append(sign)
 
     panel._maybe_apply_finder_correction()
 
-    assert triggered == [1.0]
+    assert triggered == []
+
+
+def test_maybe_apply_finder_correction_points_toward_the_target_not_away(panel):
+    # Same regression class as CalibrationPanel._maybe_apply_auto_guide_
+    # correction's own fix: verify the DIRECTION of the correction, not
+    # just that something fired. Chains a real finder-to-main calibration
+    # (identity: offset=0, ratio=1, rotation=0, so finder px == main px)
+    # through a real nudge-derived main-camera GuidingCalibration (same
+    # setup as the auto-guide regression test), and confirms the resulting
+    # perp pulse's rate correction actually reduces -- not increases -- the
+    # boresight's lag behind the target.
+    state = FinderState()
+    state.calibration = FinderCalibration(calibrated=True)
+    state.blob_found = True
+    finder_h, finder_w = 200, 300
+    state.last_frame = np.zeros((finder_h, finder_w), dtype=np.uint8)
+    # 10px east of centre -- with an identity finder-to-main mapping, this
+    # is exactly a main-camera dx_px=10, dy_px=0 offset from main centre.
+    state.last_blob_row = finder_h / 2.0
+    state.last_blob_col = finder_w / 2.0 + 10.0
+    state.set_main_calibration(calibrate_from_nudges(10.0, -10.0, 0.0, 10.0, 0.0, -10.0))
+    panel._finder_state = state
+    panel._finder_correct_var.set(True)
+
+    n = 10
+    t_unix = time.time() + np.linspace(-5, 5, n)
+    panel._active_trajectory = Trajectory(
+        t_unix=t_unix, ra_deg=np.zeros(n), dec_deg=np.zeros(n),
+        dra_dt_deg_s=np.zeros(n), ddec_dt_deg_s=np.full(n, 0.001),
+        alt_deg=np.full(n, 45.0), az_deg=np.full(n, 180.0), ha_hours=np.zeros(n),
+        distance_km=np.full(n, 500.0),
+    )
+
+    triggered = []
+    panel._offsets.trigger_perp_pulse = lambda sign, **kw: triggered.append(sign)
+
+    panel._maybe_apply_finder_correction()
+
+    assert len(triggered) == 1
+    extra_dra_dt, _ = _perp_rate_components(0.0, 0.0, 0.001, triggered[0])
+    assert extra_dra_dt > 0, (
+        "finder correction points away from the target instead of toward it "
+        f"(extra_dra_dt={extra_dra_dt}, should be positive to catch up a lagging boresight)"
+    )
+
+
+def test_maybe_apply_finder_correction_backs_off_once_main_camera_has_a_lock(panel):
+    # Regression: finder correction and main-camera auto-guide used to run
+    # fully independently -- once the ISS drifted into the main camera's
+    # own narrow FOV too, both correctors would fire on the SAME
+    # trigger_perp_pulse from different blob detections at the same time,
+    # fighting each other instead of a clean acquire-then-track handoff.
+    # FinderState.main_blob_locked (set by CalibrationPanel.handle_camera_
+    # event) is how the main camera announces "I've got it now" -- finder
+    # correction must stand down as soon as it's True, using the exact
+    # same otherwise-correcting setup as the sibling "points toward the
+    # target" test above.
+    state = FinderState()
+    state.calibration = FinderCalibration(calibrated=True)
+    state.blob_found = True
+    finder_h, finder_w = 200, 300
+    state.last_frame = np.zeros((finder_h, finder_w), dtype=np.uint8)
+    state.last_blob_row = finder_h / 2.0
+    state.last_blob_col = finder_w / 2.0 + 10.0
+    state.set_main_calibration(calibrate_from_nudges(10.0, -10.0, 0.0, 10.0, 0.0, -10.0))
+    state.set_main_blob_locked(True)
+    panel._finder_state = state
+    panel._finder_correct_var.set(True)
+
+    n = 10
+    t_unix = time.time() + np.linspace(-5, 5, n)
+    panel._active_trajectory = Trajectory(
+        t_unix=t_unix, ra_deg=np.zeros(n), dec_deg=np.zeros(n),
+        dra_dt_deg_s=np.zeros(n), ddec_dt_deg_s=np.full(n, 0.001),
+        alt_deg=np.full(n, 45.0), az_deg=np.full(n, 180.0), ha_hours=np.zeros(n),
+        distance_km=np.full(n, 500.0),
+    )
+
+    triggered = []
+    panel._offsets.trigger_perp_pulse = lambda sign, **kw: triggered.append(sign)
+
+    panel._maybe_apply_finder_correction()
+
+    assert triggered == []
+
+
+def test_maybe_apply_finder_correction_skips_outside_the_trajectorys_active_window(panel):
+    # Same class of bug as CalibrationPanel's own sibling test -- outside
+    # the trajectory's active window, interpolate() zeroes dra_dt/ddec_dt,
+    # and decompose_error's zero-speed branch returns an always-non-
+    # negative magnitude instead of a signed cross-track error, which used
+    # to become an always-negative "correction" regardless of the true
+    # error direction. A pass selected well in advance (finder correction
+    # doesn't require tracking to have started at all) is exactly this
+    # scenario.
+    state = FinderState()
+    state.calibration = FinderCalibration(calibrated=True)
+    state.blob_found = True
+    finder_h, finder_w = 200, 300
+    state.last_frame = np.zeros((finder_h, finder_w), dtype=np.uint8)
+    state.last_blob_row = finder_h / 2.0
+    state.last_blob_col = finder_w / 2.0 + 10.0
+    state.set_main_calibration(calibrate_from_nudges(10.0, -10.0, 0.0, 10.0, 0.0, -10.0))
+    panel._finder_state = state
+    panel._finder_correct_var.set(True)
+
+    n = 10
+    t_unix = time.time() + np.linspace(100.0, 200.0, n)  # starts 100s in the future
+    panel._active_trajectory = Trajectory(
+        t_unix=t_unix, ra_deg=np.zeros(n), dec_deg=np.zeros(n),
+        dra_dt_deg_s=np.zeros(n), ddec_dt_deg_s=np.full(n, 0.001),
+        alt_deg=np.full(n, 45.0), az_deg=np.full(n, 180.0), ha_hours=np.zeros(n),
+        distance_km=np.full(n, 500.0),
+    )
+
+    triggered = []
+    panel._offsets.trigger_perp_pulse = lambda sign, **kw: triggered.append(sign)
+
+    panel._maybe_apply_finder_correction()
+
+    assert triggered == []
+
+
+def test_calibration_panel_reports_main_blob_lock_only_when_auto_guide_enabled_and_found():
+    # The other half of the handoff: CalibrationPanel is the one deciding
+    # whether the main camera "has it" -- must only report locked when
+    # auto-guiding is BOTH enabled AND actually seeing the ISS, not just
+    # blob.found on its own, so finder correction stays in sole control
+    # when the operator hasn't turned auto-guiding on at all (even if the
+    # main camera happens to also see the ISS).
+    root = tk.Tk()
+    root.withdraw()
+    mount_worker = MountWorker()
+    camera_worker = CameraWorker()
+    finder_state = FinderState()
+    auto_guide_var = tk.BooleanVar(value=False)
+    try:
+        p = CalibrationPanel(
+            root, mount_worker, camera_worker, LiveOffsets(),
+            finder_state=finder_state, auto_guide_var=auto_guide_var,
+        )
+        frame = np.full((60, 80), 15, dtype=np.uint8)
+        frame[25:35, 55:65] = 220  # a bright synthetic ISS blob
+
+        p.handle_camera_event(CameraEvent(kind="preview_frame", payload={"pgm": frame_to_pgm(frame), "width": 80, "height": 60}))
+        assert finder_state.main_blob_locked is False  # auto-guide still off
+
+        auto_guide_var.set(True)
+        p.handle_camera_event(CameraEvent(kind="preview_frame", payload={"pgm": frame_to_pgm(frame), "width": 80, "height": 60}))
+        assert finder_state.main_blob_locked is True
+
+        blank = np.full((60, 80), 15, dtype=np.uint8)  # no blob this time
+        p.handle_camera_event(CameraEvent(kind="preview_frame", payload={"pgm": frame_to_pgm(blank), "width": 80, "height": 60}))
+        assert finder_state.main_blob_locked is False
+    finally:
+        mount_worker.shutdown()
+        camera_worker.shutdown()
+        root.destroy()
 
 
 def test_maybe_apply_finder_correction_does_nothing_when_checkbox_unchecked(panel):
@@ -182,6 +347,44 @@ def test_maybe_apply_finder_correction_does_nothing_when_checkbox_unchecked(pane
     panel._maybe_apply_finder_correction()
 
     assert triggered == []
+
+
+def test_on_simulate_click_propagates_the_shifted_trajectory_to_calibration_panel(tmp_path):
+    # Regression: _on_simulate_click computes its own time-shifted
+    # trajectory (real geometry, relabeled to start "now") but used to
+    # only ever hand it to the tracking loop itself -- both this panel's
+    # own _maybe_apply_finder_correction and CalibrationPanel's auto-guide
+    # correction kept reading the ORIGINAL, unshifted, real-future
+    # trajectory, which never overlapped real "now" during a Simulate
+    # run. Confirmed directly (real mount + mock camera + Simulate track
+    # + both correction checkboxes on): no correction ever applied.
+    root = tk.Tk()
+    root.withdraw()
+    mount_worker = MountWorker()
+    camera_worker = CameraWorker()
+    captured = []
+    try:
+        p = TransitPanel(
+            root, mount_worker, camera_worker, tmp_path,
+            on_tracking_trajectory_changed=captured.append,
+        )
+        _select_a_pass(p)  # a real, past-relative-to-now pass -- needs shifting to overlap "now"
+        p._mount_worker.start_tracking = lambda *a, **kw: None
+
+        p._on_simulate_click()
+
+        assert len(captured) == 1
+        shifted = captured[0]
+        assert shifted is not None
+        now = time.time()
+        assert shifted.t_unix[0] <= now <= shifted.t_unix[-1], (
+            "the trajectory propagated to CalibrationPanel doesn't overlap real 'now' -- "
+            "it's the original unshifted trajectory, not Simulate's own shifted copy"
+        )
+    finally:
+        mount_worker.shutdown()
+        camera_worker.shutdown()
+        root.destroy()
 
 
 def test_check_pass_timing_allows_starting_hours_early(panel):
@@ -779,6 +982,80 @@ def test_jog_goto_click_does_not_re_enable_start_if_never_armed(panel):
     assert str(panel._start_button["state"]) == "disabled"
 
 
+def test_mount_goto_click_disables_start_and_simulate_until_it_arrives(panel):
+    # Sibling bug to test_jog_goto_click_disables_start_and_simulate_
+    # until_it_completes above, found via cross-referencing every
+    # WorkerEvent kind against every listener: the native mount-GOTO
+    # button (_on_mount_goto_click) re-enabled Start/Simulate on
+    # "goto_result", which MountWorker emits IMMEDIATELY once :MS# is
+    # ACCEPTED (code 0) -- well before the mount has actually arrived
+    # (_poll_until_arrived keeps running for up to GOTO_POLL_TIMEOUT_S
+    # afterward). That let an operator click Start/Simulate while the
+    # real GOTO was still converging -- exactly the incident class
+    # _disable_goto_buttons exists to prevent, just via the other GOTO
+    # button. The real "done" signals are goto_arrived/goto_timeout.
+    _select_a_pass(panel)
+    panel.set_mount_connected(True)
+    panel._on_arm_click()
+    assert str(panel._start_button["state"]) == "normal"
+    assert str(panel._simulate_button["state"]) == "normal"
+
+    panel._mount_worker.goto = lambda *a, **kw: None
+    panel._on_mount_goto_click()
+    assert str(panel._mount_goto_button["state"]) == "disabled"
+    assert str(panel._arm_button["state"]) == "disabled"
+    assert str(panel._start_button["state"]) == "disabled"
+    assert str(panel._simulate_button["state"]) == "disabled"
+
+    # code=0 -- accepted, now slewing -- must NOT re-enable yet.
+    panel.handle_mount_event(WorkerEvent("goto_result", {"code": 0, "meaning": "slewing"}))
+    assert str(panel._mount_goto_button["state"]) == "disabled"
+    assert str(panel._start_button["state"]) == "disabled"
+
+    # The real completion signal.
+    panel.handle_mount_event(WorkerEvent("goto_arrived", {"ra_hours": 1.0, "dec_deg": 45.0}))
+    assert str(panel._mount_goto_button["state"]) == "normal"
+    assert str(panel._arm_button["state"]) == "normal"
+    assert str(panel._simulate_button["state"]) == "normal"
+    assert str(panel._start_button["state"]) == "normal"  # was armed before the GOTO
+
+
+def test_mount_goto_rejection_re_enables_immediately_no_polling_happens(panel):
+    # code != 0 (below horizon, altitude limit, e7 not-synced, ...) means
+    # the mount refused the target outright -- MountWorker never starts
+    # polling in that case, so goto_result IS the final word here and
+    # must re-enable right away, not wait for a goto_arrived/goto_timeout
+    # that will never come.
+    _select_a_pass(panel)
+    panel.set_mount_connected(True)
+    panel._mount_worker.goto = lambda *a, **kw: None
+    panel._on_mount_goto_click()
+    assert str(panel._mount_goto_button["state"]) == "disabled"
+
+    panel.handle_mount_event(WorkerEvent("goto_result", {"code": 1, "meaning": "below horizon"}))
+    assert str(panel._mount_goto_button["state"]) == "normal"
+    assert str(panel._arm_button["state"]) == "normal"
+    assert str(panel._simulate_button["state"]) == "normal"
+
+
+def test_mount_goto_timeout_also_re_enables(panel):
+    # goto_timeout: the mount accepted the target but never settled
+    # within GOTO_POLL_TIMEOUT_S -- still a terminal state, must not
+    # leave the operator stuck with every GOTO/Start/Simulate button
+    # disabled forever.
+    _select_a_pass(panel)
+    panel.set_mount_connected(True)
+    panel._mount_worker.goto = lambda *a, **kw: None
+    panel._on_mount_goto_click()
+    panel.handle_mount_event(WorkerEvent("goto_result", {"code": 0, "meaning": "slewing"}))
+    assert str(panel._mount_goto_button["state"]) == "disabled"
+
+    panel.handle_mount_event(WorkerEvent("goto_timeout", {"timeout_s": 15.0}))
+    assert str(panel._mount_goto_button["state"]) == "normal"
+    assert str(panel._arm_button["state"]) == "normal"
+    assert str(panel._simulate_button["state"]) == "normal"
+
+
 def test_training_error_checkbox_enables_only_when_the_connected_mount_is_mock(panel):
     assert str(panel._training_error_check["state"]) == "disabled"
 
@@ -996,6 +1273,105 @@ def test_alignment_panel_selecting_a_star_enables_goto_and_sync(alignment_panel)
     assert str(p._sync_button["state"]) == "normal"
 
 
+def test_alignment_panel_goto_click_uses_native_mount_goto_not_jog_goto(alignment_panel):
+    # Regression: this button used jog_goto, whose own divergence guard is
+    # documented (am5.angles.angular_separation_deg's docstring) as meant
+    # for short, close-in final-approach corrections -- not an arbitrary-
+    # distance slew to a freshly-selected star anywhere on the sky map,
+    # exactly this button's use case. Native goto (:MS#, firmware-driven
+    # pier side) is the right tool here, same as TransitPanel's own
+    # "GOTO (mount, auto pier side)" button.
+    p = alignment_panel
+    p.set_connected(True)
+    star, _az, _alt = p._sky_map._stars[0]
+    p._on_star_selected(star)
+
+    called = []
+    p._mount_worker.goto = lambda ra, dec: called.append((ra, dec))
+    p._mount_worker.jog_goto = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not use jog_goto"))
+
+    p._on_goto_click()
+
+    assert called == [(star.ra_hours, star.dec_deg)]
+
+
+def test_alignment_panel_goto_stays_disabled_until_arrived_not_just_accepted(alignment_panel):
+    # Regression: goto_result's code==0 means ACCEPTED and slewing, not
+    # arrived -- _poll_until_arrived keeps running well after this event
+    # fires. Re-enabling here unconditionally would let the operator
+    # click GOTO again while the mount is still converging on the first
+    # target (same incident class as TransitPanel's own goto_result fix).
+    p = alignment_panel
+    p.set_connected(True)
+    star, _az, _alt = p._sky_map._stars[0]
+    p._on_star_selected(star)
+    p._mount_worker.goto = lambda *a, **kw: None
+
+    p._on_goto_click()
+    assert str(p._goto_button["state"]) == "disabled"
+
+    p.handle_mount_event(WorkerEvent("goto_result", {"code": 0, "meaning": "slewing"}))
+    assert str(p._goto_button["state"]) == "disabled"
+
+    p.handle_mount_event(WorkerEvent("goto_arrived", {"ra_hours": star.ra_hours, "dec_deg": star.dec_deg}))
+    assert str(p._goto_button["state"]) == "normal"
+
+
+def test_alignment_panel_goto_rejection_re_enables_immediately(alignment_panel):
+    p = alignment_panel
+    p.set_connected(True)
+    star, _az, _alt = p._sky_map._stars[0]
+    p._on_star_selected(star)
+    p._mount_worker.goto = lambda *a, **kw: None
+
+    p._on_goto_click()
+    p.handle_mount_event(WorkerEvent("goto_result", {"code": 1, "meaning": "below horizon"}))
+
+    assert str(p._goto_button["state"]) == "normal"
+
+
+def test_alignment_panel_selecting_a_different_star_mid_goto_does_not_re_enable(alignment_panel):
+    # Regression: _on_star_selected calls _refresh_widget_states() on
+    # every sky-map click -- before _goto_in_progress existed, that
+    # unconditionally re-derived the button's state from connected/
+    # parked/has_star alone, so picking a different star while a GOTO was
+    # still slewing re-enabled the button and let a second, overlapping
+    # GOTO fire on top of the first.
+    p = alignment_panel
+    p.set_connected(True)
+    star_a, _az, _alt = p._sky_map._stars[0]
+    p._on_star_selected(star_a)
+    p._mount_worker.goto = lambda *a, **kw: None
+    p._on_goto_click()
+    assert str(p._goto_button["state"]) == "disabled"
+
+    star_b = p._sky_map._stars[1][0] if len(p._sky_map._stars) > 1 else star_a
+    p._on_star_selected(star_b)
+
+    assert str(p._goto_button["state"]) == "disabled"
+
+
+def test_alignment_panel_disconnect_mid_goto_resets_stuck_in_progress_flag(alignment_panel):
+    # Regression: same class of bug as CalibrationPanel's own _calib_step
+    # disconnect reset -- a disconnect mid-GOTO left _goto_in_progress
+    # stuck True forever, leaving the button disabled even after
+    # reconnecting, with no recovery short of restarting the app.
+    p = alignment_panel
+    p.set_connected(True)
+    star, _az, _alt = p._sky_map._stars[0]
+    p._on_star_selected(star)
+    p._mount_worker.goto = lambda *a, **kw: None
+    p._on_goto_click()
+    assert p._goto_in_progress is True
+
+    p.set_connected(False)
+    assert p._goto_in_progress is False
+
+    p.set_connected(True)
+    p._on_star_selected(star)
+    assert str(p._goto_button["state"]) == "normal"
+
+
 def test_alignment_panel_sync_button_ignores_disconnected_state_for_sync_only(alignment_panel):
     # Sync never moves the mount -- only needs a connection, not an
     # unparked state (mirrors JogWindow's own sync button).
@@ -1066,11 +1442,16 @@ def test_alignment_panel_turning_off_alignment_mode_asks_for_confirmation(alignm
 
 
 class _FakeSolveResult:
-    def __init__(self, ra_deg: float, dec_deg: float, success: bool = True, message: str = ""):
+    def __init__(
+        self, ra_deg: float, dec_deg: float, success: bool = True, message: str = "",
+        pixel_scale_arcsec: float = 1.72, field_rotation_deg: float = 0.0,
+    ):
         self.success = success
         self.ra_deg = ra_deg
         self.dec_deg = dec_deg
         self.message = message
+        self.pixel_scale_arcsec = pixel_scale_arcsec
+        self.field_rotation_deg = field_rotation_deg
 
 
 def test_polar_alignment_reads_frame_and_scale_from_the_selected_camera(alignment_panel):
@@ -1189,6 +1570,33 @@ def test_polar_alignment_full_workflow_computes_a_result(alignment_panel, monkey
     assert jog_calls.count(("stop", "e")) == 2
     assert str(p._polar_start_button["state"]) == "normal"
 
+    # The KStars-PAA-style correction overlay (axis / az-corrected point /
+    # true pole, each a (delta_col, delta_row) pixel offset) is populated
+    # once the measurement completes.
+    assert p._polar_overlay is not None
+    assert len(p._polar_overlay) == 3
+    for delta_col, delta_row in p._polar_overlay:
+        assert isinstance(delta_col, float)
+        assert isinstance(delta_row, float)
+
+
+def test_polar_alignment_overlay_is_cleared_at_the_start_of_a_new_run(alignment_panel, monkeypatch):
+    p = alignment_panel
+    p.set_connected(True)
+    p._finder_state.last_frame = np.zeros((10, 10), dtype=np.uint8)
+    p._finder_state.finder_plate_scale_arcsec = 5.0
+    p._polar_overlay = ((1.0, 2.0), (3.0, 4.0), (5.0, 6.0))  # stale, from a previous run
+
+    monkeypatch.setattr(
+        p._solvers[p._solver_engine_var.get()], "solve_async",
+        lambda frame, widget, on_done, **kw: on_done(_FakeSolveResult(0.0, 0.0, success=False, message="no stars")),
+    )
+    p._polar_rotation_deg_var.set("30")
+    p._polar_rate_var.set("150")
+    p._on_polar_start_click()
+
+    assert p._polar_overlay is None
+
 
 def _pass_trajectory(n: int = 20) -> Trajectory:
     # A simple rise-to-set arc: azimuth sweeps 90->270 while altitude rises
@@ -1241,6 +1649,22 @@ def _blob(x: float, y: float, found: bool = True) -> BlobDetection:
     return BlobDetection(found=found, centroid_x=x, centroid_y=y, peak_value=200.0, pixel_count=20)
 
 
+def _make_camera_calibration_tab_visible(panel):
+    """handle_camera_event/handle_finder_camera_event now skip building the
+    preview PhotoImage while their pane isn't actually mapped (see the real
+    gate's own rationale -- a ttk.Notebook only maps the selected page's
+    widgets, and CalibrationPanel's preview panes live inside its nested
+    "Camera calibration" sub-tab specifically). Tests that assert on the
+    rendered preview need the panel actually packed, visible, and on the
+    right sub-tab -- not the usual root.withdraw() headless setup every
+    other test in this file relies on."""
+    root = panel.winfo_toplevel()
+    root.deiconify()
+    panel.pack()
+    panel._sub_notebook.select(1)  # "Camera calibration"
+    root.update()
+
+
 def test_calibration_panel_calibrate_refuses_without_a_detected_blob(calibration_panel):
     calibration_panel._latest_radec = (3.0, 45.0)
     calibration_panel._latest_blob = None
@@ -1274,6 +1698,65 @@ def test_calibration_panel_calibration_sequence_produces_valid_matrix(calibratio
     assert p._calibration.arcsec_per_pixel > 0
     assert p.calibration_ready_calls == [True]
     assert "Calibrated" in p._calib_status_var.get()
+
+
+def test_calibration_panel_sibling_motion_buttons_disabled_during_guiding_calibration(calibration_panel):
+    # Regression: _axis_calibrate_button and _lag_measure_button used to
+    # stay clickable while the RA/DEC guiding-calibration nudge sequence
+    # was actively jogging the mount -- both drive their own mount motion
+    # with no guard against an in-progress jog (see _handle_calibrate/
+    # _handle_measure_mount_lag in worker.py), so a click mid-nudge could
+    # queue a second motion command that runs on the worker thread while
+    # the guiding-calibration nudge is still physically moving the mount.
+    p = calibration_panel
+    p.set_connected(True)
+    p._latest_radec = (3.0, 45.0)
+    p._latest_blob = _blob(100.0, 100.0)
+
+    p._on_calibrate_click()
+    assert p._calib_step == "ra"
+    assert str(p._calibrate_button["state"]) == "disabled"
+    assert str(p._axis_calibrate_button["state"]) == "disabled"
+    assert str(p._lag_measure_button["state"]) == "disabled"
+
+    p._latest_radec = (3.0 + (10.0 / 3600.0) / 15.0, 45.0)  # +10 arcsec RA
+    p._latest_blob = _blob(140.0, 100.0)
+    p._calib_ra_measure()
+    assert p._calib_step == "dec"
+    assert str(p._axis_calibrate_button["state"]) == "disabled"
+    assert str(p._lag_measure_button["state"]) == "disabled"
+
+    p._latest_radec = (p._latest_radec[0], 45.0 + 8.0 / 3600.0)  # +8 arcsec DEC
+    p._latest_blob = _blob(140.0, 130.0)
+    p._calib_dec_measure()
+
+    assert p._calib_step is None
+    assert str(p._calibrate_button["state"]) == "normal"
+    assert str(p._axis_calibrate_button["state"]) == "normal"
+    assert str(p._lag_measure_button["state"]) == "normal"
+
+
+def test_calibration_panel_disconnect_mid_calibration_resets_stuck_step(calibration_panel):
+    # Regression: _calib_step was never reset on disconnect -- a disconnect
+    # mid-sequence left it stuck at "ra"/"dec" forever, and _on_calibrate_
+    # click's own re-entry guard (`if self._calib_step is not None: return`)
+    # would then silently no-op every future click, even after reconnecting,
+    # with no recovery short of restarting the app.
+    p = calibration_panel
+    p.set_connected(True)
+    p._latest_radec = (3.0, 45.0)
+    p._latest_blob = _blob(100.0, 100.0)
+    p._on_calibrate_click()
+    assert p._calib_step == "ra"
+
+    p.set_connected(False)
+    assert p._calib_step is None
+
+    p.set_connected(True)
+    p._latest_radec = (3.0, 45.0)
+    p._latest_blob = _blob(100.0, 100.0)
+    p._on_calibrate_click()
+    assert p._calib_step == "ra"
 
 
 def test_calibration_panel_calibrate_uses_the_user_configured_nudge_rate_and_duration(calibration_panel):
@@ -1360,7 +1843,7 @@ def test_calibration_panel_auto_guide_corrects_when_blob_off_center(calibration_
     p._calibration = GuidingCalibration(
         px_per_ra_arcsec_x=2.0, px_per_ra_arcsec_y=0.0, px_per_dec_arcsec_x=0.0, px_per_dec_arcsec_y=2.0,
     )
-    p._trajectory = _guiding_trajectory()
+    p._active_trajectory = _guiding_trajectory()
 
     _, perp_before = p._live_offsets.snapshot()
     assert perp_before == 0.0
@@ -1374,15 +1857,102 @@ def test_calibration_panel_auto_guide_ignores_small_offset_within_deadband(calib
     p._calibration = GuidingCalibration(
         px_per_ra_arcsec_x=2.0, px_per_ra_arcsec_y=0.0, px_per_dec_arcsec_x=0.0, px_per_dec_arcsec_y=2.0,
     )
-    p._trajectory = _guiding_trajectory()
+    p._active_trajectory = _guiding_trajectory()
 
     p._maybe_apply_auto_guide_correction((480, 640), _blob(640 / 2 + 1, 480 / 2))
     _, perp = p._live_offsets.snapshot()
     assert perp == 0.0
 
 
+def test_calibration_panel_auto_guide_correction_points_toward_the_target_not_away(calibration_panel):
+    # Regression: _maybe_apply_auto_guide_correction used to feed
+    # decompose_error's raw (actual-target) cross_deg straight into
+    # trigger_perp_pulse's sign. calibrate_from_nudges builds the
+    # calibration from the BLOB's own pixel shift when the MOUNT is
+    # nudged by a known sky amount (target held fixed) -- nudging the
+    # mount +d_ra moves the boresight TOWARD a target ahead of it, so the
+    # blob's measured shift is the pixel image of -d_ra, not +d_ra. That
+    # flips the matrix GuidingCalibration stores, so pixel_to_sky() on a
+    # live frame comes out as (actual - target), not (target - actual) as
+    # the old code assumed -- confirmed by hand and by feeding the real
+    # calibrate_from_nudges/pixel_to_sky/decompose_error/
+    # _perp_rate_components chain a known scenario: the un-negated version
+    # pushed the commanded rate AWAY from the target, which would have
+    # driven the ISS out of frame instead of centering it.
+    p = calibration_panel
+    # Calibrate against a known, simple optical mapping (1 arcsec == 1 px,
+    # no rotation) exactly the way the real "Calibrate camera-to-sky
+    # mapping" flow does: nudge mount by d_ra/d_dec, record the blob's own
+    # resulting pixel shift (target fixed, so the blob moves opposite the
+    # boresight's own motion).
+    d_ra_nudge, d_dec_nudge = 10.0, 10.0
+    p._calibration = calibrate_from_nudges(
+        d_ra_nudge, -d_ra_nudge, 0.0,
+        d_dec_nudge, 0.0, -d_dec_nudge,
+    )
+
+    # dec=0 with velocity purely along DEC makes the "cross" axis align
+    # exactly with RA-tan, so the physically correct correction direction
+    # is unambiguous: a blob 10px east of centre (under this calibration)
+    # is the image of a target 10" AHEAD of the boresight in RA -- the
+    # mount is lagging and needs a POSITIVE extra RA rate to catch up.
+    n = 10
+    t_unix = time.time() + np.linspace(-5, 5, n)
+    p._active_trajectory = Trajectory(
+        t_unix=t_unix, ra_deg=np.zeros(n), dec_deg=np.zeros(n),
+        dra_dt_deg_s=np.zeros(n), ddec_dt_deg_s=np.full(n, 0.001),
+        alt_deg=np.full(n, 45.0), az_deg=np.full(n, 180.0), ha_hours=np.zeros(n),
+        distance_km=np.full(n, 500.0),
+    )
+
+    p._maybe_apply_auto_guide_correction((480, 640), _blob(640 / 2 + 10, 480 / 2))
+
+    _, perp_sign = p._live_offsets.snapshot()
+    assert perp_sign != 0.0
+
+    extra_dra_dt, extra_ddec_dt = _perp_rate_components(0.0, 0.0, 0.001, perp_sign)
+    assert extra_dra_dt > 0, (
+        "auto-guide correction points away from the target instead of toward it "
+        f"(extra_dra_dt={extra_dra_dt}, should be positive to catch up a lagging boresight)"
+    )
+
+
+def test_calibration_panel_auto_guide_skips_outside_the_trajectorys_active_window(calibration_panel):
+    # Regression: outside the trajectory's own [t_unix[0], t_unix[-1]]
+    # window (a pass selected in advance, or tracking started early and
+    # still sitting at the boundary -- both explicitly supported, see
+    # Trajectory.interpolate's own docstring), interpolate() zeroes dra_dt/
+    # ddec_dt. decompose_error's zero-speed branch then returns a bare
+    # magnitude for cross (always >= 0, no directional information --
+    # confirmed by feeding it the same error with the sign flipped and
+    # getting an identical result), which the correction's own negation
+    # turns into an always-negative "correction" regardless of the TRUE
+    # error direction -- a real hazard during an early start, since the
+    # tracking loop IS already consuming LiveOffsets every tick while
+    # sitting at the boundary.
+    p = calibration_panel
+    p._calibration = calibrate_from_nudges(10.0, -10.0, 0.0, 10.0, 0.0, -10.0)
+
+    n = 10
+    t_unix = time.time() + np.linspace(100.0, 200.0, n)  # starts 100s in the future -- "now" is before t_unix[0]
+    p._active_trajectory = Trajectory(
+        t_unix=t_unix, ra_deg=np.zeros(n), dec_deg=np.zeros(n),
+        dra_dt_deg_s=np.zeros(n), ddec_dt_deg_s=np.full(n, 0.001),
+        alt_deg=np.full(n, 45.0), az_deg=np.full(n, 180.0), ha_hours=np.zeros(n),
+        distance_km=np.full(n, 500.0),
+    )
+
+    triggered = []
+    p._live_offsets.trigger_perp_pulse = lambda sign, **kw: triggered.append(sign)
+
+    p._maybe_apply_auto_guide_correction((480, 640), _blob(640 / 2 + 10, 480 / 2))
+
+    assert triggered == []
+
+
 def test_calibration_panel_handle_camera_event_updates_blob_and_preview(calibration_panel):
     p = calibration_panel
+    _make_camera_calibration_tab_visible(p)
     frame = np.full((60, 80), 15, dtype=np.uint8)
     frame[25:35, 55:65] = 220  # a bright synthetic ISS blob
     p.handle_camera_event(CameraEvent(kind="preview_frame", payload={"pgm": frame_to_pgm(frame), "width": 80, "height": 60}))
@@ -1390,6 +1960,88 @@ def test_calibration_panel_handle_camera_event_updates_blob_and_preview(calibrat
     assert p._latest_blob.found is True
     assert p._preview_image is not None
     assert "ISS at pixel" in p._blob_status_var.get()
+
+
+def test_calibration_panel_handle_finder_camera_event_renders_finder_preview():
+    # The Camera calibration sub-tab shows both live feeds side by side
+    # (see _build_camera_calibration_tab) so the operator can run either
+    # calibration without switching tabs -- the finder side is fed via
+    # handle_finder_camera_event (routed from App._pump_events alongside
+    # FinderCameraPanel/FinderWindow's own handlers), not handle_camera_
+    # event (that's the main camera's).
+    root = tk.Tk()
+    root.withdraw()
+    mount_worker = MountWorker()
+    camera_worker = CameraWorker()
+    finder_state = FinderState()
+    try:
+        p = CalibrationPanel(root, mount_worker, camera_worker, LiveOffsets(), finder_state=finder_state)
+        _make_camera_calibration_tab_visible(p)
+        assert p._finder_preview_image is None
+
+        frame = np.full((60, 80), 15, dtype=np.uint8)
+        frame[25:35, 55:65] = 220
+        p.handle_finder_camera_event(CameraEvent(kind="preview_frame", payload={"pgm": frame_to_pgm(frame), "width": 80, "height": 60}))
+
+        assert p._finder_preview_image is not None
+    finally:
+        mount_worker.shutdown()
+        camera_worker.shutdown()
+        root.destroy()
+
+
+def test_calibration_panel_finder_preview_draws_main_camera_fov_rectangle():
+    # Same overlay as FinderCameraPanel's own preview canvas (main
+    # camera's FOV rectangle via FinderState.main_fov_corners_px) --
+    # drawn here too so an operator running "Calibrate fields" from this
+    # tab can see where the main camera's field sits within the finder's
+    # wider view without switching to the Finder tab.
+    root = tk.Tk()
+    root.withdraw()
+    mount_worker = MountWorker()
+    camera_worker = CameraWorker()
+    finder_state = FinderState()
+    try:
+        p = CalibrationPanel(root, mount_worker, camera_worker, LiveOffsets(), finder_state=finder_state)
+        _make_camera_calibration_tab_visible(p)
+        finder_state.calibration = FinderCalibration(
+            calibrated=True, offset_row=0.0, offset_col=0.0, plate_scale_ratio=1.0, rotation_rad=0.0,
+        )
+        finder_state.main_sensor_width = 40
+        finder_state.main_sensor_height = 40
+        finder_state.last_frame = np.zeros((60, 80), dtype=np.uint8)  # main_fov_corners_px needs this for frame_shape
+
+        frame = np.full((60, 80), 15, dtype=np.uint8)
+        p.handle_finder_camera_event(CameraEvent(kind="preview_frame", payload={"pgm": frame_to_pgm(frame), "width": 80, "height": 60}))
+
+        item_types = [p._finder_preview_canvas.type(item) for item in p._finder_preview_canvas.find_all()]
+        assert "polygon" in item_types
+    finally:
+        mount_worker.shutdown()
+        camera_worker.shutdown()
+        root.destroy()
+
+
+def test_calibration_panel_main_camera_disconnect_clears_stale_blob_lock(calibration_panel):
+    # Regression: handle_camera_event had no "disconnected" branch at all
+    # (the only one in the file without one) -- a main-camera disconnect
+    # while auto-guide had a lock left FinderState.main_blob_locked stuck
+    # True forever. TransitPanel reads it on every tracking_tick
+    # completely independently of whether preview_frame events are still
+    # arriving, so finder correction would stay silently locked out for
+    # the rest of the session with no main camera connected at all.
+    p = calibration_panel
+    finder_state = FinderState()
+    p._finder_state = finder_state
+    finder_state.set_main_blob_locked(True)
+    p._latest_blob = _blob(10.0, 10.0)
+    p._blob_status_var.set("ISS at pixel (10, 10), peak 200")
+
+    p.handle_camera_event(CameraEvent(kind="disconnected", payload={}))
+
+    assert finder_state.main_blob_locked is False
+    assert p._latest_blob is None
+    assert p._blob_status_var.get() == "No frame yet"
 
 
 def test_calibration_panel_blob_position_is_full_resolution_for_a_frame_above_the_preview_cap(calibration_panel):
@@ -1405,6 +2057,7 @@ def test_calibration_panel_blob_position_is_full_resolution_for_a_frame_above_th
     # downsampled detection copy's -- otherwise every consumer of
     # _latest_blob silently breaks the moment a frame exceeds the cap.
     p = calibration_panel
+    _make_camera_calibration_tab_visible(p)
     h, w = 1200, 1600  # comfortably above MAX_CALIBRATION_PREVIEW_DIM (480)
     frame = np.full((h, w), 15, dtype=np.uint8)
     true_cx, true_cy = 1000, 300
@@ -1832,77 +2485,115 @@ def test_finder_focal_and_pixel_fields_stay_editable_in_real_mode():
         root.destroy()
 
 
-def test_finder_calibrate_success_notifies_on_calibration_ready():
+def test_finder_calibrate_success_notifies_on_finder_calibration_ready():
     # Regression: the Transit tab's "Enable finder correction" checkbox was
     # created disabled and never re-enabled anywhere -- there was no
-    # callback from FinderCameraPanel's calibration to TransitPanel, unlike
-    # CalibrationPanel's own on_calibration_ready for auto-guiding.
+    # callback from the finder field calibration to TransitPanel, unlike
+    # CalibrationPanel's own on_calibration_ready for auto-guiding. Field
+    # calibration moved from FinderCameraPanel into CalibrationPanel (see
+    # CalibrationPanel._build_finder_calibration_section) so both
+    # calibrations TransitPanel's checkboxes depend on live in one tab.
     root = tk.Tk()
     root.withdraw()
-    finder_worker = CameraWorker()
+    mount_worker = MountWorker()
+    camera_worker = CameraWorker()
     finder_state = FinderState()
     notified = []
     try:
-        p = FinderCameraPanel(
-            root, finder_worker, finder_state,
-            on_calibration_ready=lambda: notified.append(True),
+        p = CalibrationPanel(
+            root, mount_worker, camera_worker, LiveOffsets(),
+            finder_state=finder_state, on_finder_calibration_ready=lambda: notified.append(True),
         )
-        p._latest_frame = np.zeros((20, 20), dtype=np.uint8)
+        finder_state.last_frame = np.zeros((20, 20), dtype=np.uint8)
         finder_state.last_main_frame = np.zeros((20, 20), dtype=np.uint8)
         finder_state.calibration.calibrate_from_frames = lambda *a, **kw: setattr(
             finder_state.calibration, "calibrated", True,
         )
-        p._on_calibrate()
+        p._on_calibrate_finder_fields()
         assert notified == [True]
+    finally:
+        mount_worker.shutdown()
+        camera_worker.shutdown()
+        root.destroy()
+
+
+def test_finder_camera_panel_and_finder_window_share_exposure_gain_sliders():
+    # Real reported bug: FinderCameraPanel (the Finder tab) and
+    # FinderWindow (the floating window) each built their own independent
+    # exposure/gain tk.DoubleVars -- changing one slider left the other
+    # showing a stale value, with no indication the two had drifted apart
+    # (same class of bug CameraControlVars was originally built to fix for
+    # the main camera, see its own docstring). Passing the SAME
+    # CameraControlVars instance to both -- what App now does -- must make
+    # Tk's own variable-sharing keep them in lockstep automatically.
+    root = tk.Tk()
+    root.withdraw()
+    finder_worker = CameraWorker()
+    shared_vars = CameraControlVars.create(FinderCameraPanel.FINDER_DEFAULT_EXPOSURE_US, FinderCameraPanel.FINDER_DEFAULT_GAIN)
+    try:
+        panel = FinderCameraPanel(root, finder_worker, FinderState(), camera_vars=shared_vars)
+        window = FinderWindow(root, finder_worker, FinderState(), on_sync=lambda *a: None, camera_vars=shared_vars)
+
+        panel._camera_vars.exposure_log.set(5.0)  # 100ms
+        assert window._camera_vars.exposure_log.get() == pytest.approx(5.0)
+        assert "100" in window._camera_vars.exposure_value.get()
+
+        window._camera_vars.gain.set(250)
+        assert panel._camera_vars.gain.get() == pytest.approx(250)
+        assert panel._camera_vars.gain_value.get() == "250"
     finally:
         finder_worker.shutdown()
         root.destroy()
 
 
-def test_finder_calibrate_failure_does_not_notify_on_calibration_ready():
+def test_finder_calibrate_failure_does_not_notify_on_finder_calibration_ready():
     root = tk.Tk()
     root.withdraw()
-    finder_worker = CameraWorker()
+    mount_worker = MountWorker()
+    camera_worker = CameraWorker()
     finder_state = FinderState()
     notified = []
     try:
-        p = FinderCameraPanel(
-            root, finder_worker, finder_state,
-            on_calibration_ready=lambda: notified.append(True),
+        p = CalibrationPanel(
+            root, mount_worker, camera_worker, LiveOffsets(),
+            finder_state=finder_state, on_finder_calibration_ready=lambda: notified.append(True),
         )
-        p._latest_frame = np.zeros((20, 20), dtype=np.uint8)
+        finder_state.last_frame = np.zeros((20, 20), dtype=np.uint8)
         finder_state.last_main_frame = np.zeros((20, 20), dtype=np.uint8)
 
         def _raise(*_a, **_kw):
             raise ValueError("boom")
 
         finder_state.calibration.calibrate_from_frames = _raise
-        p._on_calibrate()
+        p._on_calibrate_finder_fields()
         assert notified == []
-        assert "failed" in p._calib_status_var.get().lower()
+        assert "failed" in p._finder_calib_status_var.get().lower()
     finally:
-        finder_worker.shutdown()
+        mount_worker.shutdown()
+        camera_worker.shutdown()
         root.destroy()
 
 
 def test_finder_calibrate_passes_the_typed_rotation_through():
     root = tk.Tk()
     root.withdraw()
-    finder_worker = CameraWorker()
+    mount_worker = MountWorker()
+    camera_worker = CameraWorker()
     finder_state = FinderState()
     try:
-        p = FinderCameraPanel(root, finder_worker, finder_state)
-        p._latest_frame = np.zeros((20, 20), dtype=np.uint8)
+        p = CalibrationPanel(root, mount_worker, camera_worker, LiveOffsets(), finder_state=finder_state)
+        finder_state.last_frame = np.zeros((20, 20), dtype=np.uint8)
         finder_state.last_main_frame = np.zeros((20, 20), dtype=np.uint8)
         p._finder_rotation_var.set("7.5")
 
         captured = {}
         finder_state.calibration.calibrate_from_frames = lambda *a, **kw: captured.update(kw)
-        p._on_calibrate()
+        p._on_calibrate_finder_fields()
 
         assert captured["rotation_deg"] == pytest.approx(7.5)
     finally:
-        finder_worker.shutdown()
+        mount_worker.shutdown()
+        camera_worker.shutdown()
         root.destroy()
 
 

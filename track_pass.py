@@ -83,7 +83,33 @@ def main() -> None:
     window = find_next_pass(satellite, site, horizon_deg=args.horizon_deg, lookahead_hours=args.lookahead_hours)
     t_start = window.t_rise - timedelta(seconds=args.lead_s)
 
+    # compute_trajectory must run against the REAL, unshifted pass window --
+    # it queries the satellite's actual SGP4 position at whatever calendar
+    # times it's given, so shifting t_start/window to "now" BEFORE this call
+    # (the old order) computed the ISS's real position at the wrong, shifted
+    # times instead of the real pass's actual geometry. --start-immediately
+    # only relabels WHEN the (correctly-computed) trajectory happens on the
+    # wall clock -- it must never change WHERE the satellite actually is at
+    # each sample.
+    trajectory = compute_trajectory(satellite, site, t_start, window.t_set, step_s=1.0 / args.loop_hz)
+
     if args.start_immediately:
+        # Regression fix: this used to shift t_start/window BEFORE the
+        # compute_trajectory call above (wrong geometry, see its own new
+        # comment) AND ALSO shift trajectory.t_unix afterward -- a double
+        # application that left the trajectory's active window hours away
+        # from real "now" (confirmed: t_unix[0] landed 2 hours in the past
+        # for a pass 2 hours out). run_tracking_loop queries the trajectory
+        # at real wall-clock time, so with the window never overlapping
+        # "now" at all, Trajectory.interpolate's own out-of-window handling
+        # (rates zeroed, position clamped to the boundary -- see its own
+        # docstring) meant the mount just sat motionless for the whole run,
+        # every single time this flag was used -- exactly the script's own
+        # top-of-file usage example for dry-running against the mock.
+        # Shift applied exactly ONCE now, uniformly, to t_start/window (for
+        # display) and trajectory.t_unix (for run_tracking_loop's own
+        # wall-clock queries) together, after the real geometry above is
+        # already locked in.
         shift = datetime.now(timezone.utc) - t_start
         t_start += shift
         window = dataclasses.replace(
@@ -92,15 +118,12 @@ def main() -> None:
             t_culminate=window.t_culminate + shift,
             t_set=window.t_set + shift,
         )
+        trajectory.t_unix = trajectory.t_unix + shift.total_seconds()
 
     duration_s = (window.t_set - window.t_rise).total_seconds()
     print(f"pass: rise {window.t_rise.isoformat()}  culminate {window.t_culminate.isoformat()} "
           f"(max el {window.max_elevation_deg:.1f} deg)  set {window.t_set.isoformat()}  "
           f"({duration_s:.0f}s)", file=sys.stderr)
-
-    trajectory = compute_trajectory(satellite, site, t_start, window.t_set, step_s=1.0 / args.loop_hz)
-    if args.start_immediately:
-        trajectory.t_unix = trajectory.t_unix + shift.total_seconds()
 
     crossings = meridian_crossings(trajectory)
     if crossings:
@@ -127,7 +150,7 @@ def main() -> None:
     fh = None
     try:
         print(f"firmware: {mount.get_version()}", file=sys.stderr)
-        axis_signs = calibrate_directions(mount)
+        axis_signs = calibrate_directions(mount, safety=safety)
         print(f"  calibrated axis signs: ra={axis_signs.ra:+.0f} dec={axis_signs.dec:+.0f}", file=sys.stderr)
 
         _wait_until(t_start, "AOS")

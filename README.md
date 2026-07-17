@@ -70,7 +70,7 @@ mount and the pass predictor:
   parked or disconnected instead of silently no-op'ing.
 - **Realistic mock mode** — `MockMount` simulates serial latency, a
   first-order motor response ramp, and real pier-side geometry; the mock
-  camera renders a synthetic star field (from a real Hipparcos extract) with
+  camera renders a synthetic star field (from a real Tycho-2 extract) with
   a moving ISS blob. The whole GUI, and every test, runs against these with
   no hardware attached.
 
@@ -96,10 +96,11 @@ work fine without it, this is only needed to talk to real ASI hardware.
 
 ### Star catalog
 
-`assets/bright_stars.npz` (a filtered Hipparcos extract, ~1.1 MB) is
-committed and is all the mock camera needs — nothing to do. If you want to
-regenerate it from the raw catalog yourself, `skyfield`'s loader will fetch
-`hip_main.dat` (~50 MB) on first use of the Hipparcos loading path.
+`assets/bright_stars.npz` (a filtered Tycho-2 extract, ~9 MB) is
+committed and is all the mock camera needs — nothing to do. See
+`assets/bright_stars.LICENSE.txt` for provenance (source catalogue,
+magnitude cutoff, and why Tycho-2 rather than the shallower Hipparcos-only
+extract this used to be) if you want to regenerate or extend it.
 
 ## Quick start
 

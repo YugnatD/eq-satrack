@@ -64,11 +64,27 @@ MS_REPLY_MEANING = {
 # converged from 70+ deg of error down to a few arcsec over 3 clicks.
 GOTO_MISMATCH_WARN_DEG = 1.0
 
-# jog_goto: closed-loop proportional approach, gentle enough to not need a
-# tube-removed style confirmation (same order of magnitude as manual jog
-# rates the operator already drives unattended).
+# jog_goto: closed-loop proportional approach. Now that AlignmentPanel's
+# arbitrary-distance "GOTO selected star" moved to native goto (see
+# TransitPanel._on_goto_click's own docstring -- jog_goto is meant for
+# short, close-in final-approach corrections, not slews to a freshly-
+# picked star anywhere on the sky), this button's only remaining job is
+# TransitPanel's "keep pier side" GOTO -- which can genuinely need to
+# cover a real distance (wherever the mount happens to be vs. wherever
+# the next pass starts) and can't fall back to native goto at all (the
+# firmware alone decides pier side on a real :MS#, no way to constrain
+# it). Capped at the SAME safety margin already trusted everywhere else
+# in this codebase for real, sustained motion (TrackingConfig.max_rate_x,
+# just under the mount's measured 1440x max) rather than the original,
+# more conservative 400x -- reported too slow in practice, and there's no
+# reason this specific closed-loop approach needs to be gentler than the
+# tracking loop's own feedforward rates already are. The proportional
+# gain (JOG_GOTO_KP_RATE_X_PER_DEG) is unchanged, so the final settling
+# behavior close to the target (well under the old cap already, never
+# saturated there) is identical -- only the "still far from target, cruise
+# at the cap" phase gets faster.
 JOG_GOTO_KP_RATE_X_PER_DEG = 200.0
-JOG_GOTO_MAX_RATE_X = 400.0
+JOG_GOTO_MAX_RATE_X = 1400.0
 JOG_GOTO_ARRIVED_ARCSEC = 10.0
 JOG_GOTO_TIMEOUT_S = 180.0
 # Abort a manual GOTO if the pointing error grows this far past its best --
@@ -109,6 +125,21 @@ class MountWorker:
         # here so _handle_unpark knows whether to send it.
         self._park_method: str | None = None
         self._tracking_stop_event: threading.Event | None = None
+        # Directions with an active, un-stopped jog_start (:Me#/:Mw#/:Mn#/
+        # :Ms#) -- SafetyGuard.notify_command(movement_active=True) must be
+        # called at least once every watchdog_timeout (5s) or it fires its
+        # own :Q#, but _handle_jog_start only calls it ONCE when the jog
+        # begins. A jog held/scheduled to run longer than 5s (a manual
+        # JogWindow button held down, or AlignmentPanel's polar-alignment
+        # rotation, which runs tens of seconds) was silently killed by the
+        # watchdog partway through -- confirmed directly: RA advanced
+        # smoothly for ~5s then flatlined completely, no error shown
+        # anywhere, just silently-truncated motion. _idle_poll_tick below
+        # re-kicks the watchdog every poll (~0.4s) for as long as this set
+        # is non-empty, so a held jog is treated the same as continuous
+        # "yes, still deliberately moving" commands, not truncated by the
+        # watchdog's own operator-silence detection.
+        self._jog_active_directions: set[str] = set()
         # Set by emergency_stop() to break the closed-loop motion handlers
         # (jog_goto, calibrate) that would otherwise re-issue a move command
         # a fraction of a second after the emergency :Q#, silently
@@ -237,8 +268,21 @@ class MountWorker:
         down any active motion loop so it can't re-command motion right
         after the :Q#: a live tracking pass re-issues :Rv#+:Me# at 20Hz and
         jog_goto/calibrate at ~7Hz, so writing :Q# alone is overridden
-        within one loop tick unless those loops are told to abort too."""
+        within one loop tick unless those loops are told to abort too.
+
+        Also clears _jog_active_directions -- a real gap otherwise: if the
+        operator hits this while still physically holding a JogWindow
+        direction button (a plausible panic sequence -- grab e-stop, don't
+        bother releasing the other button first), that direction stays in
+        the set until ButtonRelease eventually fires (if it ever does).
+        Until then, _idle_poll_tick keeps re-notifying the watchdog every
+        tick, which means it never goes stale and so never fires its own
+        backup :Q# again -- silently defeating the ONE layer of protection
+        meant to cover exactly the case where the :Q# just sent here
+        somehow doesn't actually stop the mount (stuck relay, firmware
+        bug, corrupted byte)."""
         self._abort.set()
+        self._jog_active_directions.clear()
         if self._tracking_stop_event is not None:
             self._tracking_stop_event.set()
         if self._mount is not None:
@@ -322,6 +366,15 @@ class MountWorker:
     def _idle_poll_tick(self) -> None:
         if self._mount is None or not self._idle_poll_enabled.is_set():
             return
+        # Re-kick the safety watchdog for as long as a jog_start is active
+        # and un-stopped -- see _jog_active_directions' own comment for why
+        # this is needed (jog_start itself only notifies the watchdog once,
+        # at the start). Not folded into the try/except below: a transient
+        # ProtocolError on THIS tick's position read must not itself cause
+        # the watchdog to go stale and self-stop a jog that's otherwise
+        # still fine.
+        if self._jog_active_directions and self._safety is not None:
+            self._safety.notify_command(movement_active=True)
         try:
             radec = self._mount.get_radec()
             pier_side = self._mount.get_pier_side()
@@ -409,6 +462,7 @@ class MountWorker:
 
     def _handle_disconnect(self, payload: dict) -> None:
         self._idle_poll_enabled.clear()
+        self._jog_active_directions.clear()
         if self._mount is not None:
             self._mount.stop()
             if self._safety is not None:
@@ -432,6 +486,7 @@ class MountWorker:
         return False
 
     def _handle_park(self, payload: dict) -> None:
+        self._jog_active_directions.clear()
         if self._mount is None:
             return
         self._mount.stop()
@@ -443,6 +498,7 @@ class MountWorker:
         self._emit("parked", method="home", reply=None)
 
     def _handle_park_native(self, payload: dict) -> None:
+        self._jog_active_directions.clear()
         if self._mount is None:
             return
         # Per the official protocol doc, :hP# "only support in equatorial
@@ -488,10 +544,12 @@ class MountWorker:
             return
         self._mount.set_rate(payload["rate_x"])
         self._mount.move(payload["direction"])
+        self._jog_active_directions.add(payload["direction"])
         if self._safety is not None:
             self._safety.notify_command(movement_active=True)
 
     def _handle_jog_stop(self, payload: dict) -> None:
+        self._jog_active_directions.discard(payload["direction"])
         if self._mount is None:
             return
         self._mount.stop(payload["direction"])
@@ -583,6 +641,7 @@ class MountWorker:
         self._emit("jog_goto_result", arrived=arrived)
 
     def _handle_stop_all(self, payload: dict) -> None:
+        self._jog_active_directions.clear()
         if self._mount is None:
             return
         self._mount.stop()
@@ -612,7 +671,7 @@ class MountWorker:
         if self._mount is None or self._blocked_while_parked("calibrating"):
             return
         self._abort.clear()
-        signs = calibrate_directions(self._mount, abort=self._abort)
+        signs = calibrate_directions(self._mount, abort=self._abort, safety=self._safety)
         self._emit("calibration_done", ra_sign=signs.ra, dec_sign=signs.dec, pier_side=signs.calibrated_pier_side)
 
     @staticmethod
@@ -757,11 +816,24 @@ class MountWorker:
                     pass
 
     def _poll_until_arrived(self) -> tuple[float, float] | None:
+        """Polls position after a native :MS# GOTO until it stops changing.
+        _handle_goto sets movement_active=True once before calling this --
+        NOT enough on its own for anything but a very fast GOTO: the mock's
+        own :MS# teleports instantly (see _handle_slew's docstring), but a
+        real GOTO genuinely takes time, and this loop used to never
+        re-notify the watchdog while polling, exactly the bug already fixed
+        for jog_start (see _jog_active_directions' own comment) and for
+        _handle_jog_goto's own loop (which already re-notifies every
+        iteration, with an explicit comment for why). Confirmed directly
+        with a simulated slow-arriving GOTO (>5s to settle): the watchdog
+        fired and sent its own :Q# mid-poll, before this fix."""
         assert self._mount is not None
         deadline = time.monotonic() + GOTO_POLL_TIMEOUT_S
         prev = None
         stable_count = 0
         while time.monotonic() < deadline:
+            if self._safety is not None:
+                self._safety.notify_command(movement_active=True)
             try:
                 radec = self._mount.get_radec()
             except ProtocolError:

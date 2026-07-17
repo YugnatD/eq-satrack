@@ -106,13 +106,24 @@ class AxisSigns:
 
 def calibrate_directions(
     mount: Mount, nudge_rate_x: float = 30.0, nudge_duration_s: float = 0.4,
-    abort: threading.Event | None = None,
+    abort: threading.Event | None = None, safety: SafetyGuard | None = None,
 ) -> AxisSigns:
     """Small real nudge on each axis (~30x sidereal for ~0.4s, a few arcmin
     of travel) to empirically determine the sign convention for this
     session, rather than trusting a hardcoded assumption. `abort` (set by
     an emergency stop) short-circuits before the second-axis nudge so an
     e-stop mid-calibration isn't overridden by the next move command.
+
+    `safety`, if given, is fed a movement_active heartbeat around each
+    nudge -- am5/safety.py's own module docstring states this as a
+    non-negotiable requirement for every entry point that moves the mount,
+    but this function went without it (unlike every other motion-issuing
+    path in this codebase, e.g. measure_mount_lag's matching parameter) --
+    each nudge here is short (nudge_duration_s, well under a real
+    watchdog_timeout) so the practical exposure window was narrow, but a
+    hang between move() and stop() (e.g. time.sleep interrupted, the
+    process wedged) would otherwise leave the mount jogging with zero
+    safety-net coverage, unlike everywhere else.
 
     Records the current pier side as the one dec is now correct for (see
     AxisSigns.calibrated_pier_side/update_pier_side) -- calibrating doesn't
@@ -121,8 +132,12 @@ def calibrate_directions(
     ra0 = mount.get_radec()
     mount.set_rate(nudge_rate_x)
     mount.move("e")
+    if safety is not None:
+        safety.notify_command(movement_active=True)
     time.sleep(nudge_duration_s)
     mount.stop("e")
+    if safety is not None:
+        safety.notify_command(movement_active=False)
     time.sleep(0.1)
     ra1 = mount.get_radec()
     ra_sign = 1.0 if circular_diff_hours(ra1.ra_hours, ra0.ra_hours) > 0 else -1.0
@@ -141,8 +156,12 @@ def calibrate_directions(
     dec0 = mount.get_radec()
     mount.set_rate(nudge_rate_x)
     mount.move("n")
+    if safety is not None:
+        safety.notify_command(movement_active=True)
     time.sleep(nudge_duration_s)
     mount.stop("n")
+    if safety is not None:
+        safety.notify_command(movement_active=False)
     time.sleep(0.1)
     dec1 = mount.get_radec()
     dec_sign = 1.0 if (dec1.dec_deg - dec0.dec_deg) > 0 else -1.0
@@ -780,26 +799,43 @@ def run_tracking_loop(
                     now_mono = time.monotonic()
                     dt_feedback = now_mono - last_feedback_t
                     last_feedback_t = now_mono
-                    # decompose_error's along_deg/cross_deg are (actual -
-                    # target), so the correction has to point the other
-                    # way to close the gap -- error_* below flips to the
-                    # standard PID convention (setpoint - measured) so
-                    # positive gains do the intuitive thing.
-                    error_along_deg = -along_deg
-                    error_cross_deg = -cross_deg
-                    limit = cfg.feedback_integral_limit_deg
-                    integral_along_deg = max(-limit, min(limit, integral_along_deg + error_along_deg * dt_feedback))
-                    integral_cross_deg = max(-limit, min(limit, integral_cross_deg + error_cross_deg * dt_feedback))
-                    correction_along = cfg.feedback_kp * error_along_deg + cfg.feedback_ki * integral_along_deg
-                    correction_cross = cfg.feedback_kp * error_cross_deg + cfg.feedback_ki * integral_cross_deg
-                    feedback_dra_dt, feedback_ddec_dt = _along_cross_rate_to_equatorial(
-                        correction_along, correction_cross, dec_deg, dra_dt, ddec_dt,
-                        cfg.feedback_max_correction_deg_s,
-                    )
-                    feedback_note = (
-                        f" | feedback trim: along {correction_along * 3600:+.2f}\"/s "
-                        f"cross {correction_cross * 3600:+.2f}\"/s"
-                    )
+                    # Outside the trajectory's own active window -- an
+                    # early start still "sitting at the boundary" (see
+                    # Trajectory.interpolate's own docstring; dra_dt/
+                    # ddec_dt are explicitly zeroed there) -- decompose_
+                    # error's zero-speed branch returns a signless
+                    # MAGNITUDE for cross_deg (always >= 0, confirmed by
+                    # feeding it the same error with the sign flipped and
+                    # getting an identical result back), not a real
+                    # cross-track error. Integrating that every tick would
+                    # windup a spurious, wrongly-directed correction while
+                    # just waiting for the pass to start -- the same class
+                    # of bug fixed on the auto-guide/finder-correction
+                    # paths (am5/gui/panels.py). Freeze the feedback state
+                    # instead of corrupting it with a fabricated direction;
+                    # it resumes cleanly once real motion starts.
+                    cos_dec_fb = math.cos(math.radians(dec_deg))
+                    if math.hypot(dra_dt * cos_dec_fb, ddec_dt) >= 1e-9:
+                        # decompose_error's along_deg/cross_deg are (actual -
+                        # target), so the correction has to point the other
+                        # way to close the gap -- error_* below flips to the
+                        # standard PID convention (setpoint - measured) so
+                        # positive gains do the intuitive thing.
+                        error_along_deg = -along_deg
+                        error_cross_deg = -cross_deg
+                        limit = cfg.feedback_integral_limit_deg
+                        integral_along_deg = max(-limit, min(limit, integral_along_deg + error_along_deg * dt_feedback))
+                        integral_cross_deg = max(-limit, min(limit, integral_cross_deg + error_cross_deg * dt_feedback))
+                        correction_along = cfg.feedback_kp * error_along_deg + cfg.feedback_ki * integral_along_deg
+                        correction_cross = cfg.feedback_kp * error_cross_deg + cfg.feedback_ki * integral_cross_deg
+                        feedback_dra_dt, feedback_ddec_dt = _along_cross_rate_to_equatorial(
+                            correction_along, correction_cross, dec_deg, dra_dt, ddec_dt,
+                            cfg.feedback_max_correction_deg_s,
+                        )
+                        feedback_note = (
+                            f" | feedback trim: along {correction_along * 3600:+.2f}\"/s "
+                            f"cross {correction_cross * 3600:+.2f}\"/s"
+                        )
 
                 print(f"[track] cross-track error: {cross_deg * 3600:+.1f}\" "
                       f"along-track: {along_deg * 3600:+.1f}\" — nudge delta_t/perp by hand if this grows"

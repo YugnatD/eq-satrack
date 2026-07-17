@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from camera.guiding import GuidingCalibration
+
 # Shared by both finder exposure sliders (am5/gui/finder_window.py's
 # FinderWindow and am5/gui/panels.py's FinderCameraPanel) -- a wide-field
 # finder is used to ACQUIRE a target quickly, not for long deep-sky
@@ -170,30 +172,54 @@ class FinderCalibration:
         self.rotation_rad = math.radians(rotation_deg)
         self.calibrated = True
 
-    def finder_px_to_correction_arcsec(
+    def finder_px_to_main_px(
         self, finder_blob_row: float, finder_blob_col: float,
         finder_frame_shape: tuple[int, int],
-        finder_plate_scale_arcsec: float = 1.0,
     ) -> tuple[float, float]:
-        """Given a detected ISS blob position in the finder frame, returns
-        (delta_row_arcsec, delta_col_arcsec) -- how far the main camera
-        needs to move to centre the ISS.  Positive = move DOWN/RIGHT."""
+        """Given a detected blob position in the finder frame, returns
+        (dx_px, dy_px) -- its offset from the MAIN camera's own current
+        optical centre, in MAIN-camera pixels (same (col, row) convention
+        as CalibrationPanel's own dx_px/dy_px, e.g. blob.centroid_x -
+        width/2.0). Feed this into the main camera's own (nudge-verified)
+        GuidingCalibration.pixel_to_sky() to get a real sky-frame offset --
+        this method alone only knows the finder's roll/scale RELATIVE TO
+        the main camera, not how the main camera's own axes relate to true
+        sky directions, so its output isn't meaningful as a correction on
+        its own (see FinderState.get_correction_arcsec, the only intended
+        caller).
+
+        Regression fix: this used to add self.offset_row/offset_col
+        instead of subtracting them, and stopped at a hand-rotated arcsec
+        "along/cross" pair on the unverified assumption that the main
+        camera's own pixel axes are already sky-track-aligned. The offset
+        sign was inconsistent with this same class's OWN main_fov_corners_
+        px (centre_row = fc_row + offset_row, verified by
+        test_finder.py's synthetic-ground-truth tests) -- offset_row/col
+        is defined by calibrate_from_frames as (main centre's position in
+        finder pixels) - (finder's own frame centre), so "blob offset from
+        MAIN centre" is (blob - finder_centre) - offset_row/col, not
+        + offset_row/col."""
         if not self.calibrated:
             return 0.0, 0.0
-        # Finder centre
         fc_row = finder_frame_shape[0] / 2.0
         fc_col = finder_frame_shape[1] / 2.0
-        # Blob offset from finder centre, in finder pixels
-        dr = finder_blob_row - fc_row + self.offset_row
-        dc = finder_blob_col - fc_col + self.offset_col
-        # Convert to arcseconds using finder plate scale
-        dr_arcsec = dr * finder_plate_scale_arcsec
-        dc_arcsec = dc * finder_plate_scale_arcsec
-        # Apply rotation to align with main camera axes
+        # Blob offset from the MAIN camera's own centre (main_centre_in_
+        # finder = fc_row/col + offset_row/col, see main_fov_corners_px),
+        # in finder pixels, finder-axis orientation.
+        dr = finder_blob_row - fc_row - self.offset_row
+        dc = finder_blob_col - fc_col - self.offset_col
+        # Rotate into the main camera's own pixel-axis orientation (finder's
+        # mechanical roll relative to the main camera).
         cos_r, sin_r = math.cos(self.rotation_rad), math.sin(self.rotation_rad)
-        along = dr_arcsec * cos_r - dc_arcsec * sin_r
-        cross = dr_arcsec * sin_r + dc_arcsec * cos_r
-        return along, cross
+        rotated_row = dr * cos_r - dc * sin_r
+        rotated_col = dr * sin_r + dc * cos_r
+        # Scale finder-pixel magnitude into main-pixel magnitude -- inverse
+        # of main_fov_corners_px's own main_px -> finder_px shrink (divide
+        # by ratio there; multiply here).
+        ratio = max(self.plate_scale_ratio, 1e-9)
+        dy_px = rotated_row * ratio
+        dx_px = rotated_col * ratio
+        return dx_px, dy_px
 
     def main_fov_corners_px(
         self, finder_frame_shape: tuple[int, int],
@@ -299,6 +325,26 @@ class FinderState:
     # easily-stale duplicate value.
     main_plate_scale_arcsec: float = 1.0
     finder_plate_scale_arcsec: float = 1.0
+    # The main camera's own nudge-verified camera-to-sky calibration (set
+    # by CalibrationPanel once "Calibrate camera-to-sky mapping" succeeds,
+    # see set_main_calibration) -- required by get_correction_arcsec below.
+    # FinderCalibration alone only knows the finder's roll/scale relative
+    # to the MAIN camera's own pixel axes; only this establishes how those
+    # axes relate to true sky directions, so a finder-only calibration
+    # can't produce a real correction on its own.
+    main_calibration: GuidingCalibration | None = None
+    # True whenever the MAIN camera's own blob detector currently has the
+    # ISS in frame (set by CalibrationPanel.handle_camera_event on every
+    # preview_frame, see set_main_blob_locked) -- lets TransitPanel's
+    # finder correction back off once auto-guide has a real lock instead
+    # of the two correctors running concurrently and fighting over the
+    # same trigger_perp_pulse (see get_correction_arcsec's own docstring
+    # for the class of bug this is the sequencing half of: the finder-to-
+    # main geometric calibration was never enough on its own to make a
+    # correction trustworthy at the SAME precision/scale as the main
+    # camera's own nudge-verified one, so once the main camera actually
+    # has a lock, its correction should be the only one acting).
+    main_blob_locked: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
     _frame_counter: int = field(default=0, repr=False, compare=False)
     # Every Nth frame gets blob-detected -- at a ~10Hz preview rate this is
@@ -331,6 +377,20 @@ class FinderState:
         with self._lock:
             self.last_main_frame = frame
 
+    def set_main_calibration(self, calibration: GuidingCalibration | None) -> None:
+        """Called by CalibrationPanel whenever its own "Calibrate camera-
+        to-sky mapping" completes (or is invalidated, with None) -- see
+        main_calibration's own field docstring for why get_correction_
+        arcsec needs this."""
+        with self._lock:
+            self.main_calibration = calibration
+
+    def set_main_blob_locked(self, locked: bool) -> None:
+        """Called by CalibrationPanel on every main-camera preview_frame --
+        see main_blob_locked's own field docstring."""
+        with self._lock:
+            self.main_blob_locked = locked
+
     def main_fov_corners_px(self) -> list[tuple[float, float]] | None:
         """Corners (row, col) in finder-pixel space of the main camera's
         FOV rectangle, or None if not calibrated yet or the main camera's
@@ -356,21 +416,30 @@ class FinderState:
             self.last_blob_row = None
             self.last_blob_col = None
 
-    def get_correction_arcsec(
-        self, finder_plate_scale_arcsec: float | None = None,
-    ) -> tuple[float, float] | None:
-        """Returns (along_arcsec, cross_arcsec) if a blob is detected AND
-        the calibration has been done, else None. Uses this instance's own
-        finder_plate_scale_arcsec (the real, currently-configured value --
-        see the field's docstring) unless the caller explicitly overrides
-        it."""
-        scale = finder_plate_scale_arcsec if finder_plate_scale_arcsec is not None else self.finder_plate_scale_arcsec
+    def get_correction_arcsec(self) -> tuple[float, float] | None:
+        """Returns (d_ra_arcsec, d_dec_arcsec) -- the sky-frame offset
+        between the finder-detected blob and the MAIN camera's own current
+        optical centre, in the same "actual - target" convention
+        GuidingCalibration.pixel_to_sky always returns (see
+        CalibrationPanel._maybe_apply_auto_guide_correction's own
+        docstring for the derivation) -- so a caller can feed this straight
+        into am5.tracker.decompose_error the same way that method does.
+        None if no blob is detected, the finder-to-main geometric
+        calibration (FinderCameraPanel's "Calibrate fields") hasn't been
+        done, or the main camera's OWN camera-to-sky calibration
+        (CalibrationPanel's "Calibrate camera-to-sky mapping") hasn't --
+        see main_calibration's own field docstring for why both are
+        required, not just the finder-to-main one."""
         with self._lock:
             if not self.blob_found or self.last_blob_row is None or self.last_frame is None:
                 return None
-            if not self.calibration.calibrated:
+            if not self.calibration.calibrated or self.main_calibration is None:
                 return None
-            return self.calibration.finder_px_to_correction_arcsec(
-                self.last_blob_row, self.last_blob_col,
-                self.last_frame.shape[:2], scale,
+            dx_px, dy_px = self.calibration.finder_px_to_main_px(
+                self.last_blob_row, self.last_blob_col, self.last_frame.shape[:2],
             )
+            main_calibration = self.main_calibration
+        try:
+            return main_calibration.pixel_to_sky(dx_px, dy_px)
+        except ValueError:
+            return None

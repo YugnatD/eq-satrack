@@ -19,6 +19,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import numpy as np
+
 from .angles import angular_separation_deg, equatorial_to_altaz
 
 
@@ -114,3 +116,134 @@ def polar_alignment_error(axis_ra_deg: float, axis_dec_deg: float, lat_deg: floa
         axis_alt_deg=axis_alt_deg, axis_az_deg=axis_az_deg,
         error_deg=error_deg, error_alt_deg=error_alt_deg, error_az_deg=error_az_deg,
     )
+
+
+def true_pole_radec(lat_deg: float) -> tuple[float, float]:
+    """The true celestial pole's own equatorial position -- fixed by
+    definition (it's Earth's rotation axis, essentially motionless in the
+    equatorial frame over the timescales this app cares about), unlike its
+    ALTITUDE/AZIMUTH which is topocentric and changes as Earth turns
+    underneath it (see polar_alignment_error, which works in alt/az
+    instead for exactly that reason). RA is meaningless at the pole itself
+    -- 0.0 here is an arbitrary placeholder, safe because
+    tangent_plane_offset_arcsec/project_radec_to_pixel are verified to
+    give an RA-independent result when dec_deg is +-90 (see
+    tests/test_polar_alignment.py)."""
+    return 0.0, 90.0 if lat_deg >= 0 else -90.0
+
+
+def correction_triangle_radec(
+    axis_ra_deg: float, axis_dec_deg: float, lat_deg: float, lon_deg: float, when,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Two RA/DEC waypoints tracing the KStars-style polar-alignment
+    correction path from the fitted axis to the true pole, split into a
+    pure-azimuth leg then a pure-altitude leg -- a real mount's two
+    adjusters only ever move independently, so that's the actual sky path
+    (and the directions worth drawing on a live view), not a straight
+    line: (az_corrected_point, true_pole_point). az_corrected_point is
+    where the axis would land if ONLY the azimuth error were corrected
+    (same altitude as the axis, azimuth equal to the true pole's); the
+    second leg from there to true_pole_point is then a pure-altitude
+    change by construction, no separate computation needed. Doesn't need
+    polar_alignment_error's own error_az_deg as an input -- the target
+    azimuth (0 north of the equator, 180 south of it) is a fixed fact of
+    the site, the same one true_pole_radec/polar_alignment_error use.
+
+    There's no fixed image/sky direction for "azimuth" or "altitude" --
+    the local correspondence between (RA, DEC) and (az, alt) steps rotates
+    with parallactic angle through the night, AND (being this close to the
+    pole by construction -- that's where PAA points) is strongly
+    nonlinear over anything but a tiny step, so a single linear
+    extrapolation by the full error measurably drifts off the true
+    constant-altitude path (confirmed: ~0.2 deg altitude drift on a
+    0.84 deg azimuth correction in testing). This instead runs a proper
+    multi-step Newton iteration -- solving az(ra,dec)=target_az AND
+    alt(ra,dec)=alt0 exactly (to numerical precision), re-linearizing
+    equatorial_to_altaz's local Jacobian at each step -- rather than a
+    hand-derived closed form (easy to get a sign wrong in -- see
+    project_radec_to_pixel's own docstring on why THAT was verified from
+    scratch instead of guessed)."""
+    target_az_deg = 0.0 if lat_deg >= 0 else 180.0
+    az0, alt0 = equatorial_to_altaz(axis_ra_deg, axis_dec_deg, lat_deg, lon_deg, when)
+    ra, dec = axis_ra_deg, axis_dec_deg
+    eps_deg = 0.005
+    for _ in range(12):
+        az, alt = equatorial_to_altaz(ra, dec, lat_deg, lon_deg, when)
+        f_az = ((az - target_az_deg + 180.0) % 360.0) - 180.0
+        f_alt = alt - alt0
+        if abs(f_az) < 1e-7 and abs(f_alt) < 1e-7:
+            break
+        az_dra, alt_dra = equatorial_to_altaz(ra + eps_deg, dec, lat_deg, lon_deg, when)
+        az_ddec, alt_ddec = equatorial_to_altaz(ra, dec + eps_deg, lat_deg, lon_deg, when)
+        d_az_d_ra = (((az_dra - az) + 180.0) % 360.0 - 180.0) / eps_deg
+        d_alt_d_ra = (alt_dra - alt) / eps_deg
+        d_az_d_dec = (((az_ddec - az) + 180.0) % 360.0 - 180.0) / eps_deg
+        d_alt_d_dec = (alt_ddec - alt) / eps_deg
+        det = d_az_d_ra * d_alt_d_dec - d_az_d_dec * d_alt_d_ra
+        if abs(det) < 1e-9:
+            raise ValueError("degenerate local alt/az<->RA/DEC Jacobian -- cannot resolve a correction direction")
+        d_ra = (d_alt_d_dec * (-f_az) - d_az_d_dec * (-f_alt)) / det
+        d_dec = (-d_alt_d_ra * (-f_az) + d_az_d_ra * (-f_alt)) / det
+        ra += d_ra
+        dec += d_dec
+
+    return (ra, dec), true_pole_radec(lat_deg)
+
+
+def tangent_plane_offset_arcsec(ra_deg, dec_deg, center_ra_deg: float, center_dec_deg: float):
+    """Standard-coordinates (xi, eta) gnomonic/TAN tangent-plane offset of
+    (ra_deg, dec_deg) from (center_ra_deg, center_dec_deg), in arcsec.
+    Deliberately NOT the flat small-angle approximation used elsewhere in
+    this project for small on-sky offsets (e.g. circular_diff_deg-based
+    ones) -- that approximation is ill-defined right where
+    project_radec_to_pixel below most needs it to work: placing the true
+    celestial pole, where RA has no meaning -- and was confirmed (see
+    camera/mock_camera.py's _render_stars, which used to have its own
+    flat approximation) to measurably distort simulated star positions
+    within about a degree of the pole (hundreds of arcsec of error,
+    exactly where PAA points). This is the same TAN/gnomonic projection
+    real plate solvers' own WCS uses, so it reduces to the flat
+    approximation for small offsets but stays correct at any separation,
+    including exactly at dec=+-90 (verified RA-independent there against
+    astropy.wcs, see tests/test_polar_alignment.py).
+
+    Built on numpy (not the math module) throughout so it works
+    unchanged on both plain floats (the polar-alignment overlay's use
+    case) and whole coordinate arrays (camera/mock_camera.py's
+    _render_stars, vectorized over its full star catalog every frame)."""
+    ra0, dec0 = np.radians(center_ra_deg), np.radians(center_dec_deg)
+    ra, dec = np.radians(ra_deg), np.radians(dec_deg)
+    d_ra = ra - ra0
+    denom = np.sin(dec0) * np.sin(dec) + np.cos(dec0) * np.cos(dec) * np.cos(d_ra)
+    xi = np.cos(dec) * np.sin(d_ra) / denom
+    eta = (np.cos(dec0) * np.sin(dec) - np.sin(dec0) * np.cos(dec) * np.cos(d_ra)) / denom
+    return np.degrees(xi) * 3600.0, np.degrees(eta) * 3600.0
+
+
+def project_radec_to_pixel(
+    ra_deg: float, dec_deg: float, center_ra_deg: float, center_dec_deg: float,
+    pixel_scale_arcsec: float, rotation_deg: float,
+) -> tuple[float, float]:
+    """(delta_col, delta_row) pixel offset of (ra_deg, dec_deg) from a
+    solved frame's own centre, given that solve's pixel_scale_arcsec and
+    field_rotation_deg (SolveResult's own fields, camera/platesolve.py) --
+    delta_col/delta_row are in this project's own image convention (column
+    increases right/east, row increases down; see
+    camera/finder.py's downsample_for_display and camera/mock_camera.py's
+    _render_stars, which both use exactly this layout), so the result can
+    be added directly to a frame-centre pixel position for drawing.
+
+    rotation_deg must be extracted the same way camera/platesolve.py's
+    _parse_astap_ini/_parse_astrometry_wcs already do
+    (atan2(CD1_2, CD1_1)) -- this function's sign conventions were derived
+    and verified specifically against that extraction, by round-tripping
+    through astropy.wcs with a CD matrix constructed to match this
+    project's own pixel layout (see tests/test_polar_alignment.py) --
+    getting this wrong would make the polar-alignment overlay point the
+    WRONG direction, worse than not drawing it at all, hence the
+    from-scratch verification rather than a guessed formula."""
+    east_arcsec, north_arcsec = tangent_plane_offset_arcsec(ra_deg, dec_deg, center_ra_deg, center_dec_deg)
+    rot = math.radians(rotation_deg)
+    delta_col = (east_arcsec * math.cos(rot) + north_arcsec * math.sin(rot)) / pixel_scale_arcsec
+    delta_row = (east_arcsec * math.sin(rot) - north_arcsec * math.cos(rot)) / pixel_scale_arcsec
+    return delta_col, delta_row

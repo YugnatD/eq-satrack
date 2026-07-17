@@ -58,13 +58,26 @@ class Sample:
     dec_deg: float
 
 
-def poll_radec(mount: Mount, duration_s: float, hz: float, csv_writer, tag: str = "") -> list[Sample]:
+def poll_radec(mount: Mount, duration_s: float, hz: float, csv_writer, tag: str = "", safety: SafetyGuard | None = None) -> list[Sample]:
     """Poll :GMEQ# for `duration_s` seconds at up to `hz`, logging every
-    successful sample to `csv_writer` and returning them."""
+    successful sample to `csv_writer` and returning them.
+
+    `safety`, if given, is re-notified every iteration -- most callers
+    here poll for well under the default watchdog_timeout (5.0s) so this
+    was previously harmless, but test_h_goto_characterization's own
+    duration_s=5.0 call sits right at that boundary: any real-world
+    overhead (network round trips, scheduling jitter) pushes the actual
+    elapsed time past it, and the watchdog's own backup :Q# would then
+    fire mid-poll -- interrupting the exact real GOTO this test exists to
+    characterize, corrupting the measurement rather than protecting
+    anything (the mount is already known to be moving, on purpose, by the
+    time this runs)."""
     period = 1.0 / hz
     samples: list[Sample] = []
     t_end = time.monotonic() + duration_s
     while time.monotonic() < t_end:
+        if safety is not None:
+            safety.notify_command(movement_active=True)
         t_req = time.monotonic()
         try:
             radec = mount.get_radec()
@@ -560,7 +573,7 @@ def test_h_goto_characterization(mount: Mount, safety: SafetyGuard, out_dir: Pat
             print("  mount did not accept the slew — skipping arrival polling for this target.")
         else:
             safety.notify_command(movement_active=True)
-            samples = poll_radec(mount, duration_s=5.0, hz=30.0, csv_writer=csv_writer, tag="goto")
+            samples = poll_radec(mount, duration_s=5.0, hz=30.0, csv_writer=csv_writer, tag="goto", safety=safety)
     finally:
         mount.stop()
         safety.notify_command(movement_active=False)

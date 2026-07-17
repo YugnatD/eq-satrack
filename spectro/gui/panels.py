@@ -1175,18 +1175,23 @@ class TargetPanel(ttk.Frame):
     pattern am5/gui/panels.py's PassesPanel uses for its own background
     TLE/trajectory work. Never touch Tk widgets from the worker thread."""
 
-    # TODO: pull from the Connection tab's site fields once that's wired
-    # to a shared SiteVars-like object (see am5/gui/panels.py's own
-    # SiteVars docstring for why a single shared source of truth matters
-    # -- two independent copies drifting apart bit this project once
-    # already). Hardcoded to ConnectionPanel's own displayed defaults for
-    # now so at least the two don't visibly disagree.
+    # Fallback only, when no connection_panel is wired in (tests, or a
+    # standalone TargetPanel) -- ConnectionPanel's own displayed defaults,
+    # so at least the two don't visibly disagree in that case. Whenever a
+    # connection_panel IS passed (the real app, see spectro/gui/app.py),
+    # _current_site() below reads its live get_site_*() getters instead --
+    # this used to be hardcoded unconditionally, so a site change in the
+    # Connection tab silently never reached this panel's standard-star
+    # visibility search or altitude chart (see am5/gui/panels.py's own
+    # SiteVars docstring for why a single shared source of truth matters --
+    # two independent copies drifting apart bit this project once already).
     _SITE_LAT_DEG = 46.18
     _SITE_LON_DEG = 6.14
     _SITE_ELEVATION_M = 400.0
 
-    def __init__(self, parent: tk.Misc):
+    def __init__(self, parent: tk.Misc, connection_panel: ConnectionPanel | None = None):
         super().__init__(parent, padding=10)
+        self._connection_panel = connection_panel
         self._target: Star | None = None
         self._results: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self._spectrum_request_id = 0
@@ -1271,6 +1276,19 @@ class TargetPanel(ttk.Frame):
         style_axes(self._chart_figure, self._chart_ax)
         self._chart_canvas.draw()
 
+    def _current_site(self) -> tuple[float, float, float]:
+        """(lat_deg, lon_deg, elevation_m) -- from ConnectionPanel's live,
+        user-editable fields when one is wired in, else the fallback
+        defaults (see this class's own docstring comment above
+        _SITE_LAT_DEG)."""
+        if self._connection_panel is None:
+            return self._SITE_LAT_DEG, self._SITE_LON_DEG, self._SITE_ELEVATION_M
+        return (
+            self._connection_panel.get_site_lat_deg(),
+            self._connection_panel.get_site_lon_deg(),
+            self._connection_panel.get_site_elevation_m(),
+        )
+
     def _on_search(self) -> None:
         name = self._search_var.get().strip()
         if not name:
@@ -1279,12 +1297,17 @@ class TargetPanel(ttk.Frame):
         self._target_info_var.set(f"Searching SIMBAD for {name!r}...")
         self._tree.delete(*self._tree.get_children())
         self._recommend_var.set("")
-        threading.Thread(target=self._search_thread, args=(name,), daemon=True).start()
+        # Read the site on the main thread (ConnectionPanel's fields are Tk
+        # variables) and pass the plain floats into the background thread,
+        # rather than have that thread touch Tk state directly.
+        site = self._current_site()
+        threading.Thread(target=self._search_thread, args=(name, site), daemon=True).start()
 
-    def _search_thread(self, name: str) -> None:
+    def _search_thread(self, name: str, site: tuple[float, float, float]) -> None:
+        lat_deg, lon_deg, elevation_m = site
         try:
             target = resolve_target(name)
-            candidates = find_standard_candidates(target, self._SITE_LAT_DEG, self._SITE_LON_DEG, self._SITE_ELEVATION_M)
+            candidates = find_standard_candidates(target, lat_deg, lon_deg, elevation_m)
             self._results.put(("ok", (target, candidates)))
         except StarNotFound as exc:
             self._results.put(("error", str(exc)))
@@ -1444,13 +1467,14 @@ class TargetPanel(ttk.Frame):
     def _draw_chart(self, target: Star, standard: Star | None) -> None:
         self._reset_chart()
         when = datetime.now(timezone.utc)
-        target_az, target_alt = altitude_track(target, self._SITE_LAT_DEG, self._SITE_LON_DEG, self._SITE_ELEVATION_M, when)
+        lat_deg, lon_deg, elevation_m = self._current_site()
+        target_az, target_alt = altitude_track(target, lat_deg, lon_deg, elevation_m, when)
         self._chart_ax.plot(
             [math.radians(a) for a in target_az], [90 - alt for alt in target_alt],
             color=PALETTE.accent, label="Target",
         )
         if standard is not None:
-            std_az, std_alt = altitude_track(standard, self._SITE_LAT_DEG, self._SITE_LON_DEG, self._SITE_ELEVATION_M, when)
+            std_az, std_alt = altitude_track(standard, lat_deg, lon_deg, elevation_m, when)
             self._chart_ax.plot(
                 [math.radians(a) for a in std_az], [90 - alt for alt in std_alt],
                 color=PALETTE.accent_ok, label="Standard", linestyle="--",

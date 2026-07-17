@@ -200,17 +200,34 @@ def test_drain_coalescing_preview_frames_passes_through_non_preview_events_untou
 def test_pump_events_only_renders_the_last_of_several_queued_camera_preview_frames(app):
     # Integration-level version of the two tests above: pushing a backlog
     # of preview_frame events straight onto the real CameraWorker queue
-    # and pumping once must leave the panel showing the LAST frame's
-    # dimensions, not stall trying to render every one of them.
+    # and pumping once must leave the panel showing the LAST frame, not
+    # stall trying to render every one of them.
     from camera.worker import frame_to_pgm
     import numpy as np
 
-    small = frame_to_pgm(np.zeros((10, 10), dtype=np.uint8))
-    big = frame_to_pgm(np.zeros((20, 20), dtype=np.uint8))
-    app.camera_worker.events.put(CameraEvent(kind="preview_frame", payload={"pgm": small, "width": 10, "height": 10}))
-    app.camera_worker.events.put(CameraEvent(kind="preview_frame", payload={"pgm": big, "width": 20, "height": 20}))
+    # TransitPanel.handle_camera_event now skips building the preview
+    # PhotoImage entirely while its canvas isn't actually mapped (real CPU
+    # cost for a frame nobody can see -- a ttk.Notebook only maps the
+    # selected tab's widgets), so this needs the Transit tab actually
+    # selected and the root actually shown, not the usual withdrawn root
+    # this fixture defaults to.
+    app.root.deiconify()
+    app.notebook.select(app.transit_panel)
+    app.root.update()
+
+    # Distinguished by PIXEL VALUE, not size: a real (now-mapped) canvas
+    # has its own actual pixel dimensions, so fit_pgm_to_canvas scales
+    # both frames to fit it -- comparing _display_w/_display_h against the
+    # raw source size no longer holds once real scaling is involved (that
+    # assertion only ever passed because the canvas was never laid out
+    # under the old always-withdrawn test setup, an incidental zoom=1
+    # fallback, not a deliberate guarantee). Checking which frame's actual
+    # content made it to screen is what this test is really about.
+    stale = frame_to_pgm(np.full((10, 10), 50, dtype=np.uint8))
+    fresh = frame_to_pgm(np.full((20, 20), 200, dtype=np.uint8))
+    app.camera_worker.events.put(CameraEvent(kind="preview_frame", payload={"pgm": stale, "width": 10, "height": 10}))
+    app.camera_worker.events.put(CameraEvent(kind="preview_frame", payload={"pgm": fresh, "width": 20, "height": 20}))
 
     app._pump_events()
 
-    assert app.transit_panel._display_w == 20
-    assert app.transit_panel._display_h == 20
+    assert app.transit_panel._preview_image.get(0, 0) == (200, 200, 200)

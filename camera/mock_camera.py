@@ -8,17 +8,25 @@ Generates synthetic RAW8 frames. Two modes:
   camera-only session (no mount connected) still shows something moving.
 - Tethered to a mount (the GUI's App wires this once both workers are
   connected, see am5/gui/app.py): a real star field -- the bundled
-  Hipparcos-derived catalog, assets/bright_stars.npz, ~98700 stars down to
-  Vmag 9.5 -- is rendered relative to wherever the mount is actually
-  pointed (the "boresight"), brightness scaled by each star's real
-  magnitude AND by exposure/gain (see EXPOSURE_REFERENCE_US below) --
-  exactly like a real sensor, a longer exposure integrates more signal and
-  reveals fainter catalog stars, not just a brighter version of the same
-  ones. The ISS is rendered at its offset from that boresight. Both are
-  computed fresh from real RA/DEC every frame (a tangent-plane projection,
-  no field rotation modeled), not accumulated from an abstract pixel
-  offset -- so panning/jogging the mount correctly pans the simulated
-  field, and pointing at a real star (e.g. Vega) actually shows that star,
+  Tycho-2-derived catalog, assets/bright_stars.npz, ~937000 stars down to
+  V 11.0 (see assets/bright_stars.LICENSE.txt for why Tycho-2, not the
+  shallower Hipparcos-only extract this used to be: Hipparcos alone is too
+  sparse near specific sky positions, no matter how deep its own faint-end
+  cutoff is pushed -- confirmed directly, e.g. only 2-4 stars near Vega or
+  Polaris even at Hipparcos' full depth) -- is rendered relative to
+  wherever the mount is actually pointed (the "boresight"), brightness
+  scaled by each star's real magnitude AND by exposure/gain (see
+  EXPOSURE_REFERENCE_US below) -- exactly like a real sensor, a longer
+  exposure integrates more signal and reveals fainter catalog stars, not
+  just a brighter version of the same ones. The ISS is rendered at its
+  offset from that boresight. Both are computed fresh from real RA/DEC
+  every frame (a proper gnomonic/TAN tangent-plane projection --
+  am5.polar_alignment.tangent_plane_offset_arcsec, not a flat small-angle
+  approximation, which was confirmed to visibly distort star positions
+  within about a degree of the celestial pole; no field rotation
+  modeled), not accumulated from an abstract pixel offset -- so
+  panning/jogging the mount correctly pans the simulated field, and
+  pointing at a real star (e.g. Vega) actually shows that star,
   at the plate scale of whatever optical train is configured in the
   Exposure calc tab (see set_sky_context's caller in am5/gui/panels.py's
   TransitPanel._on_camera_connect_click). With a narrow field of view
@@ -39,6 +47,7 @@ from pathlib import Path
 import numpy as np
 
 from am5.angles import circular_diff_deg
+from am5.polar_alignment import tangent_plane_offset_arcsec
 
 # Matches this project's own "typical ISS rig" default (200mm aperture,
 # 1000mm focal length, 2.9um pixels -- see am5/optics.py's ExposurePanel
@@ -48,8 +57,7 @@ from am5.angles import circular_diff_deg
 # docstring).
 DEFAULT_ARCSEC_PER_PIXEL = 0.6
 
-# ~98700 real stars (Hipparcos, Vmag < 9.5 -- near the catalogue's own
-# completeness limit) -- see assets/bright_stars.LICENSE.txt for provenance.
+# ~937000 real stars (Tycho-2, V < 11.0) -- see assets/bright_stars.LICENSE.txt for provenance.
 STAR_CATALOG_PATH = Path(__file__).resolve().parent.parent / "assets" / "bright_stars.npz"
 
 # Background stars are rendered dimmer than the ISS and scaled by their
@@ -91,7 +99,7 @@ _star_catalog_cache: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
 
 def _load_star_catalog() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """(ra_deg, dec_deg, magnitude) arrays, loaded once and cached at
-    module level -- ~98700 stars, still cheap to keep resident (a few MB)."""
+    module level -- ~937000 stars, still cheap to keep resident (a few MB)."""
     global _star_catalog_cache
     if _star_catalog_cache is None:
         with np.load(STAR_CATALOG_PATH) as data:
@@ -195,16 +203,41 @@ class MockAsiCamera:
         return dx, dy
 
     def _render_stars(self, frame: np.ndarray, boresight_ra: float, boresight_dec: float, gain_scale: float) -> None:
-        """Vectorized over the whole ~98700-star catalog: compute every
-        star's tangent-plane pixel position at once (numpy, not a Python
-        loop over 98700 stars), filter to the handful actually in view, then
-        rasterize just those -- keeps this real-time regardless of catalog
-        depth, since the per-frame cost that scales with star count is a
-        few vectorized array ops, not a Python loop."""
+        """Vectorized over the whole star catalog: compute every star's
+        tangent-plane pixel position at once (numpy, not a Python loop),
+        filter to the handful actually in view, then rasterize just those
+        -- keeps this real-time regardless of catalog depth, since the
+        per-frame cost that scales with star count is a few vectorized
+        array ops, not a Python loop.
+
+        Uses the rigorous gnomonic/TAN tangent-plane projection
+        (am5.polar_alignment.tangent_plane_offset_arcsec), not a flat
+        small-angle approximation -- this USED to be
+        circular_diff_deg(star_ra, boresight_ra) * cos(boresight_dec),
+        which is measurably wrong (hundreds of arcsec/pixels of distortion,
+        confirmed directly) within about a degree of the celestial pole --
+        exactly where polar alignment testing points, which made the mock
+        camera's simulated star field geometrically unlike the real sky
+        there, independent of how many/how faint the catalog's stars are.
+
+        Pre-filters to a declination band around the boresight with a
+        cheap plain array comparison (no trig) BEFORE the gnomonic
+        projection -- added when the Tycho-2 catalog (~937000 stars, vs.
+        the previous Hipparcos extract's ~98700) pushed this method's cost
+        from ~21ms to ~70ms/frame, enough to pin a full CPU core running
+        the finder near-continuously (confirmed: sustained high CPU/heat
+        during a real polar-alignment session, the same class of incident
+        documented in read_frame's own comment about noise generation).
+        Only a thin dec band can possibly land in the sensor regardless of
+        RA, so this cuts the expensive trig down to a small candidate set
+        with no change in which stars actually get rendered."""
         star_ra, star_dec, star_mag = _load_star_catalog()
-        cos_dec = math.cos(math.radians(boresight_dec))
-        dx = circular_diff_deg(star_ra, boresight_ra) * cos_dec * 3600.0
-        dy = (star_dec - boresight_dec) * 3600.0
+        # Half the sensor's angular diagonal, plus a margin -- generous on
+        # purpose (correctness over squeezing out a few more percent).
+        half_fov_deg = math.hypot(self._width, self._height) * self._plate_scale / 3600.0 / 2.0 + 1.0
+        candidate = np.abs(star_dec - boresight_dec) <= half_fov_deg
+        star_ra, star_dec, star_mag = star_ra[candidate], star_dec[candidate], star_mag[candidate]
+        dx, dy = tangent_plane_offset_arcsec(star_ra, star_dec, boresight_ra, boresight_dec)
         star_x = self._width / 2.0 + dx / self._plate_scale
         star_y = self._height / 2.0 - dy / self._plate_scale
         margin = 5.0
@@ -258,7 +291,15 @@ class MockAsiCamera:
         # exposure as a dead control for "how many stars show up".
         exposure_scale = self._exposure_us / EXPOSURE_REFERENCE_US
         gain_scale = (1.0 + self._gain / 570.0) * exposure_scale
-        noise_sigma = 6.0 / max(1.0 + self._gain / 570.0, 0.1)
+        # 2.0, not the original 6.0: real BSI CMOS sensors this mock
+        # targets (IMX678/IMX290) have low read noise, and the higher
+        # value buried most catalog stars a real plate solver would need
+        # (peaks of a few counts above background, see _render_stars) at
+        # a level indistinguishable from noise -- confirmed directly: a
+        # real ASTAP/astrometry.net solve against a mock frame at the old
+        # noise level found only ~2 extractable sources even in a
+        # 16-star-dense field, nowhere near enough for a geometric match.
+        noise_sigma = 2.0 / max(1.0 + self._gain / 570.0, 0.1)
         frame = self._draw_noise(noise_sigma)
 
         with self._sky_lock:

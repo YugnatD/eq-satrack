@@ -36,7 +36,7 @@ from am5.constants import SIDEREAL_DEG_PER_S
 from am5.constellations import constellations_altaz
 from am5.ephemeris import PassWindow, Trajectory, compute_trajectory, find_passes, load_satellite_tle, meridian_crossings
 from am5.named_stars import NAMED_STARS, NamedStar
-from am5.polar_alignment import fit_rotation_axis, polar_alignment_error
+from am5.polar_alignment import correction_triangle_radec, fit_rotation_axis, polar_alignment_error, project_radec_to_pixel
 from am5.optics import (
     DEFAULT_FULL_WELL_ELECTRONS,
     OpticalTrain,
@@ -185,11 +185,11 @@ class CameraControlVars:
     gain_value: tk.StringVar
 
     @classmethod
-    def create(cls) -> "CameraControlVars":
-        exposure_log = tk.DoubleVar(value=3.0)
-        exposure_value = tk.StringVar(value="1.00 ms")
-        gain = tk.DoubleVar(value=300)
-        gain_value = tk.StringVar(value="300")
+    def create(cls, default_exposure_us: float = 1000.0, default_gain: float = 300.0) -> "CameraControlVars":
+        exposure_log = tk.DoubleVar(value=math.log10(default_exposure_us))
+        exposure_value = tk.StringVar(value=format_exposure_us(default_exposure_us))
+        gain = tk.DoubleVar(value=default_gain)
+        gain_value = tk.StringVar(value=f"{default_gain:.0f}")
 
         # One trace each, registered here rather than per-widget, so the
         # formatted label stays correct regardless of which of the two
@@ -1348,6 +1348,7 @@ class TransitPanel(ttk.Frame):
         mount_lag_var: tk.DoubleVar | None = None, mount_max_accel_var: tk.DoubleVar | None = None,
         feedback_enabled_var: tk.BooleanVar | None = None,
         finder_state: FinderState | None = None,
+        on_tracking_trajectory_changed: Callable[[Trajectory | None], None] | None = None,
     ):
         super().__init__(parent, padding=10)
         self._mount_worker = mount_worker
@@ -1360,6 +1361,27 @@ class TransitPanel(ttk.Frame):
 
         # -- tracking state (mount side) --
         self._trajectory: Trajectory | None = None
+        # The trajectory actually being tracked RIGHT NOW -- distinct from
+        # self._trajectory (the currently-selected pass, set as soon as a
+        # pass is picked in the Passes tab, possibly hours before it
+        # starts). _on_simulate_click computes its own time-shifted copy
+        # (real geometry, relabeled to start "now" for rehearsal) and used
+        # to only ever hand it to the tracking loop itself -- this stayed
+        # None/stale, so _maybe_apply_finder_correction kept reading the
+        # ORIGINAL, unshifted, real-future self._trajectory during a
+        # Simulate run, landed outside its real active window on every
+        # interpolate(time.time()) call, and silently did nothing for the
+        # whole run (confirmed directly: real mount + mock camera +
+        # Simulate track + both correction checkboxes on produced no
+        # correction at all). Set on Start/Simulate, cleared on stop --
+        # see _on_start_click/_on_simulate_click/handle_mount_event's own
+        # "tracking_stopped"/"tracking_error" branch.
+        self._active_trajectory: Trajectory | None = None
+        # Propagates self._active_trajectory to CalibrationPanel (see
+        # CalibrationPanel.set_active_trajectory) -- its own auto-guide
+        # correction needs the exact same "what's actually being tracked
+        # right now" trajectory, for the same reason.
+        self._on_tracking_trajectory_changed = on_tracking_trajectory_changed
         self._window: PassWindow | None = None
         self._site: GeographicPosition | None = None
         self._crossings: list = []
@@ -1776,6 +1798,16 @@ class TransitPanel(ttk.Frame):
         self._armed = True
         self._start_button.configure(state="normal")
 
+    def _set_active_trajectory(self, trajectory: Trajectory | None) -> None:
+        """Updates self._active_trajectory (see its own comment for why
+        this must be the trajectory ACTUALLY being tracked right now, not
+        just whichever pass is selected) and propagates it to
+        CalibrationPanel, which needs the exact same thing for its own
+        auto-guide correction."""
+        self._active_trajectory = trajectory
+        if self._on_tracking_trajectory_changed is not None:
+            self._on_tracking_trajectory_changed(trajectory)
+
     def _on_start_click(self) -> None:
         if self._trajectory is None or self._window is None or not self._armed:
             return
@@ -1791,6 +1823,7 @@ class TransitPanel(ttk.Frame):
         csv_path = self._out_dir / f"tracking_{datetime.now().strftime('%Y%m%dT%H%M%S')}.csv"
         duration_s = max(0.0, (self._window.t_set - datetime.now(timezone.utc)).total_seconds())
         duration_s = min(duration_s, MAX_TRACKING_DURATION_S)
+        self._set_active_trajectory(self._trajectory)
         self._mount_worker.start_tracking(
             self._trajectory, self._axis_signs, self._offsets, csv_path, duration_s, self._build_tracking_config(),
         )
@@ -1820,6 +1853,14 @@ class TransitPanel(ttk.Frame):
         duration_s = min(float(shifted.t_unix[-1]) - now, MAX_TRACKING_DURATION_S)
         if self._mount_is_mock and self._training_error_var.get():
             self._inject_training_pointing_error(shifted, now)
+        # Regression fix: this shifted trajectory used to only ever go to
+        # the tracking loop itself -- self._active_trajectory (and
+        # CalibrationPanel's own copy) stayed at whatever it was before,
+        # so both correction paths kept reading the ORIGINAL, unshifted,
+        # real-future trajectory during a Simulate run and always landed
+        # outside its real active window. See _active_trajectory's own
+        # comment for the full incident.
+        self._set_active_trajectory(shifted)
         self._mount_worker.start_tracking(
             shifted, self._axis_signs, self._offsets, csv_path, duration_s, self._build_tracking_config(),
         )
@@ -1979,7 +2020,30 @@ class TransitPanel(ttk.Frame):
                 if self._armed:
                     self._start_button.configure(state="normal")
         elif event.kind == "goto_result":
-            # Native :MS# GOTO complete -- re-enable GOTO buttons
+            # code != 0 means the mount REJECTED the target outright
+            # (below horizon, altitude limit, e7 not-synced, etc.) -- no
+            # polling ever starts in that case (see MountWorker._handle_
+            # goto), so this IS the final word and it's safe to re-enable
+            # now. code == 0 means ACCEPTED and the mount is now actively
+            # slewing -- _poll_until_arrived keeps running well after this
+            # event fires, so re-enabling here unconditionally (the old
+            # behavior) let the operator click Start/Simulate WHILE the
+            # real GOTO was still converging, inheriting a large, silent
+            # along-track error baked in at that moment -- the exact
+            # incident class _disable_goto_buttons exists to prevent
+            # (already fixed for jog_goto_result below; this button just
+            # used the wrong "done" signal). Wait for goto_arrived/
+            # goto_timeout instead.
+            if event.payload.get("code") != 0 and self._mount_connected and self._trajectory is not None:
+                self._jog_goto_button.configure(state="normal")
+                self._mount_goto_button.configure(state="normal")
+                self._arm_button.configure(state="normal")
+                self._simulate_button.configure(state="normal")
+                if self._armed:
+                    self._start_button.configure(state="normal")
+        elif event.kind in ("goto_arrived", "goto_timeout"):
+            # The real "native GOTO is done" signals -- see goto_result's
+            # own comment above for why that one isn't enough on its own.
             if self._mount_connected and self._trajectory is not None:
                 self._jog_goto_button.configure(state="normal")
                 self._mount_goto_button.configure(state="normal")
@@ -1989,6 +2053,11 @@ class TransitPanel(ttk.Frame):
                     self._start_button.configure(state="normal")
         elif event.kind in ("tracking_stopped", "tracking_error"):
             self._stop_button.configure(state="disabled")
+            # No tracking loop is consuming this trajectory anymore --
+            # clear it so a stale (possibly Simulate-shifted) window can't
+            # linger and either wrongly gate or wrongly permit a
+            # correction after the run has actually ended.
+            self._set_active_trajectory(None)
             # Reset the armed flag so it matches the now-disabled Start
             # button (which stays disabled here -- Start is never
             # re-enabled by this branch). Before this, _armed stayed True
@@ -2007,10 +2076,19 @@ class TransitPanel(ttk.Frame):
 
     def _maybe_apply_finder_correction(self) -> None:
         """Apply a cross-track correction from the finder camera if it has
-        a blob locked AND its field has been calibrated against the main
-        camera. Uses the same trigger_perp_pulse mechanism as auto-guiding
-        -- gentle, bounded pulses, not instantaneous position jumps.
-        Only active when the finder checkbox is checked.
+        a blob locked AND both required calibrations exist -- FinderState.
+        get_correction_arcsec needs its OWN finder-to-main geometric
+        calibration (FinderCameraPanel's "Calibrate fields") AND the main
+        camera's nudge-verified camera-to-sky GuidingCalibration
+        (CalibrationPanel's "Calibrate camera-to-sky mapping", propagated
+        into FinderState by CalibrationPanel -- see FinderState.
+        main_calibration's own field docstring for why the finder-to-main
+        calibration alone isn't enough: it only knows the finder's roll
+        relative to the main camera's OWN pixel axes, not how those axes
+        relate to true sky along/cross-track directions). Uses the same
+        trigger_perp_pulse mechanism as auto-guiding -- gentle, bounded
+        pulses, not instantaneous position jumps. Only active when the
+        finder checkbox is checked.
 
         Regression fix: this method used to be defined on CalibrationPanel
         (which has neither self._finder_state nor self._finder_correct_var
@@ -2028,16 +2106,68 @@ class TransitPanel(ttk.Frame):
         real, reported "the app just freezes" symptom far better than
         any per-frame performance cost does. Confirmed by reproducing an
         actual live Simulate-track session end-to-end against a mock
-        rig and watching it crash on the first tracking_tick."""
-        if self._finder_state is None or not self._finder_correct_var.get():
+        rig and watching it crash on the first tracking_tick.
+
+        Second regression fix: this used to take FinderCalibration.
+        finder_px_to_correction_arcsec's own hand-rotated "along/cross"
+        output as if it were already sky-frame along/cross-track, with no
+        calibration actually linking the main camera's own pixel axes to
+        the sky -- see CalibrationPanel._maybe_apply_auto_guide_
+        correction's docstring for the same class of bug just fixed on the
+        main-camera auto-guide path (an inverted/unverified sign pushing
+        the mount away from the target). Now routes through the main
+        camera's OWN GuidingCalibration (via FinderState.
+        get_correction_arcsec) and am5.tracker.decompose_error against the
+        real trajectory, exactly like the main-camera path -- including
+        the same negation (error_cross_deg = -cross_deg): decompose_error
+        returns (actual - target), so the correction has to point the
+        other way to close the gap.
+
+        Third regression fix: this used to run unconditionally alongside
+        CalibrationPanel's own auto-guide correction whenever both were
+        enabled -- two independent correctors, at different precisions/
+        update rates, both nudging the SAME trigger_perp_pulse from
+        different blob detections, fighting each other instead of a clean
+        handoff. Now backs off once the main camera has its own lock (see
+        FinderState.main_blob_locked's own field docstring) -- acquire via
+        the wide finder field while the ISS isn't in the main camera's
+        narrow FOV yet, then let auto-guide take over exclusively once it
+        is, matching the acquire-then-track workflow this pair of
+        checkboxes is meant to give.
+
+        Fourth regression fix: same class of bug as CalibrationPanel.
+        _maybe_apply_auto_guide_correction's own fourth fix -- outside the
+        trajectory's active window (a pass selected in advance, or
+        tracking started early and sitting at the boundary), interpolate()
+        zeroes dra_dt/ddec_dt, and decompose_error's zero-speed branch
+        then returns an always-non-negative magnitude for cross instead of
+        a signed value, which error_cross_deg = -cross_deg turns into an
+        always-negative "correction" regardless of the true error
+        direction. Skip instead of applying a degenerate direction.
+
+        Fifth regression fix: reads self._active_trajectory now, not
+        self._trajectory (the SELECTED pass, set as soon as one is picked
+        in the Passes tab, possibly hours before it starts) -- see
+        _active_trajectory's own comment for the incident this fixes
+        (Simulate's own time-shifted trajectory never reached this
+        method, so it read the original, real-future trajectory and
+        landed outside its active window for the whole run)."""
+        if self._finder_state is None or not self._finder_correct_var.get() or self._active_trajectory is None:
+            return
+        if self._finder_state.main_blob_locked:
             return
         correction = self._finder_state.get_correction_arcsec()
         if correction is None:
             return
-        _along_arcsec, cross_arcsec = correction
-        if abs(cross_arcsec) < 5.0:  # ~5" dead-band -- don't over-correct noise
+        d_ra_arcsec, d_dec_arcsec = correction
+        _, dec_deg, dra_dt, ddec_dt = self._active_trajectory.interpolate(time.time())
+        if math.hypot(dra_dt * math.cos(math.radians(dec_deg)), ddec_dt) < 1e-9:
+            return  # outside the trajectory's active window -- no real track direction to correct against
+        _, cross_deg = decompose_error(d_ra_arcsec / 3600.0, d_dec_arcsec / 3600.0, dec_deg, dra_dt, ddec_dt)
+        error_cross_deg = -cross_deg
+        if abs(error_cross_deg * 3600.0) < 5.0:  # ~5" dead-band -- don't over-correct noise
             return
-        self._offsets.trigger_perp_pulse(1.0 if cross_arcsec > 0 else -1.0)
+        self._offsets.trigger_perp_pulse(1.0 if error_cross_deg > 0 else -1.0)
 
     # ==================================================================
     # Camera column
@@ -2403,7 +2533,20 @@ class TransitPanel(ttk.Frame):
             self._buffer_pct_var.set("")
             self._file_size_var.set("")
         elif event.kind == "preview_frame":
-            self._show_preview_frame(event.payload["pgm"], event.payload["width"], event.payload["height"])
+            # Decoding/scaling into a PhotoImage costs real CPU (measured
+            # ~4ms/frame at this project's own reference main-camera
+            # resolution, ~4% of a core continuously at the 10Hz preview
+            # rate) for literally nothing while this tab isn't the
+            # selected one -- a ttk.Notebook only maps the current page's
+            # widgets. _display_w/_display_h/_display_scale (used for ROI
+            # drag mapping) are safe to skip too: the canvas isn't on
+            # screen, so no drag can physically be happening to need them;
+            # the next preview_frame after this tab becomes visible again
+            # refreshes them before any drag could occur. Same gate as
+            # FinderWindow/FinderCameraPanel/CalibrationPanel's own preview
+            # panes.
+            if self._preview_canvas.winfo_ismapped():
+                self._show_preview_frame(event.payload["pgm"], event.payload["width"], event.payload["height"])
             capacity = event.payload.get("buffer_capacity", 0)
             used = event.payload.get("buffer_used", 0)
             pct = (used / capacity * 100.0) if capacity else 0.0
@@ -2836,6 +2979,14 @@ class AlignmentPanel(ttk.Frame):
         self._selected_star: NamedStar | None = None
         self._connected = False
         self._parked = False
+        # Regression fix: _refresh_widget_states used to derive the GOTO
+        # button's state purely from connected/parked/has_star, with no
+        # notion of "a GOTO is already running" -- _on_star_selected calls
+        # _refresh_widget_states() on every sky-map click, so an operator
+        # picking a different star while a previous GOTO was still
+        # slewing would re-enable the button and could fire a second,
+        # overlapping GOTO on top of the first.
+        self._goto_in_progress = False
         self._alignment_mode = False
         self._refresh_after_id: str | None = None
         self._solvers = {"astap": PlateSolver(), "astrometry_net": AstrometryNetSolver()}
@@ -2847,11 +2998,20 @@ class AlignmentPanel(ttk.Frame):
         self._polar_rotation_deg = 0.0
         self._polar_rate_x = 0.0
         self._polar_direction = "e"
+        self._polar_last_solve_result = None
+        # (axis_delta, az_corrected_delta, true_pole_delta) pixel offsets
+        # from the last-solved frame's centre, or None -- see
+        # _update_polar_overlay/_refresh_polar_preview.
+        self._polar_overlay: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] | None = None
+        # (ra_deg, dec_deg) of the last known mount position, updated by
+        # _update_mount_position -- fed to the solver as a hint (see
+        # _polar_capture_point). None until the first "position" event.
+        self._last_mount_radec: tuple[float, float] | None = None
 
         sub_notebook = ttk.Notebook(self)
         sub_notebook.pack(fill="both", expand=True)
-        sub_notebook.add(self._build_sync_tab(sub_notebook), text="Multi-star sync")
         sub_notebook.add(self._build_polar_tab(sub_notebook), text="Polar alignment")
+        sub_notebook.add(self._build_sync_tab(sub_notebook), text="Multi-star sync")
 
         self._refresh_stars()
 
@@ -3046,7 +3206,37 @@ class AlignmentPanel(ttk.Frame):
             drawn = show_frame_on_canvas(self._polar_preview_canvas, frame)
             if drawn is not None:
                 self._polar_preview_image = drawn.photo  # keep a reference -- Tk drops images with none
+                self._draw_polar_overlay(drawn, frame.shape[1], frame.shape[0])
         self._polar_preview_after_id = self.after(200, self._refresh_polar_preview)
+
+    def _draw_polar_overlay(self, drawn: CanvasFrame, frame_width: int, frame_height: int) -> None:
+        """Draws the KStars-PAA-style correction triangle computed by
+        _update_polar_overlay on top of the live preview frame
+        show_frame_on_canvas just drew -- axis position, true-pole target,
+        and the two legs (pure azimuth, then pure altitude) connecting
+        them. A no-op until the first 3-point measurement completes."""
+        if self._polar_overlay is None:
+            return
+        (axis_dc, axis_dr), (az_dc, az_dr), (pole_dc, pole_dr) = self._polar_overlay
+
+        def to_canvas_xy(delta_col: float, delta_row: float) -> tuple[float, float]:
+            full_x = frame_width / 2.0 + delta_col
+            full_y = frame_height / 2.0 + delta_row
+            return drawn.x_offset + full_x * drawn.scale, drawn.y_offset + full_y * drawn.scale
+
+        axis_xy = to_canvas_xy(axis_dc, axis_dr)
+        az_xy = to_canvas_xy(az_dc, az_dr)
+        pole_xy = to_canvas_xy(pole_dc, pole_dr)
+
+        canvas = self._polar_preview_canvas
+        canvas.create_line(*axis_xy, *az_xy, fill=PALETTE.accent_warn, width=2, dash=(4, 2))
+        canvas.create_line(*az_xy, *pole_xy, fill=PALETTE.accent, width=2, dash=(4, 2))
+        r = 6
+        canvas.create_oval(axis_xy[0] - r, axis_xy[1] - r, axis_xy[0] + r, axis_xy[1] + r, outline=PALETTE.fg, width=2)
+        canvas.create_text(axis_xy[0], axis_xy[1] - r - 8, text="axis", fill=PALETTE.fg, font=("", 8))
+        canvas.create_line(pole_xy[0] - r, pole_xy[1], pole_xy[0] + r, pole_xy[1], fill=PALETTE.accent_ok, width=2)
+        canvas.create_line(pole_xy[0], pole_xy[1] - r, pole_xy[0], pole_xy[1] + r, fill=PALETTE.accent_ok, width=2)
+        canvas.create_text(pole_xy[0], pole_xy[1] - r - 8, text="true pole", fill=PALETTE.accent_ok, font=("", 8))
 
     def _on_polar_start_click(self) -> None:
         try:
@@ -3061,6 +3251,8 @@ class AlignmentPanel(ttk.Frame):
         self._polar_start_button.configure(state="disabled")
         self._polar_result_var.set("")
         self._polar_points = []
+        self._polar_last_solve_result = None
+        self._polar_overlay = None  # stale overlay from a previous run must not linger during a new capture sequence
         # Sign of rotation_deg picks the RA jog direction -- negative
         # rotates west instead of east, so a run can be immediately
         # followed by an opposite-direction run to end up roughly back
@@ -3087,8 +3279,10 @@ class AlignmentPanel(ttk.Frame):
             self._polar_status_var.set(f"Unknown plate scale for the {self._polar_camera_var.get()} camera")
             self._polar_start_button.configure(state="normal")
             return
+        hint_ra_deg, hint_dec_deg = (self._last_mount_radec if self._last_mount_radec is not None else (None, None))
         self._current_solver().solve_async(
             frame.copy(), self, lambda result, idx=point_index: self._on_polar_solve_done(idx, result), fov_deg=fov_deg,
+            hint_ra_deg=hint_ra_deg, hint_dec_deg=hint_dec_deg,
         )
 
     def _on_polar_solve_done(self, point_index: int, result) -> None:
@@ -3097,6 +3291,11 @@ class AlignmentPanel(ttk.Frame):
             self._polar_start_button.configure(state="normal")
             return
         self._polar_points.append((result.ra_deg, result.dec_deg))
+        # Kept for the overlay: only the LAST (point 3) solve's WCS is
+        # relevant, since that's the frame still showing in the live view
+        # once the sequence finishes -- naturally ends up holding point
+        # 3's result by the time _finish_polar_alignment runs.
+        self._polar_last_solve_result = result
         if point_index >= 3:
             self._finish_polar_alignment()
             return
@@ -3133,7 +3332,34 @@ class AlignmentPanel(ttk.Frame):
             f"Altitude: {alt_direction} by {abs(result.error_alt_deg) * 60.0:.1f}'\n"
             f"Azimuth: rotate the base {az_direction} by {abs(result.error_az_deg) * 60.0:.1f}'"
         )
+        self._update_polar_overlay(axis_ra_deg, axis_dec_deg, lat, lon)
         self._polar_start_button.configure(state="normal")
+
+    def _update_polar_overlay(self, axis_ra_deg: float, axis_dec_deg: float, lat: float, lon: float) -> None:
+        """KStars-PAA-style correction overlay: where the mount's fitted
+        axis currently sits vs. where the true pole is, drawn on the live
+        preview as two legs (pure azimuth, then pure altitude -- the only
+        two directions the mount's own adjusters can actually move it in,
+        see correction_triangle_radec's docstring). Projected into the
+        LAST captured frame's pixel space using that solve's own WCS
+        (pixel_scale_arcsec/field_rotation_deg) -- static, per the chosen
+        design: it reflects the just-completed measurement, not a live
+        re-solve, so it stays valid exactly as long as the mount hasn't
+        been slewed since (only the alt/az adjusters are expected to move
+        between here and the next run)."""
+        solve = self._polar_last_solve_result
+        if solve is None or solve.pixel_scale_arcsec <= 0:
+            self._polar_overlay = None
+            return
+        when = datetime.now(timezone.utc)
+        (az_ra, az_dec), (pole_ra, pole_dec) = correction_triangle_radec(axis_ra_deg, axis_dec_deg, lat, lon, when)
+        center_ra, center_dec = solve.ra_deg, solve.dec_deg
+        scale, rot = solve.pixel_scale_arcsec, solve.field_rotation_deg
+        self._polar_overlay = (
+            project_radec_to_pixel(axis_ra_deg, axis_dec_deg, center_ra, center_dec, scale, rot),
+            project_radec_to_pixel(az_ra, az_dec, center_ra, center_dec, scale, rot),
+            project_radec_to_pixel(pole_ra, pole_dec, center_ra, center_dec, scale, rot),
+        )
 
     # -- sky map / star selection --------------------------------------------
 
@@ -3171,11 +3397,18 @@ class AlignmentPanel(ttk.Frame):
     # -- actions ---------------------------------------------------------------
 
     def _on_goto_click(self) -> None:
+        # Native mount GOTO (:MS#, firmware-driven, handles pier side on
+        # its own), not jog_goto -- jog_goto's own divergence guard is
+        # documented (see am5.angles.angular_separation_deg's docstring)
+        # as meant for short, close-in final-approach corrections, not an
+        # arbitrary-distance slew to a freshly-selected star anywhere on
+        # the sky map, which is exactly this button's use case.
         if self._selected_star is None:
             return
+        self._goto_in_progress = True
         self._goto_button.configure(state="disabled")
         self._status_var.set(f"GOTO {self._selected_star.name}...")
-        self._mount_worker.jog_goto(self._selected_star.ra_hours, self._selected_star.dec_deg, self._axis_signs)
+        self._mount_worker.goto(self._selected_star.ra_hours, self._selected_star.dec_deg)
 
     def _on_sync_click(self) -> None:
         if self._selected_star is None:
@@ -3202,6 +3435,7 @@ class AlignmentPanel(ttk.Frame):
     def _update_mount_position(self, ra_hours: float, dec_deg: float) -> None:
         lat, lon = self._current_site()
         self._mount_position_var.set(f"Mount: RA={ra_hours:.3f}h  DEC={dec_deg:+.2f} deg")
+        self._last_mount_radec = (ra_hours * 15.0, dec_deg)
         if lat is not None and lon is not None:
             az_deg, alt_deg = equatorial_to_altaz(ra_hours * 15.0, dec_deg, lat, lon, datetime.now(timezone.utc))
             self._sky_map.update_mount_marker(az_deg, alt_deg)
@@ -3213,8 +3447,24 @@ class AlignmentPanel(ttk.Frame):
             actual_ra_deg = event.payload["actual_ra_deg"]
             if actual_ra_deg != "":  # only populated every error_log_every ticks, see am5/tracker.py
                 self._update_mount_position(actual_ra_deg / 15.0, event.payload["actual_dec_deg"])
-        elif event.kind == "jog_goto_result":
-            self._status_var.set("Arrived" if event.payload.get("arrived") else "Did not arrive -- check the log")
+        elif event.kind == "goto_result":
+            # code != 0 means the mount REJECTED the target outright (below
+            # horizon, altitude limit, e7 not-synced, etc.) -- no polling
+            # ever starts in that case, so this IS the final word. code ==
+            # 0 means ACCEPTED and the mount is now actively slewing --
+            # wait for goto_arrived/goto_timeout instead of re-enabling
+            # here, same fix as TransitPanel's own goto_result handling
+            # (see its handle_mount_event for the full incident this
+            # guards against: re-enabling here unconditionally let an
+            # operator click GOTO again while the mount was still
+            # converging on the previous target).
+            if event.payload.get("code") != 0:
+                self._status_var.set(f"GOTO rejected: {event.payload.get('meaning', '?')}")
+                self._goto_in_progress = False
+                self._refresh_widget_states()
+        elif event.kind in ("goto_arrived", "goto_timeout"):
+            self._status_var.set("Arrived" if event.kind == "goto_arrived" else "Did not arrive -- check the log")
+            self._goto_in_progress = False
             self._refresh_widget_states()
         elif event.kind == "sync_result":
             self._status_var.set(event.payload["message"] if event.payload["ok"] else f"Sync failed: {event.payload['message']}")
@@ -3241,6 +3491,12 @@ class AlignmentPanel(ttk.Frame):
         if not connected:
             self._parked = False
             self._mount_position_var.set("Mount: not connected")
+            # Otherwise a disconnect mid-GOTO leaves _goto_in_progress
+            # stuck True forever -- the button would stay disabled even
+            # after reconnecting, with no way to recover short of restart
+            # (same class of bug as CalibrationPanel's own _calib_step
+            # reset on disconnect).
+            self._goto_in_progress = False
         self._refresh_widget_states()
 
     def set_trajectory(self, trajectory: Trajectory, window: PassWindow, satellite_name: str) -> None:
@@ -3257,7 +3513,9 @@ class AlignmentPanel(ttk.Frame):
 
     def _refresh_widget_states(self) -> None:
         has_star = self._selected_star is not None
-        self._goto_button.configure(state="normal" if (self._connected and not self._parked and has_star) else "disabled")
+        self._goto_button.configure(
+            state="normal" if (self._connected and not self._parked and has_star and not self._goto_in_progress) else "disabled"
+        )
         # Sync never moves the mount (see Mount.sync's docstring) -- only
         # needs a connection, not an unparked state.
         self._sync_button.configure(state="normal" if (self._connected and has_star) else "disabled")
@@ -3291,12 +3549,22 @@ class CalibrationPanel(ttk.Frame):
         self, parent: tk.Misc, mount_worker: MountWorker, camera_worker: CameraWorker, live_offsets: LiveOffsets,
         auto_guide_var: tk.BooleanVar | None = None, on_calibration_ready: Callable[[], None] | None = None,
         mount_lag_var: tk.DoubleVar | None = None, mount_max_accel_var: tk.DoubleVar | None = None,
-        axis_signs: AxisSigns | None = None,
+        axis_signs: AxisSigns | None = None, finder_state: FinderState | None = None,
+        on_finder_calibration_ready: Callable[[], None] | None = None,
     ):
         super().__init__(parent, padding=10)
         self._mount_worker = mount_worker
         self._camera_worker = camera_worker
         self._live_offsets = live_offsets
+        # Shared with TransitPanel/FinderCameraPanel (same instance, owned
+        # by App) when passed -- a successful "Calibrate camera-to-sky
+        # mapping" here is propagated into it (see _calib_dec_measure)
+        # so TransitPanel's finder-correction path can chain through it
+        # too (see FinderState.main_calibration's own field docstring for
+        # why the finder-to-main calibration alone isn't enough). Falls
+        # back to None so this panel still works standalone (tests) --
+        # the propagation is just skipped in that case.
+        self._finder_state = finder_state
         # Shared with TransitPanel/JogWindow (same instance, owned by App)
         # when passed -- App auto-corrects dec's sign in place on a pier
         # flip (see AxisSigns.update_pier_side), and the status label below
@@ -3322,7 +3590,30 @@ class CalibrationPanel(ttk.Frame):
         # (button click -> two self.after() timers), not via a worker event,
         # so there's nothing on a queue for App to poll instead.
         self._on_calibration_ready = on_calibration_ready
-        self._trajectory: Trajectory | None = None
+        # Same rationale as _on_calibration_ready, for the SEPARATE finder-
+        # to-main field calibration below (moved here from FinderCameraPanel
+        # so both calibrations that TransitPanel's checkboxes depend on live
+        # in one tab -- see _build_finder_calibration_section).
+        self._on_finder_calibration_ready = on_finder_calibration_ready
+        # Regression fix: this used to be set once from App._on_pass_
+        # selected (a pass can be selected hours before it starts) and
+        # never touched again -- in particular, TransitPanel._on_simulate_
+        # click computes its own time-shifted trajectory (real geometry,
+        # relabeled to start "now" for rehearsal) but only ever handed it
+        # to the tracking loop itself, never to this panel. So during a
+        # real Simulate run, self._trajectory here stayed the ORIGINAL,
+        # unshifted, real-future trajectory -- _maybe_apply_auto_guide_
+        # correction's own interpolate(time.time()) call landed outside
+        # that trajectory's real active window every time, hit the
+        # zero-velocity guard (see that method's own docstring), and
+        # silently did nothing for the whole Simulate run. Confirmed
+        # directly: real mount + mock camera + Simulate track + both
+        # correction checkboxes on produced no correction at all. Renamed
+        # in effect to "whatever trajectory is ACTUALLY being tracked
+        # right now, or None" -- see set_active_trajectory, wired from
+        # TransitPanel's own Start/Simulate/stop handling instead of pass
+        # selection.
+        self._active_trajectory: Trajectory | None = None
 
         self._calibration: GuidingCalibration | None = None
         self._calib_step: str | None = None  # None when idle
@@ -3357,24 +3648,51 @@ class CalibrationPanel(ttk.Frame):
         self._connected = False
         self._parked = False
 
-        self._build_mount_calibration_section(self)
+        # Two sub-tabs: mount-side calibration (axis signs, mount lag,
+        # clock sync, health -- no camera involved) and camera-side
+        # calibration (both the main-to-sky and finder-to-main
+        # calibrations, plus both live previews side by side) -- split out
+        # after this tab grew to hold both kinds of one-time session setup
+        # at once, which got hard to scan as a single flat page.
+        # Stored (not a local) so a caller/test can select the right page
+        # explicitly -- e.g. the preview panes only become winfo_ismapped()
+        # (see handle_camera_event/handle_finder_camera_event's own
+        # rationale for gating rendering on that) once "Camera calibration"
+        # is the selected sub-tab, not just whenever this outer tab itself
+        # is selected in App's own top-level notebook.
+        self._sub_notebook = ttk.Notebook(self)
+        self._sub_notebook.pack(fill="both", expand=True)
+        mount_tab = ttk.Frame(self._sub_notebook, padding=10)
+        camera_tab = ttk.Frame(self._sub_notebook, padding=10)
+        self._sub_notebook.add(mount_tab, text="Mount calibration")
+        self._sub_notebook.add(camera_tab, text="Camera calibration")
 
-        columns = ttk.Frame(self)
-        columns.pack(fill="both", expand=True)
-        left = ttk.Frame(columns)
-        left.pack(side="left", fill="both", expand=True)
-        right = ttk.Frame(columns)
-        right.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        self._build_mount_calibration_section(mount_tab)
+        self._build_camera_calibration_tab(camera_tab)
 
+        self.set_connected(False)
+        self.after(200, self._poll_clock_sync_results)
+
+    # -- camera calibration tab (main-to-sky, finder-to-main, both previews) --
+
+    def _build_camera_calibration_tab(self, parent: tk.Misc) -> None:
+        controls = ttk.Frame(parent)
+        controls.pack(fill="x")
+        main_col = ttk.Frame(controls)
+        main_col.pack(side="left", anchor="n", fill="both", expand=True)
+        finder_col = ttk.Frame(controls)
+        finder_col.pack(side="left", anchor="n", fill="both", expand=True, padx=(10, 0))
+
+        main_frame = ttk.LabelFrame(main_col, text="Main camera -> sky mapping", padding=8)
+        main_frame.pack(fill="both", expand=True)
         ttk.Label(
-            left,
+            main_frame,
             text="Camera-based auto-guiding: detects the ISS in the live preview and\n"
                  "nudges the mount to keep it centered, on top of the usual feedforward tracking.",
             justify="left",
         ).pack(anchor="w")
-
         ttk.Label(
-            left,
+            main_frame,
             text="1) Point the camera at any bright, steady object (a star with sidereal\n"
                  "   tracking on, or even a distant light at night) -- it does NOT need to\n"
                  "   be the ISS, this only measures how the camera is physically mounted.\n"
@@ -3384,7 +3702,7 @@ class CalibrationPanel(ttk.Frame):
             justify="left", foreground=PALETTE.fg_dim,
         ).pack(anchor="w", pady=(4, 8))
 
-        speed_row = ttk.Frame(left)
+        speed_row = ttk.Frame(main_frame)
         speed_row.pack(anchor="w", pady=(0, 8))
         ttk.Label(speed_row, text="Nudge rate (x sidereal)").pack(side="left")
         self._calib_rate_var = tk.StringVar(value=str(GUIDING_CALIB_NUDGE_RATE_X))
@@ -3393,20 +3711,20 @@ class CalibrationPanel(ttk.Frame):
         self._calib_duration_var = tk.StringVar(value=str(GUIDING_CALIB_NUDGE_DURATION_S))
         ttk.Entry(speed_row, textvariable=self._calib_duration_var, width=6).pack(side="left", padx=(4, 0))
         ttk.Label(
-            left,
+            main_frame,
             text="Lower these for a narrow field of view (long focal length) -- the\n"
                  "defaults can push the target out of frame before it's measured.",
             foreground=PALETTE.fg_dim, justify="left",
         ).pack(anchor="w", pady=(0, 8))
 
-        self._calibrate_button = ttk.Button(left, text="Calibrate camera-to-sky mapping", command=self._on_calibrate_click)
+        self._calibrate_button = ttk.Button(main_frame, text="Calibrate camera-to-sky mapping", command=self._on_calibrate_click)
         self._calibrate_button.pack(anchor="w")
         self._motion_widgets.append(self._calibrate_button)
         self._calib_status_var = tk.StringVar(value="Not calibrated this session")
-        ttk.Label(left, textvariable=self._calib_status_var).pack(anchor="w", pady=(2, 8))
+        ttk.Label(main_frame, textvariable=self._calib_status_var).pack(anchor="w", pady=(2, 8))
 
         ttk.Label(
-            left,
+            main_frame,
             text="Once calibrated, enable auto-guiding from the Transit tab (it's only\n"
                  "useful during an active pass). Only corrects cross-track (sideways drift)\n"
                  "automatically -- along-track (ahead/behind) stays a manual delta_t call,\n"
@@ -3416,14 +3734,33 @@ class CalibrationPanel(ttk.Frame):
         ).pack(anchor="w", pady=(4, 0))
 
         self._blob_status_var = tk.StringVar(value="No frame yet")
-        ttk.Label(left, textvariable=self._blob_status_var, justify="left").pack(anchor="w", pady=(8, 0))
+        ttk.Label(main_frame, textvariable=self._blob_status_var, justify="left").pack(anchor="w", pady=(8, 0))
 
-        ttk.Label(right, text="Live preview (crosshair = detected ISS position)").pack(anchor="w")
-        self._preview_label = tk.Label(right, background="black")
+        self._build_finder_calibration_section(finder_col)
+
+        previews = ttk.Frame(parent)
+        previews.pack(fill="both", expand=True, pady=(10, 0))
+        main_preview_col = ttk.Frame(previews)
+        main_preview_col.pack(side="left", anchor="n", fill="both", expand=True)
+        finder_preview_col = ttk.Frame(previews)
+        finder_preview_col.pack(side="left", anchor="n", fill="both", expand=True, padx=(10, 0))
+
+        ttk.Label(main_preview_col, text="Main camera (crosshair = detected ISS position)").pack(anchor="w")
+        self._preview_label = tk.Label(main_preview_col, background="black")
         self._preview_label.pack(anchor="w", pady=(4, 0))
 
-        self.set_connected(False)
-        self.after(200, self._poll_clock_sync_results)
+        ttk.Label(finder_preview_col, text="Finder camera (green = main camera's FOV, red = detected ISS)").pack(anchor="w")
+        # A Canvas, not a Label like the main preview above -- needs to
+        # draw the main camera's FOV rectangle and blob marker ON TOP of
+        # the image (FinderState.main_fov_corners_px/blob_found), same as
+        # FinderCameraPanel's own preview canvas. A Label can only show a
+        # flat image, no overlay.
+        self._finder_preview_canvas = tk.Canvas(
+            finder_preview_col, background="black",
+            width=MAX_CALIBRATION_PREVIEW_DIM, height=MAX_CALIBRATION_PREVIEW_DIM, highlightthickness=0,
+        )
+        self._finder_preview_canvas.pack(anchor="w", pady=(4, 0))
+        self._finder_preview_image: tk.PhotoImage | None = None
 
     # -- mount calibration section (axis signs, mount lag, clock sync) -------
 
@@ -3555,6 +3892,174 @@ class CalibrationPanel(ttk.Frame):
         self._health_var.set("Reading...")
         self._mount_worker.read_mount_health()
 
+    # -- finder-to-main field calibration ------------------------------------
+
+    def _build_finder_calibration_section(self, parent: tk.Misc) -> None:
+        """Moved here from FinderCameraPanel (the Finder tab) so both
+        calibrations TransitPanel's checkboxes depend on -- this one
+        (finder-to-main geometry) AND the camera-to-sky one above (main-to-
+        sky) -- live in a single tab, run in the natural order: point both
+        cameras at the same field and calibrate here first (a one-time
+        per-session setup step, no active pass needed), then run the
+        camera-to-sky calibration above during a pass. Only meaningful if
+        a finder camera is in use at all -- self._finder_state is None for
+        a rig with no finder (or in tests that don't wire one), in which
+        case this section still builds but nothing in it will ever
+        collect real frames; that's fine, it just stays visibly disabled."""
+        frame = ttk.LabelFrame(parent, text="Finder-to-main field calibration (optional -- only if using a finder camera)", padding=8)
+        frame.pack(anchor="w", fill="x", pady=(0, 10))
+        ttk.Label(
+            frame,
+            text="Point both the finder and main cameras at the same star field (connect both\n"
+                 "in the Connection tab first), then click Calibrate -- FFT cross-correlation finds\n"
+                 "the offset between them in ~1s and stores it for this session. Needed for the\n"
+                 "Transit tab's \"Enable finder correction\" checkbox, on top of the camera-to-sky\n"
+                 "calibration above (the finder-to-main geometry alone doesn't know how the main\n"
+                 "camera's own axes relate to true sky directions).",
+            foreground=PALETTE.fg_dim, justify="left",
+        ).pack(anchor="w")
+        row = ttk.Frame(frame)
+        row.pack(anchor="w", pady=(6, 0))
+        # Read-only -- the real plate scales come from whatever optics were
+        # actually configured in the Connection tab at connect time (see
+        # FinderState.main_plate_scale_arcsec/finder_plate_scale_arcsec),
+        # not a separately-typed field here that could silently drift out
+        # of sync with the real configuration.
+        self._finder_scales_status_var = tk.StringVar(value="")
+        ttk.Label(row, textvariable=self._finder_scales_status_var, foreground=PALETTE.fg_dim).pack(side="left", padx=(0, 8))
+        # Manual, NOT auto-measured -- see FinderCalibration.calibrate_from_
+        # frames' own docstring (this project's star fields are too sparse
+        # for FFT-based rotation/scale registration to be reliable).
+        ttk.Label(row, text="Rotation (deg):").pack(side="left")
+        self._finder_rotation_var = tk.StringVar(value="0.0")
+        ttk.Entry(row, textvariable=self._finder_rotation_var, width=6).pack(side="left", padx=(4, 8))
+        self._finder_calib_btn = ttk.Button(row, text="Calibrate fields", command=self._on_calibrate_finder_fields, state="disabled")
+        self._finder_calib_btn.pack(side="left")
+        self._finder_calib_status_var = tk.StringVar(value="Not calibrated")
+        ttk.Label(frame, textvariable=self._finder_calib_status_var, foreground=PALETTE.fg_dim).pack(anchor="w", pady=(4, 0))
+        self._refresh_finder_scales_status()
+
+    def _refresh_finder_scales_status(self) -> None:
+        if self._finder_state is None:
+            self._finder_scales_status_var.set("No finder camera configured")
+            return
+        self._finder_scales_status_var.set(
+            f"finder {self._finder_state.finder_plate_scale_arcsec:.3f}\"/px, "
+            f"main {self._finder_state.main_plate_scale_arcsec:.3f}\"/px "
+            "(from the Connection tab)"
+        )
+
+    def _on_calibrate_finder_fields(self) -> None:
+        """Cross-correlates the latest finder frame against the most recent
+        main-camera frame to compute the field offset -- moved from
+        FinderCameraPanel._on_calibrate, reading both frames from
+        self._finder_state (kept live by FinderCameraPanel's own
+        preview_frame handling regardless of which tab is active, same as
+        every other cross-panel shared-state field in this codebase)
+        instead of a private frame copy, since this panel never receives
+        the finder camera's own preview_frame events directly."""
+        if self._finder_state is None or self._finder_state.last_frame is None:
+            self._finder_calib_status_var.set("No finder frame yet -- wait for preview")
+            return
+        finder_frame = self._finder_state.last_frame
+        main_frame = self._finder_state.last_main_frame
+        used_fallback = main_frame is None
+        if used_fallback:
+            # Fall back: calibrate finder to itself (offset = 0, still useful
+            # for ISS blob -> correction when both cameras share the boresight)
+            main_frame = finder_frame
+        try:
+            rotation_deg = float(self._finder_rotation_var.get())
+        except ValueError:
+            self._finder_calib_status_var.set("Invalid rotation value")
+            return
+        finder_scale = self._finder_state.finder_plate_scale_arcsec
+        main_scale = self._finder_state.main_plate_scale_arcsec
+        self._finder_calib_status_var.set("Calibrating…")
+        self.update_idletasks()
+        try:
+            self._finder_state.calibration.calibrate_from_frames(
+                main_frame, finder_frame,
+                main_plate_scale_arcsec=main_scale,
+                finder_plate_scale_arcsec=finder_scale,
+                rotation_deg=rotation_deg,
+            )
+            dr = self._finder_state.calibration.offset_row
+            dc = self._finder_state.calibration.offset_col
+            fallback_note = (
+                " -- WARNING: no main camera frame yet, calibrated the finder against itself "
+                "(offset is meaningless -- point both cameras at the same field and retry)"
+                if used_fallback else ""
+            )
+            self._finder_calib_status_var.set(
+                f"Calibrated ✓  offset ({dr:+.1f}, {dc:+.1f}) finder px  "
+                f"scale ratio {self._finder_state.calibration.plate_scale_ratio:.2f}  "
+                f"rotation {rotation_deg:+.1f}°{fallback_note}"
+            )
+            if self._on_finder_calibration_ready is not None:
+                self._on_finder_calibration_ready()
+        except Exception as exc:  # noqa: BLE001
+            self._finder_calib_status_var.set(f"Calibration failed: {exc}")
+
+    def handle_finder_camera_event(self, event: CameraEvent) -> None:
+        """Fed from App._pump_events' finder_worker loop, alongside
+        FinderCameraPanel/FinderWindow's own handlers -- this panel needs
+        connect state (to gate _finder_calib_btn), the plate-scale status
+        line, AND a live preview (see _build_camera_calibration_tab's own
+        rationale for showing both cameras' feeds side by side here) so
+        the operator can watch both fields while running either
+        calibration without switching tabs. Blob detection itself stays
+        FinderCameraPanel's job (FinderState.update_frame) -- this just
+        redraws whatever it already found, same as the crosshair on the
+        main camera's own preview below."""
+        if self._finder_state is None:
+            return
+        if event.kind == "connected":
+            self._finder_calib_btn.configure(state="normal")
+            self._refresh_finder_scales_status()
+        elif event.kind == "disconnected":
+            self._finder_calib_btn.configure(state="disabled")
+        elif event.kind == "preview_frame":
+            # Unlike the main-camera side (which still needs to decode/
+            # detect for auto-guide regardless of visibility), nothing
+            # else in this panel depends on this frame -- blob detection
+            # for the finder side is FinderCameraPanel's own job (see this
+            # method's docstring). Skip the decode entirely, not just the
+            # render, when this preview pane isn't actually mapped (see
+            # handle_camera_event's matching gate for the full rationale).
+            if self._finder_preview_canvas.winfo_ismapped():
+                frame = pgm_to_array(event.payload["pgm"])
+                self._show_finder_preview(frame)
+
+    def _show_finder_preview(self, frame: np.ndarray) -> None:
+        """Same image + overlay as FinderCameraPanel's own preview canvas
+        (main camera's FOV rectangle via FinderState.main_fov_corners_px,
+        blob marker via FinderState.blob_found/last_blob_row/col) -- drawn
+        here too so an operator running "Calibrate fields" from this tab
+        can see where the main camera's field actually sits within the
+        finder's wider view without switching to the Finder tab. Uses the
+        same fixed MAX_CALIBRATION_PREVIEW_DIM cap as this panel's own
+        main-camera preview (not canvas-relative sizing like
+        FinderCameraPanel's), for consistent behavior with the rest of
+        this tab."""
+        gray = frame if frame.ndim == 2 else frame.mean(axis=2).astype(frame.dtype)
+        dw, dh, scale, display = downsample_for_display(gray, MAX_CALIBRATION_PREVIEW_DIM, MAX_CALIBRATION_PREVIEW_DIM)
+        self._finder_preview_image = tk.PhotoImage(data=frame_to_pgm(display))
+        self._finder_preview_canvas.delete("all")
+        self._finder_preview_canvas.create_image(0, 0, anchor="nw", image=self._finder_preview_image)
+        corners = self._finder_state.main_fov_corners_px()
+        if corners is not None:
+            points = []
+            for row, col in corners:
+                points.append(col * scale)
+                points.append(row * scale)
+            self._finder_preview_canvas.create_polygon(points, outline="lime", fill="", width=2)
+        if self._finder_state.blob_found and self._finder_state.last_blob_row is not None:
+            bx = self._finder_state.last_blob_col * scale
+            by = self._finder_state.last_blob_row * scale
+            r = 8
+            self._finder_preview_canvas.create_oval(bx - r, by - r, bx + r, by + r, outline="red", width=2)
+
     def _render_lag_plot(self, figure: Figure, axes, canvas: FigureCanvasTkAgg, payload: dict | None) -> None:
         """Draws the speed-vs-time curve from the last "Measure mount lag"
         run (accel ramp, the stop command, then the decel ramp back down)
@@ -3629,11 +4134,24 @@ class CalibrationPanel(ttk.Frame):
 
     # -- wiring from app.py --------------------------------------------------
 
-    def set_trajectory(self, trajectory: Trajectory) -> None:
-        self._trajectory = trajectory
+    def set_active_trajectory(self, trajectory: Trajectory | None) -> None:
+        """Called from App whenever TransitPanel starts/stops real or
+        simulated tracking -- see self._active_trajectory's own comment
+        for why this needs to be the trajectory ACTUALLY being tracked
+        right now (possibly time-shifted, for a Simulate rehearsal), not
+        just whichever pass happens to be selected."""
+        self._active_trajectory = trajectory
 
     def _refresh_widget_states(self) -> None:
-        state = "normal" if (self._connected and not self._parked) else "disabled"
+        # self._calib_step is not None means the RA/DEC guiding-calibration
+        # nudge sequence is actively jogging the mount (see _on_calibrate_
+        # click) -- _axis_calibrate_button and _lag_measure_button drive
+        # their own mount motion with no guard against an in-progress jog
+        # elsewhere, so they must stay disabled for the whole sequence too,
+        # not just _calibrate_button itself, or a click mid-nudge queues a
+        # second motion command that runs on the worker thread while the
+        # calibration nudge is still physically moving the mount.
+        state = "normal" if (self._connected and not self._parked and self._calib_step is None) else "disabled"
         for widget in self._motion_widgets:
             widget.configure(state=state)
         connection_state = "normal" if self._connected else "disabled"
@@ -3644,6 +4162,11 @@ class CalibrationPanel(ttk.Frame):
         self._connected = connected
         if not connected:
             self._parked = False
+            # Otherwise a disconnect mid-calibration leaves _calib_step
+            # stuck at "ra"/"dec" forever -- _on_calibrate_click's re-entry
+            # guard would then silently no-op every future click, even
+            # after reconnecting, with no way to recover short of restart.
+            self._calib_step = None
         self._refresh_widget_states()
 
     # -- event handlers -------------------------------------------------------
@@ -3729,6 +4252,24 @@ class CalibrationPanel(ttk.Frame):
             self._refresh_widget_states()
 
     def handle_camera_event(self, event: CameraEvent) -> None:
+        if event.kind == "disconnected":
+            # Regression fix: this was the only handle_camera_event in the
+            # whole file with no "disconnected" branch at all -- every
+            # other panel resets its own stale per-connection state here
+            # (see e.g. FinderState.reset_blob's own docstring for the
+            # same class of incident on the finder side). Without this,
+            # a main-camera disconnect while auto-guide had a lock left
+            # FinderState.main_blob_locked stuck True forever -- TransitPanel
+            # reads it on every tracking_tick, completely independent of
+            # whether preview_frame events are still arriving here, so
+            # finder correction would stay silently locked out for the
+            # rest of the session even with no main camera connected at
+            # all, let alone tracking.
+            self._latest_blob = None
+            self._blob_status_var.set("No frame yet")
+            if self._finder_state is not None:
+                self._finder_state.set_main_blob_locked(False)
+            return
         if event.kind != "preview_frame":
             return
         frame = pgm_to_array(event.payload["pgm"])
@@ -3755,11 +4296,35 @@ class CalibrationPanel(ttk.Frame):
         if small_blob.found:
             blob = dataclasses.replace(small_blob, centroid_x=small_blob.centroid_x / scale, centroid_y=small_blob.centroid_y / scale)
         self._latest_blob = blob
-        self._show_preview(small, small_blob)
+        # Skip building/drawing the PhotoImage when this tab (or the
+        # Camera calibration sub-tab within it) isn't actually visible --
+        # a ttk.Notebook only maps the currently-selected page's widgets
+        # (confirmed: an unselected page's own winfo_ismapped() reads
+        # False), so nobody sees this render anyway. Detection above and
+        # everything below (blob status, main_blob_locked, auto-guide's
+        # own correction) still run unconditionally regardless of tab
+        # visibility -- those are real background functionality (a
+        # correction should keep applying while the operator is watching
+        # the Transit tab, not just while this one happens to be open),
+        # unlike this PhotoImage build, which exists purely for this tab's
+        # own on-screen display and costs real CPU for literally nothing
+        # while it isn't shown (same pattern already applied to
+        # FinderWindow's own preview, see its handle_camera_event).
+        if self._preview_label.winfo_ismapped():
+            self._show_preview(small, small_blob)
         if blob.found:
             self._blob_status_var.set(f"ISS at pixel ({blob.centroid_x:.0f}, {blob.centroid_y:.0f}), peak {blob.peak_value:.0f}")
         else:
             self._blob_status_var.set("ISS not detected in frame")
+        if self._finder_state is not None:
+            # "locked" means auto-guide is BOTH enabled and actually
+            # seeing the ISS right now -- not just blob.found on its own
+            # -- so TransitPanel's finder correction (see FinderState.
+            # main_blob_locked's own field docstring) only backs off once
+            # something is actually taking over, and stays in sole control
+            # if auto-guiding is left off even when the main camera
+            # happens to also see the ISS.
+            self._finder_state.set_main_blob_locked(self._auto_guide_var.get() and blob.found)
         if self._auto_guide_var.get():
             self._maybe_apply_auto_guide_correction(frame.shape, blob)
 
@@ -3799,7 +4364,7 @@ class CalibrationPanel(ttk.Frame):
             self._calib_status_var.set("Can't calibrate: no bright object detected in the current frame yet.")
             return
         self._calib_step = "ra"
-        self._calibrate_button.configure(state="disabled")
+        self._refresh_widget_states()
         self._calib_status_var.set("Calibrating RA axis -- nudging east...")
         self._calib_ra0, self._calib_dec0 = self._latest_radec
         self._calib_blob0 = self._latest_blob
@@ -3842,8 +4407,8 @@ class CalibrationPanel(ttk.Frame):
         blob1 = self._latest_blob
         d_dec_arcsec = (dec1 - self._calib_dec0) * 3600.0
         dx, dy = blob1.centroid_x - self._calib_blob0.centroid_x, blob1.centroid_y - self._calib_blob0.centroid_y
-        self._refresh_widget_states()
         self._calib_step = None
+        self._refresh_widget_states()
         if abs(d_dec_arcsec) < 1.0:
             self._calib_status_var.set("Calibration failed: mount didn't move measurably in DEC -- check connection.")
             return
@@ -3854,6 +4419,13 @@ class CalibrationPanel(ttk.Frame):
             self._calib_status_var.set(f"Calibration failed: {exc}")
             return
         self._calib_status_var.set(f"Calibrated: ~{self._calibration.arcsec_per_pixel:.2f} arcsec/px -- ready to auto-guide")
+        # Propagated so TransitPanel's finder-correction path (if a finder
+        # camera is in use) can chain through this same, nudge-verified
+        # calibration too -- see FinderState.main_calibration's own field
+        # docstring for why the finder-to-main calibration alone can't
+        # produce a real sky-frame correction without this.
+        if self._finder_state is not None:
+            self._finder_state.set_main_calibration(self._calibration)
         if self._on_calibration_ready is not None:
             self._on_calibration_ready()
 
@@ -3868,15 +4440,54 @@ class CalibrationPanel(ttk.Frame):
     # -- auto-guide correction --------------------------------------------------
 
     def _maybe_apply_auto_guide_correction(self, frame_shape: tuple[int, int], blob: BlobDetection) -> None:
-        """dx_px/dy_px (blob minus frame center) represents "where the ISS
-        actually is" relative to "where the camera boresight (== mount
-        pointing) currently is" -- i.e. a (target - actual) sky offset once
-        run through the calibration. decompose_error's cross-track sign
-        convention already matches trigger_perp_pulse's (see am5/tracker.py
-        decompose_error's docstring / the reasoning worked out when this
-        panel was built): a positive cross_deg needs a sign=+1 pulse to
-        close the gap, no inversion needed."""
-        if not blob.found or self._calibration is None or self._trajectory is None:
+        """Regression fix -- this used to feed decompose_error's raw
+        cross_deg straight into trigger_perp_pulse's sign, on the claim
+        that dx_px/dy_px (blob minus frame center) is a (target - actual)
+        sky offset. It's actually the opposite: calibrate_from_nudges
+        (camera/guiding.py) builds the calibration from the BLOB's own
+        pixel shift when the MOUNT (boresight) is nudged by a known sky
+        amount, target held fixed -- e.g. nudging the mount +d_ra moves the
+        boresight TOWARD the (fixed) target, so the blob's measured shift
+        is the pixel image of -d_ra, not +d_ra. That flips the matrix
+        GuidingCalibration actually stores, so pixel_to_sky(dx_px, dy_px)
+        run on a live frame -- where dx_px/dy_px is the blob's offset from
+        the CURRENT boresight, not a nudge-induced shift -- comes out as
+        (actual - target), the same "measured - setpoint" convention
+        run_tracking_loop's own d_ra/d_dec use. Confirmed both by hand
+        (matrix derivation) and numerically (feeding a synthetic nudge
+        calibration + a known actual/target offset through the real
+        calibrate_from_nudges/pixel_to_sky/decompose_error/
+        _perp_rate_components chain): the un-negated version above pushed
+        the commanded rate AWAY from the target instead of toward it --
+        the auto-guide feature would have driven the ISS out of frame
+        instead of centering it. cross_deg needs the same negation
+        run_tracking_loop's own feedback trim already applies
+        (error_cross_deg = -cross_deg) before it's used as a correction,
+        for exactly the same reason -- decompose_error is agnostic about
+        which convention its inputs use, but a correction has to point
+        the other way to close the gap.
+
+        Fourth regression fix: outside the trajectory's own active window
+        -- e.g. a pass selected well in advance, or tracking started early
+        and still "sitting at the boundary" (both explicitly supported,
+        see Trajectory.interpolate's own docstring and TransitPanel's own
+        early-start allowance) -- interpolate() explicitly zeroes dra_dt/
+        ddec_dt. decompose_error's zero-speed branch then returns a bare
+        MAGNITUDE for cross (hypot of the raw error, always >= 0, no
+        directional information -- confirmed by feeding it the same error
+        with the sign flipped and getting an identical result), which
+        error_cross_deg = -cross_deg turns into an always-negative value
+        regardless of the TRUE error direction. Harmless while the
+        tracking loop isn't running (nothing reads the resulting perp
+        pulse), but a real hazard during an early start: the loop IS
+        already consuming LiveOffsets every tick while sitting at the
+        boundary, so a blob detected during that wait (plausible -- the
+        camera is presumably already pointed roughly at the acquisition
+        area) would push the mount in a fixed, possibly-wrong direction
+        right as the pass is about to begin. No meaningful cross-track
+        direction exists without a real track velocity, so skip instead
+        of guessing."""
+        if not blob.found or self._calibration is None or self._active_trajectory is None:
             return
         if time.monotonic() - self._last_correction_t < GUIDING_MIN_CORRECTION_INTERVAL_S:
             return
@@ -3889,12 +4500,15 @@ class CalibrationPanel(ttk.Frame):
             d_ra_arcsec, d_dec_arcsec = self._calibration.pixel_to_sky(dx_px, dy_px)
         except ValueError:
             return
-        _, dec_deg, dra_dt, ddec_dt = self._trajectory.interpolate(time.time())
+        _, dec_deg, dra_dt, ddec_dt = self._active_trajectory.interpolate(time.time())
+        if math.hypot(dra_dt * math.cos(math.radians(dec_deg)), ddec_dt) < 1e-9:
+            return  # outside the trajectory's active window -- no real track direction to correct against
         _, cross_deg = decompose_error(d_ra_arcsec / 3600.0, d_dec_arcsec / 3600.0, dec_deg, dra_dt, ddec_dt)
-        if abs(cross_deg * 3600.0) < GUIDING_DEADBAND_PX * self._calibration.arcsec_per_pixel:
+        error_cross_deg = -cross_deg
+        if abs(error_cross_deg * 3600.0) < GUIDING_DEADBAND_PX * self._calibration.arcsec_per_pixel:
             return
         self._last_correction_t = time.monotonic()
-        self._live_offsets.trigger_perp_pulse(1.0 if cross_deg > 0 else -1.0, duration_s=GUIDING_PERP_PULSE_DURATION_S)
+        self._live_offsets.trigger_perp_pulse(1.0 if error_cross_deg > 0 else -1.0, duration_s=GUIDING_PERP_PULSE_DURATION_S)
 
 
 # ---------------------------------------------------------------------------
@@ -3908,12 +4522,20 @@ class FinderCameraPanel(ttk.Frame):
     stays greyed out and nothing else changes.  When a camera IS connected:
 
     1. Live preview with ISS blob highlight (bright moving dot).
-    2. "Calibrate fields" button: point both cameras at the same region,
-       click -- FFT cross-correlation stores the offset between them.
-    3. Once calibrated, enabling "Finder correction" in the Transit tab
-       automatically nudges the mount cross-track whenever the ISS blob
-       drifts away from the calibrated boresight offset.
+    2. Field calibration (point both cameras at the same region, measure
+       the offset between them) lives in the Calibration tab, alongside
+       the main camera's own camera-to-sky calibration -- both are needed
+       together for the Transit tab's "Enable finder correction" checkbox,
+       see CalibrationPanel._build_finder_calibration_section.
+    3. Once both are calibrated, enabling "Finder correction" in the
+       Transit tab automatically nudges the mount cross-track whenever the
+       ISS blob drifts away from the calibrated boresight offset.
     """
+
+    # ASI 678MM-ish defaults -- shared with FinderWindow's own default when
+    # neither is passed a camera_vars (see FinderControlVars' docstring).
+    FINDER_DEFAULT_EXPOSURE_US = 50000.0
+    FINDER_DEFAULT_GAIN = 100.0
 
     def __init__(
         self,
@@ -3921,16 +4543,13 @@ class FinderCameraPanel(ttk.Frame):
         finder_worker: CameraWorker,
         finder_state: FinderState,
         live_offsets: LiveOffsets | None = None,
-        on_calibration_ready: Callable[[], None] | None = None,
+        camera_vars: CameraControlVars | None = None,
     ):
         super().__init__(parent, padding=10)
         self._finder_worker = finder_worker
-        # Calibration here finishes entirely on its own (button click ->
-        # FFT correlation, synchronous) -- same rationale as CalibrationPanel's
-        # own on_calibration_ready: there's no worker event to pump this
-        # through, so it has to tell TransitPanel directly when its "Enable
-        # finder correction" checkbox should become enabled.
-        self._on_calibration_ready = on_calibration_ready
+        self._camera_vars = camera_vars if camera_vars is not None else CameraControlVars.create(
+            self.FINDER_DEFAULT_EXPOSURE_US, self.FINDER_DEFAULT_GAIN,
+        )
         # The main camera's own frames/plate scale arrive via finder_state
         # (last_main_frame, main_plate_scale_arcsec -- see camera/finder.py
         # and App._pump_events, which feeds them from the main CameraWorker's
@@ -3948,14 +4567,13 @@ class FinderCameraPanel(ttk.Frame):
         self._connected = False
         self._latest_frame: np.ndarray | None = None
         self._photo: tk.PhotoImage | None = None
-        self._interactive: list[tk.Widget] = []
 
         ttk.Label(
             self,
             text=(
                 "Wide-field finder camera -- helps acquire the ISS when the main camera's FOV is too "
-                "narrow. Connect it in the Connection tab, then use 'Calibrate fields' below to measure "
-                "the offset between the two cameras."
+                "narrow. Connect it in the Connection tab, then use the Calibration tab's 'Calibrate "
+                "fields' to measure the offset between the two cameras."
             ),
             foreground=PALETTE.fg_dim, wraplength=800, justify="left",
         ).pack(anchor="w")
@@ -4001,76 +4619,39 @@ class FinderCameraPanel(ttk.Frame):
         ttk.Label(offset_frame, text="(↑ ↓ = delta_t, ← → = nudge -- from anywhere in this tab)",
                   foreground=PALETTE.fg_dim).pack(anchor="w", pady=(2, 0))
 
-        # Exposure / gain -- ASI 678MM defaults, log-scale slider like main camera
-        import math as _math
+        # Exposure / gain -- ASI 678MM defaults, log-scale slider like main
+        # camera. self._camera_vars (shared with FinderWindow, see App) so
+        # the two sliders show/drive the exact same value instead of two
+        # copies that only agreed at connect time (same fix as
+        # CameraControlVars' own docstring describes for the main camera).
         exp_frame = ttk.LabelFrame(self, text="Exposure / gain", padding=8)
         exp_frame.pack(fill="x", pady=(8, 0))
-        # log10(50000) ≈ 4.7 -- 50ms default for finder
-        self._finder_exp_log = tk.DoubleVar(value=_math.log10(50000))
-        self._finder_exp_label = tk.StringVar(value=format_exposure_us(50000))
-        self._finder_gain_var = tk.DoubleVar(value=100)
-        self._finder_gain_label = tk.StringVar(value="100")
 
         exp_row = ttk.Frame(exp_frame)
         exp_row.pack(fill="x")
         ttk.Label(exp_row, text="Exp", width=4).pack(side="left")
         self._finder_exp_scale = ttk.Scale(
-            exp_row, from_=1.5, to=_math.log10(MAX_FINDER_EXPOSURE_US), variable=self._finder_exp_log, state="disabled",
-            command=lambda _v: (
-                self._finder_exp_label.set(format_exposure_us(10 ** self._finder_exp_log.get())),
-                self._apply_camera_settings() if self._connected else None,
-            ),
+            exp_row, from_=1.5, to=math.log10(MAX_FINDER_EXPOSURE_US), variable=self._camera_vars.exposure_log, state="disabled",
+            command=lambda _v: self._apply_camera_settings() if self._connected else None,
         )
         self._finder_exp_scale.pack(side="left", fill="x", expand=True, padx=(4, 4))
-        ttk.Label(exp_row, textvariable=self._finder_exp_label, width=10).pack(side="left")
+        ttk.Label(exp_row, textvariable=self._camera_vars.exposure_value, width=10).pack(side="left")
 
         gain_row = ttk.Frame(exp_frame)
         gain_row.pack(fill="x", pady=(4, 0))
         ttk.Label(gain_row, text="Gain", width=4).pack(side="left")
         self._finder_gain_scale = ttk.Scale(
-            gain_row, from_=0, to=570, variable=self._finder_gain_var, state="disabled",
-            command=lambda _v: (
-                self._finder_gain_label.set(str(round(self._finder_gain_var.get()))),
-                self._apply_camera_settings() if self._connected else None,
-            ),
+            gain_row, from_=0, to=570, variable=self._camera_vars.gain, state="disabled",
+            command=lambda _v: self._apply_camera_settings() if self._connected else None,
         )
         self._finder_gain_scale.pack(side="left", fill="x", expand=True, padx=(4, 4))
-        ttk.Label(gain_row, textvariable=self._finder_gain_label, width=6).pack(side="left")
+        ttk.Label(gain_row, textvariable=self._camera_vars.gain_value, width=6).pack(side="left")
 
-        # Calibration
-        calib_frame = ttk.LabelFrame(self, text="Field calibration", padding=8)
-        calib_frame.pack(fill="x", pady=(8, 0))
-        ttk.Label(
-            calib_frame,
-            text="Point both cameras at the same star field, then click Calibrate.\n"
-                 "The FFT cross-correlation takes ~1 s and stores the offset permanently for this session.",
-            foreground=PALETTE.fg_dim, justify="left",
-        ).pack(anchor="w")
-        calib_row = ttk.Frame(calib_frame)
-        calib_row.pack(anchor="w", pady=(6, 0))
-        # Read-only -- the real plate scales come from whatever optics were
-        # actually configured in the Connection tab at connect time (see
-        # FinderState.main_plate_scale_arcsec/finder_plate_scale_arcsec),
-        # not a separately-typed field here that could silently drift out
-        # of sync with the real configuration.
-        self._scales_status_var = tk.StringVar(value="")
-        ttk.Label(calib_row, textvariable=self._scales_status_var, foreground=PALETTE.fg_dim).pack(side="left", padx=(0, 8))
-        # Manual, NOT auto-measured: phase cross-correlation only recovers
-        # a translation, and this project's star fields are too sparse (a
-        # handful of point sources, not a textured scene) for FFT-based
-        # rotation/scale registration to be reliable -- see
-        # FinderCalibration.calibrate_from_frames' own docstring. Defaults
-        # to 0 (the old, silent assumption) but now visible/editable
-        # instead of hidden, so a real mechanical roll offset between the
-        # two scopes can actually be corrected for once measured by hand.
-        ttk.Label(calib_row, text="Rotation (deg):").pack(side="left")
-        self._finder_rotation_var = tk.StringVar(value="0.0")
-        ttk.Entry(calib_row, textvariable=self._finder_rotation_var, width=6).pack(side="left", padx=(4, 8))
-        self._calib_btn = ttk.Button(calib_row, text="Calibrate fields", command=self._on_calibrate, state="disabled")
-        self._calib_btn.pack(side="left")
-        self._interactive.append(self._calib_btn)
-        self._calib_status_var = tk.StringVar(value="Not calibrated")
-        ttk.Label(calib_frame, textvariable=self._calib_status_var, foreground=PALETTE.fg_dim).pack(anchor="w", pady=(4, 0))
+        # Field calibration ("Calibrate fields") now lives in the
+        # Calibration tab (see CalibrationPanel._build_finder_calibration_
+        # section) -- alongside the main camera's own camera-to-sky
+        # calibration, since TransitPanel's "Enable finder correction"
+        # checkbox needs both.
 
         # Live preview
         preview_frame = ttk.LabelFrame(self, text="Finder preview -- ISS blob highlighted in red", padding=8)
@@ -4079,7 +4660,6 @@ class FinderCameraPanel(ttk.Frame):
         self._canvas.pack(fill="both", expand=True)
         self._blob_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self._blob_var, foreground=PALETTE.accent_ok).pack(anchor="w", pady=(4, 0))
-        self._refresh_scales_status()
 
         # Same rationale as TransitPanel's own _bind_offset_keys call --
         # bound recursively on every widget, not just self, since a
@@ -4094,17 +4674,10 @@ class FinderCameraPanel(ttk.Frame):
     def _apply_camera_settings(self) -> None:
         if not self._connected:
             return
-        exp_us = round(10 ** self._finder_exp_log.get())
-        gain = round(self._finder_gain_var.get())
+        exp_us = round(10 ** self._camera_vars.exposure_log.get())
+        gain = round(self._camera_vars.gain.get())
         self._finder_worker.set_exposure_us(exp_us)
         self._finder_worker.set_gain(gain)
-
-    def _refresh_scales_status(self) -> None:
-        self._scales_status_var.set(
-            f"finder {self._finder_state.finder_plate_scale_arcsec:.3f}\"/px, "
-            f"main {self._finder_state.main_plate_scale_arcsec:.3f}\"/px "
-            "(from the Connection tab)"
-        )
 
     def _poll_delta_t_display(self) -> None:
         dt, _ = self._live_offsets.snapshot()
@@ -4136,74 +4709,38 @@ class FinderCameraPanel(ttk.Frame):
         button.state(["pressed"])
         self.after(duration_ms, lambda: button.state(["!pressed"]))
 
-    def _on_calibrate(self) -> None:
-        """Cross-correlate the latest finder frame against the most recent
-        main camera frame to compute the field offset."""
-        if self._latest_frame is None:
-            self._calib_status_var.set("No finder frame yet -- wait for preview")
-            return
-        main_frame = self._finder_state.last_main_frame
-        used_fallback = main_frame is None
-        if used_fallback:
-            # Fall back: calibrate finder to itself (offset = 0, still useful
-            # for ISS blob → correction when both cameras share the boresight)
-            main_frame = self._latest_frame
-        try:
-            rotation_deg = float(self._finder_rotation_var.get())
-        except ValueError:
-            self._calib_status_var.set("Invalid rotation value")
-            return
-        finder_scale = self._finder_state.finder_plate_scale_arcsec
-        main_scale = self._finder_state.main_plate_scale_arcsec
-        self._calib_status_var.set("Calibrating…")
-        self.update_idletasks()
-        try:
-            self._finder_state.calibration.calibrate_from_frames(
-                main_frame, self._latest_frame,
-                main_plate_scale_arcsec=main_scale,
-                finder_plate_scale_arcsec=finder_scale,
-                rotation_deg=rotation_deg,
-            )
-            dr = self._finder_state.calibration.offset_row
-            dc = self._finder_state.calibration.offset_col
-            fallback_note = (
-                " -- WARNING: no main camera frame yet, calibrated the finder against itself "
-                "(offset is meaningless -- point both cameras at the same field and retry)"
-                if used_fallback else ""
-            )
-            self._calib_status_var.set(
-                f"Calibrated ✓  offset ({dr:+.1f}, {dc:+.1f}) finder px  "
-                f"scale ratio {self._finder_state.calibration.plate_scale_ratio:.2f}  "
-                f"rotation {rotation_deg:+.1f}°{fallback_note}"
-            )
-            if self._on_calibration_ready is not None:
-                self._on_calibration_ready()
-        except Exception as exc:  # noqa: BLE001
-            self._calib_status_var.set(f"Calibration failed: {exc}")
-
     def handle_camera_event(self, event: CameraEvent) -> None:
         if event.kind == "connected":
             self._connected = True
             w, h = event.payload["width"], event.payload["height"]
             self._status_var.set(f"Connected — {w}×{h} {'colour' if event.payload['is_color'] else 'mono'}")
-            self._calib_btn.configure(state="normal")
             self._finder_exp_scale.configure(state="normal")
             self._finder_gain_scale.configure(state="normal")
             self._apply_camera_settings()
-            self._refresh_scales_status()
         elif event.kind == "connect_error":
             self._status_var.set(f"Error: {event.payload.get('message', '?')} -- retry in the Connection tab")
         elif event.kind == "disconnected":
             self._connected = False
             self._status_var.set("Not connected -- connect in the Connection tab")
-            self._calib_btn.configure(state="disabled")
             self._finder_exp_scale.configure(state="disabled")
             self._finder_gain_scale.configure(state="disabled")
         elif event.kind == "preview_frame":
             frame = pgm_to_array(event.payload["pgm"])
             self._latest_frame = frame
+            # Always runs regardless of tab visibility -- FinderState.
+            # update_frame does the (throttled) blob detection that finder
+            # correction depends on (TransitPanel._maybe_apply_finder_
+            # correction), which must keep working in the background while
+            # the operator is on some other tab, same reasoning as
+            # CalibrationPanel's own auto-guide detection.
             self._finder_state.update_frame(frame)
-            self._show_preview(frame)
+            # ...but the canvas render itself is purely visual and costs
+            # real CPU for nothing while this tab isn't the selected one
+            # (a ttk.Notebook only maps the current page's widgets) -- same
+            # gate already used by FinderWindow's own handle_camera_event
+            # and by CalibrationPanel's two preview panes.
+            if self._canvas.winfo_ismapped():
+                self._show_preview(frame)
 
     def _show_preview(self, frame: np.ndarray) -> None:
         cw = self._canvas.winfo_width()
