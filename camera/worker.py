@@ -24,7 +24,18 @@ from camera.fits_writer import write_fits
 from camera.mock_camera import MockAsiCamera
 from camera.ser_writer import SerWriter
 
+# Commands where only the LATEST queued value matters -- see the read
+# loop's own comment on _COALESCE_LATEST_ONLY's use for the real-hardware
+# bug this fixes (a UI slider dragged quickly queues many of these).
+_COALESCE_LATEST_ONLY = frozenset({"set_exposure_us", "set_gain", "set_roi", "set_bit_depth", "set_sky_context"})
+
 PREVIEW_INTERVAL_S = 0.1  # ~10Hz -- plenty for a framing/focus preview, well under the 100-200fps capture rate
+# Added on top of the currently-configured exposure to get the read loop's
+# own read_frame() timeout -- covers USB transfer/readout/scheduling
+# jitter beyond the pure exposure time itself. See the read loop's own
+# comment for the incident this margin (and scaling the timeout with
+# exposure at all) fixes.
+READ_FRAME_TIMEOUT_MARGIN_MS = 2000
 STATS_INTERVAL_S = 1.0
 WRITE_BUFFER_TARGET_BYTES = 200 * 1024 * 1024  # ~200MB RAM budget for the SER write-behind buffer
 WRITE_BUFFER_MIN_FRAMES = 8
@@ -42,11 +53,35 @@ class CameraEvent:
     payload: dict = field(default_factory=dict)
 
 
+#  This project's own real camera's 12-bit ADC range (0-4095) when
+# running RAW16 -- same constant am5/gui/panels.py's own
+# _scale_16bit_to_8bit_fixed and camera/mock_camera.py's read_frame use.
+_CAMERA_ADC_MAX = 4095.0
+
+
 def frame_to_pgm(frame) -> bytes:
-    """Encode a 2D uint8 array as a binary PGM (P5) image — tk.PhotoImage
-    reads this directly via data=..., no Pillow dependency needed. This is
-    a raw-sensor grayscale preview (Bayer mosaic, not debayered), good
-    enough for framing/focus, not a colour rendering."""
+    """Encode a 2D array as a binary PGM (P5) image — tk.PhotoImage reads
+    this directly via data=..., no Pillow dependency needed. This is a
+    raw-sensor grayscale preview (Bayer mosaic, not debayered), good
+    enough for framing/focus, not a colour rendering.
+
+    Regression fix: this used to assume the frame was always uint8
+    (frame.tobytes() straight into a hardcoded maxval=255 header) -- a
+    RAW16 frame (see AsiCamera's own docstring: the sensor's real 12-bit
+    ADC range, 0-4095, packed in uint16, reachable via TransitPanel's own
+    bit-depth combo) produced a CORRUPTED preview the moment 16-bit mode
+    was used: 2 bytes/pixel actually on the wire, but the header's
+    maxval=255 tells every reader (pgm_to_array, tk.PhotoImage) to expect
+    1. Scaled to uint8 by a FIXED factor (this sensor's real ADC range,
+    not the frame's own per-frame max -- same fixed-vs-adaptive
+    reasoning as am5/gui/panels.py's _scale_16bit_to_8bit_fixed, which
+    exists for exactly this reason: an adaptive per-frame stretch here
+    would silently cancel out real gain changes) BEFORE encoding, so the
+    wire format -- and everything downstream: pgm_to_array, blob
+    detection, the GUI's own manual "Preview stretch" multiplier -- stays
+    uint8 always, unchanged."""
+    if frame.dtype != np.uint8:
+        frame = np.clip(frame.astype(np.float32) * (255.0 / _CAMERA_ADC_MAX), 0, 255).astype(np.uint8)
     height, width = frame.shape
     header = f"P5\n{width} {height}\n255\n".encode("ascii")
     return header + frame.tobytes()
@@ -68,6 +103,12 @@ class CameraWorker:
         self.events: "queue.Queue[CameraEvent]" = queue.Queue()
         self._commands: "queue.Queue[tuple[str, dict]]" = queue.Queue()
         self._camera: AsiCamera | MockAsiCamera | None = None
+        # Tracked here (not just forwarded to the camera) so the read
+        # loop's own read_frame() timeout can scale with it -- see
+        # _handle_set_exposure_us and the read loop's own comment for the
+        # regression this fixes. Default matches CameraControlVars' own
+        # 1000us default.
+        self._exposure_us = 1000
         self._streaming = threading.Event()
         self._ser_writer: SerWriter | None = None
         # Write-behind buffer: the disk write (add_frame -- disk I/O, can
@@ -179,23 +220,75 @@ class CameraWorker:
         frame_count_since_stats = 0
         read_errors_since_stats = 0
         while not self._shutdown.is_set():
-            try:
-                name, payload = self._commands.get_nowait()
+            # Regression fix: this used to dequeue exactly ONE command per
+            # loop iteration, with a full blocking read_frame() (at
+            # whatever exposure was JUST set) after every single one. A UI
+            # slider dragged quickly queues many set_exposure_us commands
+            # near-instantly -- confirmed live: dragging the finder's
+            # exposure slider from 5s down to 50ms looked like it "never"
+            # sped back up, because the worker was working through each
+            # queued intermediate value one at a time, blocking a full
+            # (still slow) exposure's worth on every one of them before
+            # even looking at the next command, let alone the final
+            # desired value. Reproduced deterministically against the
+            # mock camera (not real-hardware-specific): queuing 12 rapid
+            # set_exposure_us calls from 5s down to 50ms took ~18s to
+            # settle instead of ~1 frame. Fix: drain the WHOLE backlog
+            # currently in the queue up front, and for commands where only
+            # the latest value actually matters (_COALESCE_LATEST_ONLY),
+            # keep just the last one of each -- one-shot commands
+            # (connect/disconnect/start_recording/stop_recording/
+            # save_fits_snapshot) are still applied in full, in their
+            # original order, since dropping or reordering any of those
+            # would be a real correctness bug, not just a perf one.
+            pending: list[tuple[str, dict]] = []
+            while True:
+                try:
+                    pending.append(self._commands.get_nowait())
+                except queue.Empty:
+                    break
+            # Keep every command in its ORIGINAL relative position (a
+            # coalesced command could otherwise jump ahead of an earlier
+            # "connect", or behind a later "disconnect" -- either would be
+            # a real correctness bug) -- just drop a coalescable command
+            # if a newer one of the same name is still coming later in
+            # this same batch.
+            last_index_by_name: dict[str, int] = {}
+            for i, (name, _payload) in enumerate(pending):
+                if name in _COALESCE_LATEST_ONLY:
+                    last_index_by_name[name] = i
+            to_run = [
+                (name, payload) for i, (name, payload) in enumerate(pending)
+                if name not in _COALESCE_LATEST_ONLY or last_index_by_name[name] == i
+            ]
+            for name, payload in to_run:
                 handler = handlers.get(name)
                 if handler is not None:
                     try:
                         handler(payload)
                     except Exception as exc:  # noqa: BLE001 - surface it, keep the worker alive
                         self._emit("log", message=f"[error] {name} failed: {exc}")
-            except queue.Empty:
-                pass
 
             if self._camera is None or not self._streaming.is_set():
                 time.sleep(0.05)
                 continue
 
             try:
-                frame = self._camera.read_frame(timeout_ms=2000)
+                # Regression fix: this used to be a flat 2000ms regardless
+                # of the actually-configured exposure -- the finder's own
+                # exposure slider goes up to 5s (MAX_FINDER_EXPOSURE_US,
+                # camera/finder.py), and a frame simply cannot be ready
+                # before its own exposure time elapses, so ANY exposure
+                # above ~2s made every single read_frame() call time out
+                # (confirmed: reported as a wall of "[finder:log] [warn]
+                # read_frame failed: Timeout" with a real 5s exposure/gain
+                # 400 configured -- a working camera, not a hardware
+                # fault). Scales with the currently-set exposure plus a
+                # flat margin for USB transfer/readout/scheduling jitter,
+                # floored at the original 2000ms for the common short-
+                # exposure case.
+                timeout_ms = max(2000, round(self._exposure_us / 1000) + READ_FRAME_TIMEOUT_MARGIN_MS)
+                frame = self._camera.read_frame(timeout_ms=timeout_ms)
             except Exception as exc:  # noqa: BLE001 - a dropped/timed-out frame shouldn't kill the loop
                 self._emit("log", message=f"[warn] read_frame failed: {exc}")
                 read_errors_since_stats += 1
@@ -411,6 +504,11 @@ class CameraWorker:
         self._emit("bit_depth_changed", bit_depth=self._camera.bit_depth)
 
     def _handle_set_exposure_us(self, payload: dict) -> None:
+        # Tracked regardless of whether a camera is connected yet (a
+        # connect right after this should already use it), same as the
+        # read loop reading self._exposure_us on every iteration rather
+        # than only right after a successful set.
+        self._exposure_us = payload["microseconds"]
         if self._camera is None:
             return
         self._camera.set_exposure_us(payload["microseconds"])
@@ -488,8 +586,12 @@ class CameraWorker:
             return
         # Same bit depth as whatever the live video path is currently
         # running at (set_bit_depth) -- one setting governs both, no
-        # separate per-action choice.
-        frame = self._camera.read_frame(timeout_ms=5000)
+        # separate per-action choice. Timeout scales with exposure for
+        # the same reason the main read loop's own does -- see its
+        # comment for the incident this fixes.
+        frame = self._camera.read_frame(
+            timeout_ms=max(5000, round(self._exposure_us / 1000) + READ_FRAME_TIMEOUT_MARGIN_MS)
+        )
         path = Path(payload["path"])
         path.parent.mkdir(parents=True, exist_ok=True)
         write_fits(path, frame, header_extra={"INSTRUME": "ASI290MC"})

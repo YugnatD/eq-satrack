@@ -14,6 +14,7 @@ from tkinter import ttk
 
 from am5.gui.finder_window import FinderWindow
 from am5.gui.jog_window import JogWindow
+from am5.gui.ser_player_window import SerPlayerWindow
 from am5.gui.panels import (
     AlignmentPanel,
     CameraControlVars,
@@ -22,7 +23,6 @@ from am5.gui.panels import (
     CalibrationPanel,
     FinderCameraPanel,
     PassesPanel,
-    SerPlayerPanel,
     SiteVars,
     TransitPanel,
 )
@@ -171,15 +171,12 @@ class App:
             mount_lag_var=self.mount_lag_var, mount_max_accel_var=self.mount_max_accel_var,
             axis_signs=self.axis_signs, finder_state=self.finder_state,
             on_finder_calibration_ready=lambda: self.transit_panel.set_finder_correction_available(True),
+            camera_vars=self.camera_vars, finder_camera_vars=self.finder_camera_vars,
         )
         self.alignment_panel = AlignmentPanel(
             self.notebook, self.worker, self.axis_signs, self.site_vars, finder_state=self.finder_state,
+            camera_vars=self.camera_vars, finder_camera_vars=self.finder_camera_vars, out_dir=out_dir,
         )
-
-        # Pure local file I/O, no worker/device -- doesn't need any of the
-        # constructor args above, and (unlike every other panel) needs no
-        # wiring into _pump_events below.
-        self.ser_player_panel = SerPlayerPanel(self.notebook)
 
         # Finder camera panel -- optional wide-field second camera for ISS
         # acquisition.  Created unconditionally but greyed out until a
@@ -205,10 +202,6 @@ class App:
         self.notebook.add(self.exposure_panel, text="▣ Exposure calc")
         self.notebook.add(self.finder_panel, text="🔭 Finder")
         self.notebook.add(self.transit_panel, text="◎ Transit")
-        # SER player is a standalone review tool (plays back a recorded
-        # file, no live device/session state involved) -- kept rightmost,
-        # separated from the live-tracking workflow tabs before it.
-        self.notebook.add(self.ser_player_panel, text="▶ SER player")
 
         self._panels = [self.connection_panel]
 
@@ -227,6 +220,16 @@ class App:
         )
         self.finder_window.withdraw()
 
+        # SER player is a standalone review tool (plays back a recorded
+        # file, no live device/session state involved) -- a separate
+        # floating window rather than a Notebook tab, same reasoning as
+        # JogWindow/FinderWindow: a plain tab's position in a wrapping
+        # multi-row tab strip isn't stable (with enough other tabs it
+        # could land at the start of a wrapped second row instead of
+        # staying visually separate from the workflow tabs).
+        self.ser_player_window = SerPlayerWindow(root)
+        self.ser_player_window.withdraw()
+
         # Packed BEFORE the notebook below, even though it's created after
         # -- pack() gives space priority in packing order, not creation
         # order, and the notebook's "expand=True" makes it greedy for any
@@ -242,6 +245,9 @@ class App:
             side="left", padx=10, pady=4,
         )
         ttk.Button(jog_button_frame, text="🔭 Finder...", command=self._show_finder_window).pack(
+            side="left", pady=4,
+        )
+        ttk.Button(jog_button_frame, text="▶ SER player...", command=self._show_ser_player_window).pack(
             side="left", pady=4,
         )
 
@@ -280,6 +286,11 @@ class App:
         self.finder_window.deiconify()
         self.finder_window.lift()
         self.finder_window.focus_force()
+
+    def _show_ser_player_window(self) -> None:
+        self.ser_player_window.deiconify()
+        self.ser_player_window.lift()
+        self.ser_player_window.focus_force()
 
     def _on_tab_changed(self, _event: object) -> None:
         if self.notebook.select() == str(self.transit_panel):

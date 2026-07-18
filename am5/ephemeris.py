@@ -21,6 +21,16 @@ CELESTRAK_URL_TEMPLATE = "https://celestrak.org/NORAD/elements/gp.php?CATNR={cat
 ISS_CATNR = 25544
 CELESTRAK_ISS_URL = CELESTRAK_URL_TEMPLATE.format(catnr=ISS_CATNR)
 
+# Same endpoint family as CELESTRAK_URL_TEMPLATE, but keyed by GROUP (a
+# named collection of NORAD IDs Celestrak curates) instead of a single
+# CATNR -- used for PassesPanel's "Live now" sub-tab (am5/gui/panels.py),
+# which needs many candidate satellites to check against the current sky,
+# not one specific one. VISUAL_GROUP verified live (WebFetch): returns
+# ~250 satellites in the same 3-line-per-satellite TLE format
+# load.tle_file() already parses for the single-satellite case below.
+CELESTRAK_GROUP_URL_TEMPLATE = "https://celestrak.org/NORAD/elements/gp.php?GROUP={group}&FORMAT=tle"
+VISUAL_GROUP = "visual"
+
 
 def _age_hours(path: Path) -> float:
     return (datetime.now(timezone.utc).timestamp() - path.stat().st_mtime) / 3600.0
@@ -56,6 +66,107 @@ def load_satellite_tle(catnr: int, cache_path: Path, max_age_hours: float = 48.0
 def load_iss_tle(cache_path: Path, max_age_hours: float = 48.0) -> EarthSatellite:
     """ISS-specific convenience wrapper over load_satellite_tle."""
     return load_satellite_tle(ISS_CATNR, cache_path, max_age_hours)
+
+
+def load_satellite_group_tles(group: str, cache_path: Path, max_age_hours: float = 48.0) -> list[EarthSatellite]:
+    """Same cache-first/fetch-fallback logic as load_satellite_tle, but for
+    a whole named Celestrak GROUP (e.g. VISUAL_GROUP) instead of one
+    CATNR -- returns every satellite in the group instead of just the
+    first one. Used by PassesPanel's "Live now" sub-tab (am5/gui/panels.py)
+    to check many candidate satellites against the current sky at once,
+    rather than tracking one specific known satellite. Use a distinct
+    cache_path per group, same reasoning as load_satellite_tle's own
+    docstring for per-CATNR cache files."""
+    url = CELESTRAK_GROUP_URL_TEMPLATE.format(group=group)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    force_reload = not cache_path.exists() or _age_hours(cache_path) > max_age_hours
+    ts = load.timescale()
+    try:
+        satellites = load.tle_file(url, reload=force_reload, filename=str(cache_path), ts=ts)
+    except Exception as exc:
+        if not cache_path.exists():
+            raise RuntimeError(f"no cached TLE group and fetch failed: {exc}") from exc
+        print(f"[warn] TLE group fetch failed ({exc}); using cache from {_age_hours(cache_path):.1f}h ago", file=sys.stderr)
+        satellites = load.tle_file(url, reload=False, filename=str(cache_path), ts=ts)
+    if not satellites:
+        raise RuntimeError(f"no satellites parsed from {cache_path} (invalid group name?)")
+    if _age_hours(cache_path) > max_age_hours:
+        print(f"[warn] TLE group is {_age_hours(cache_path):.1f}h old (> {max_age_hours}h) — orbit-changing "
+              f"maneuvers can invalidate individual entries, expect pointing error", file=sys.stderr)
+    return satellites
+
+
+def currently_visible_satellites(
+    satellites: list[EarthSatellite], site: GeographicPosition, horizon_deg: float = 10.0,
+    t0: datetime | None = None,
+) -> list[tuple[EarthSatellite, float, float]]:
+    """(satellite, alt_deg, az_deg) for every satellite in `satellites`
+    currently above `horizon_deg` at `t0` (now, if not given), sorted by
+    altitude descending (highest first -- the easiest, most centrally
+    overhead target to point at right now). Pure SGP4 propagation, no
+    network -- safe to call from a background thread against an
+    already-loaded satellite list (see PassesPanel's "Live now" sub-tab,
+    am5/gui/panels.py, which loads the group once via
+    load_satellite_group_tles and calls this repeatedly on a timer)."""
+    ts = load.timescale()
+    t0 = t0 or datetime.now(timezone.utc)
+    t = ts.from_datetime(t0)
+    visible = []
+    for sat in satellites:
+        alt, az, _ = (sat - site).at(t).altaz()
+        if alt.degrees > horizon_deg:
+            visible.append((sat, float(alt.degrees), float(az.degrees)))
+    visible.sort(key=lambda entry: entry[1], reverse=True)
+    return visible
+
+
+def current_pass_window(
+    satellite: EarthSatellite, site: GeographicPosition, horizon_deg: float = 10.0,
+    t0: datetime | None = None, lookahead_hours: float = 6.0,
+) -> PassWindow:
+    """The REMAINING portion of a pass already in progress -- for a
+    satellite already confirmed above horizon_deg at t0 (see
+    currently_visible_satellites), not a full rise-to-set window like
+    find_passes/find_next_pass. t_rise is just t0 itself (the satellite
+    already rose before this function is ever called); t_culminate is
+    t0 if the real culmination already happened, or the actual upcoming
+    culmination event if there's still one ahead; t_set is the next
+    horizon-crossing set event. Returned PassWindow feeds
+    compute_trajectory(satellite, site, window.t_rise, window.t_set)
+    completely unchanged -- "start tracking now" needs no new tracking
+    code, just a PassWindow whose rise is "now" instead of a future
+    scheduled rise. Raises ValueError if no set event is found within
+    lookahead_hours (shouldn't happen for a satellite genuinely above
+    horizon_deg, but a pathological orbit/horizon combination could)."""
+    ts = load.timescale()
+    t0 = t0 or datetime.now(timezone.utc)
+    t1 = t0 + timedelta(hours=lookahead_hours)
+    times, events = satellite.find_events(site, ts.from_datetime(t0), ts.from_datetime(t1), altitude_degrees=horizon_deg)
+    diff = satellite - site
+
+    t_culminate = t0
+    t_set = None
+    for t, event in zip(times, events):
+        if event == 1 and t_set is None:  # culminate, before any set seen yet
+            t_culminate = t.utc_datetime()
+        elif event == 2:  # set
+            t_set = t.utc_datetime()
+            break
+    if t_set is None:
+        raise ValueError(f"no set event found within {lookahead_hours}h -- satellite may not actually be above {horizon_deg} deg")
+
+    t_culm_sf = ts.from_datetime(t_culminate)
+    pos_at_culm = diff.at(t_culm_sf)
+    alt, _, _ = pos_at_culm.altaz()
+    distance_km = float(pos_at_culm.distance().km)
+    return PassWindow(
+        t_rise=t0,
+        t_culminate=t_culminate,
+        t_set=t_set,
+        max_elevation_deg=float(alt.degrees),
+        distance_km=distance_km,
+        magnitude_estimate=float("nan"),  # see find_passes' own docstring -- no calibrated magnitude_ref for an arbitrary satellite
+    )
 
 
 @dataclass(frozen=True)

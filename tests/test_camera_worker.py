@@ -8,7 +8,7 @@ import pytest
 
 from camera.mock_camera import DEFAULT_ARCSEC_PER_PIXEL
 from camera.ser_writer import HEADER_SIZE
-from camera.worker import CameraEvent, CameraWorker
+from camera.worker import CameraEvent, CameraWorker, frame_to_pgm, pgm_to_array
 
 
 def _pgm_to_array(pgm: bytes) -> np.ndarray:
@@ -16,6 +16,30 @@ def _pgm_to_array(pgm: bytes) -> np.ndarray:
     _, width_s, height_s = header.split()
     width, height = int(width_s), int(height_s)
     return np.frombuffer(body, dtype=np.uint8).reshape(height, width)
+
+
+def test_frame_to_pgm_passes_uint8_through_unchanged():
+    frame = np.array([[10, 250]], dtype=np.uint8)
+    decoded = pgm_to_array(frame_to_pgm(frame))
+    np.testing.assert_array_equal(decoded, frame)
+
+
+def test_frame_to_pgm_scales_a_16bit_frame_by_the_fixed_adc_range_not_corrupt_it():
+    # Regression: this used to call frame.tobytes() directly with a
+    # hardcoded maxval=255 PGM header regardless of dtype -- a RAW16
+    # frame (reachable via TransitPanel's own bit-depth combo) put 2
+    # bytes/pixel on the wire while the header told every reader to
+    # expect 1, corrupting the preview the moment 16-bit mode was used.
+    # Fixed scale (this sensor's real 12-bit ADC range, 0-4095), not the
+    # frame's own per-frame max -- see frame_to_pgm's own docstring for
+    # why an adaptive stretch here would be wrong (cancels out real gain
+    # changes downstream).
+    frame = np.array([[0, 4095]], dtype=np.uint16)
+    pgm = frame_to_pgm(frame)
+    decoded = pgm_to_array(pgm)
+    assert decoded.dtype == np.uint8
+    assert decoded.shape == (1, 2)
+    np.testing.assert_array_equal(decoded, np.array([[0, 255]], dtype=np.uint8))
 
 
 def _wait_for(worker: CameraWorker, kind: str, timeout: float = 5.0) -> CameraEvent:
@@ -51,6 +75,45 @@ def test_preview_frames_arrive_after_connect(worker):
     event = _wait_for(worker, "preview_frame", timeout=3.0)
     assert event.payload["pgm"].startswith(b"P5\n")
     assert event.payload["width"] > 0 and event.payload["height"] > 0
+
+
+def test_a_burst_of_exposure_changes_settles_on_the_latest_value_quickly(worker):
+    # Regression, found on real hardware: the read loop used to dequeue
+    # exactly ONE command per iteration, with a full blocking read_frame()
+    # (at whatever exposure was JUST set) after every single one. A UI
+    # slider dragged quickly queues many set_exposure_us commands
+    # near-instantly -- reported live as the finder's exposure slider
+    # looking like it "never" sped back up after being dragged down from
+    # 5s to 50ms, because the worker was working through each queued
+    # intermediate (still slow) value one at a time before even looking
+    # at the final desired one. Now the whole backlog is drained up front
+    # and only the LAST queued value of a "current setting" command
+    # (_COALESCE_LATEST_ONLY) is actually applied.
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    worker.set_exposure_us(5_000_000)
+    _wait_for(worker, "preview_frame", timeout=6.0)  # let the 5s exposure actually take effect first
+
+    steps = [5_000_000, 4_500_000, 4_000_000, 3_000_000, 2_000_000, 1_500_000, 1_000_000, 700_000, 400_000, 200_000, 100_000, 50_000]
+    for us in steps:
+        worker.set_exposure_us(us)
+
+    # One frame may still lag behind (whatever read was already blocking
+    # when the burst arrived can't be interrupted), but everything after
+    # that must reflect the FINAL (50ms) exposure, not work through the
+    # 11 stale intermediate values first -- bound the whole thing well
+    # under what draining the backlog one-at-a-time would take (roughly
+    # 5+4.5+4+3+2+1.5+1+0.7+0.4+0.2+0.1+0.05 =~ 22s).
+    deadline = time.monotonic() + 8.0
+    frame_times = []
+    while time.monotonic() < deadline and len(frame_times) < 4:
+        event = _wait_for(worker, "preview_frame", timeout=8.0)
+        frame_times.append(time.monotonic())
+    assert len(frame_times) >= 4
+    # The last few intervals must be fast (matching the final 50ms
+    # exposure), not still working through multi-second stale values.
+    late_intervals = [b - a for a, b in zip(frame_times[-3:], frame_times[-2:])]
+    assert all(interval < 1.0 for interval in late_intervals)
 
 
 def test_stats_report_positive_fps(worker):
@@ -522,3 +585,63 @@ def test_fits_snapshot_matches_the_currently_set_bit_depth(worker, tmp_path):
         # applied -- assert on value range, not the raw dtype.
         assert data.min() >= 0
         assert data.max() <= 4095
+
+
+def test_read_loop_scales_read_frame_timeout_with_configured_exposure(worker, monkeypatch):
+    # Regression: the read loop used to call read_frame(timeout_ms=2000)
+    # unconditionally -- a real exposure above ~2s (the finder's own
+    # slider goes up to 5s) made every single read time out, since a
+    # frame can't be ready before its own exposure elapses. Confirmed
+    # live with the user's own 5s exposure/gain 400 finder setup
+    # ("read_frame failed: Timeout"). Fixed by scaling the timeout with
+    # the currently configured exposure, see camera/worker.py's
+    # READ_FRAME_TIMEOUT_MARGIN_MS and the read loop's own timeout_ms
+    # computation.
+    import camera.mock_camera as mock_camera_module
+
+    recorded_timeouts = []
+    original_read_frame = mock_camera_module.MockAsiCamera.read_frame
+
+    def fast_read_frame(self, timeout_ms=2000):
+        recorded_timeouts.append(timeout_ms)
+        self._exposure_us = 0  # skip the mock's own exposure-paced sleep so the test stays fast
+        return original_read_frame(self, timeout_ms=timeout_ms)
+
+    monkeypatch.setattr(mock_camera_module.MockAsiCamera, "read_frame", fast_read_frame)
+
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    _wait_for(worker, "preview_frame")  # drain a frame already in flight at the old 2000ms default
+
+    recorded_timeouts.clear()
+    worker.set_exposure_us(5_000_000)
+    _wait_for(worker, "preview_frame")
+
+    assert recorded_timeouts, "expected read_frame to have been called"
+    assert recorded_timeouts[-1] == 7000
+
+
+def test_fits_snapshot_timeout_scales_with_configured_exposure(worker, monkeypatch, tmp_path):
+    import camera.mock_camera as mock_camera_module
+
+    recorded_timeouts = []
+    original_read_frame = mock_camera_module.MockAsiCamera.read_frame
+
+    def fast_read_frame(self, timeout_ms=2000):
+        recorded_timeouts.append(timeout_ms)
+        self._exposure_us = 0
+        return original_read_frame(self, timeout_ms=timeout_ms)
+
+    monkeypatch.setattr(mock_camera_module.MockAsiCamera, "read_frame", fast_read_frame)
+
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    worker.set_exposure_us(6_000_000)
+    _wait_for(worker, "preview_frame")
+
+    recorded_timeouts.clear()
+    worker.save_fits_snapshot(tmp_path / "snapshot.fits")
+    _wait_for(worker, "fits_saved", timeout=5.0)
+
+    assert recorded_timeouts, "expected read_frame to have been called for the snapshot"
+    assert recorded_timeouts[-1] == 8000

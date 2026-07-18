@@ -1,3 +1,5 @@
+import math
+import threading
 import time
 import tkinter as tk
 from datetime import datetime, timedelta, timezone
@@ -9,9 +11,11 @@ import pytest
 
 from skyfield.api import EarthSatellite, load, wgs84
 
+import am5.gui.panels as gui_panels
 from am5.clock_sync import ClockSyncStatus
 from am5.ephemeris import PassWindow, Trajectory, compute_trajectory, find_next_pass, meridian_crossings
 from am5.gui.panels import (
+    AUTO_GOTO_BEFORE_START_THRESHOLD_DEG,
     CUSTOM_SATELLITE_LABEL,
     GUIDING_CALIB_NUDGE_DURATION_S,
     GUIDING_CALIB_NUDGE_RATE_X,
@@ -19,6 +23,7 @@ from am5.gui.panels import (
     KNOWN_SATELLITES,
     MAX_CALIBRATION_PREVIEW_DIM,
     MAX_TRACKING_DURATION_S,
+    POLAR_SOLVE_RETRY_ATTEMPTS,
     AlignmentPanel,
     AlignmentSkyMapWidget,
     CameraControlVars,
@@ -32,7 +37,9 @@ from am5.gui.panels import (
     TransitPanel,
     _local_and_utc,
     _meridian_detail_line,
+    _normalize_to_8bit_for_preview,
     _sanitize_filename,
+    _scale_16bit_to_8bit_fixed,
     visible_named_stars,
 )
 from am5.gui.finder_window import FinderWindow
@@ -46,6 +53,49 @@ from camera.worker import CameraEvent, CameraWorker, frame_to_pgm
 # Same fixed, network-free TLE as tests/test_ephemeris.py.
 _TLE_LINE1 = "1 25544U 98067A   24001.50000000  .00016717  00000-0  10270-3 0  9006"
 _TLE_LINE2 = "2 25544  51.6400 208.9163 0006317  69.9862 25.2825 15.49560500000000"
+
+
+def test_scale_16bit_to_8bit_fixed_a_uniform_gain_change_stays_visible():
+    # Regression: show_frame_on_canvas (FinderWindow's live preview, and
+    # AlignmentPanel's polar-alignment preview) used to share
+    # _normalize_to_8bit_for_preview with the SER player -- that function
+    # rescales EVERY frame so its own max always maps to 255, which
+    # exactly cancels out a uniform gain change algebraically (k*frame /
+    # (k*max) == frame/max). Reported symptom: gain slider had no visible
+    # effect on the live preview. A FIXED reference point (this project's
+    # own camera's real 12-bit ADC range) must not have this
+    # cancellation -- scaling the raw frame by a real gain-like factor
+    # has to change the OUTPUT.
+    base = np.full((10, 10), 200, dtype=np.uint16)  # well under the 4095 12-bit ceiling, no clipping
+    low_gain = _scale_16bit_to_8bit_fixed(base)
+    high_gain = _scale_16bit_to_8bit_fixed(base * 2)  # simulates ~2x more signal from more gain
+    assert int(high_gain[0, 0]) > int(low_gain[0, 0])
+
+
+def test_scale_16bit_to_8bit_fixed_passes_uint8_values_through_unchanged_at_1x():
+    frame = np.array([[10, 250]], dtype=np.uint8)
+    result = _scale_16bit_to_8bit_fixed(frame)
+    np.testing.assert_array_equal(result, frame)
+
+
+def test_scale_16bit_to_8bit_fixed_manual_stretch_boosts_uint8_too():
+    # The manual "Preview stretch" slider (FinderWindow) is purely
+    # display-side and applies regardless of the camera's own bit depth,
+    # unlike the fixed 12-bit ADC conversion above (which only matters
+    # for RAW16 frames).
+    frame = np.array([[10, 100]], dtype=np.uint8)
+    result = _scale_16bit_to_8bit_fixed(frame, stretch=2.0)
+    np.testing.assert_array_equal(result, np.array([[20, 200]], dtype=np.uint8))
+
+
+def test_normalize_to_8bit_for_preview_still_auto_stretches_for_ser_playback():
+    # SerPlayerPanel's own use of this function is unaffected by the fix
+    # above -- SER's PixelDepth can legitimately be anything up to 16, so
+    # per-frame auto-stretch is still the right (if imperfect) behavior
+    # there, see the function's own docstring.
+    frame = np.full((4, 4), 100, dtype=np.uint16)
+    result = _normalize_to_8bit_for_preview(frame)
+    assert int(result.max()) == 255
 
 
 def _tk_available() -> bool:
@@ -434,6 +484,123 @@ def test_on_start_click_passes_mount_lag_and_feedback_into_tracking_config(panel
     panel._on_start_click()
     assert captured["config"].mount_lag_s == pytest.approx(0.27)
     assert captured["config"].enable_feedback is True
+
+
+def _trajectory_at(ra_deg: float, dec_deg: float, duration_s: float = 60.0) -> Trajectory:
+    n = 10
+    t_unix = time.time() + np.linspace(0.0, duration_s, n)
+    return Trajectory(
+        t_unix=t_unix, ra_deg=np.full(n, ra_deg), dec_deg=np.full(n, dec_deg),
+        dra_dt_deg_s=np.zeros(n), ddec_dt_deg_s=np.zeros(n),
+        alt_deg=np.full(n, 45.0), az_deg=np.full(n, 180.0), ha_hours=np.zeros(n),
+        distance_km=np.full(n, 500.0),
+    )
+
+
+def test_on_start_click_auto_gotos_first_when_far_off_target(panel):
+    # Regression, reported live: picking a "Live now" satellite (a real,
+    # arbitrary current sky position, unlike a scheduled pass an operator
+    # has usually already pointed toward) and going straight ARM -> Start
+    # left the mount wherever it was previously -- the tracker's own
+    # runaway-divergence check then correctly rejected it ("pointing
+    # error 79.8 deg exceeds runaway limit 10.0 deg"). Now Start itself
+    # auto-GOTOs to the target first when the last known position is off
+    # by more than AUTO_GOTO_BEFORE_START_THRESHOLD_DEG, instead of
+    # requiring the operator to click a GOTO button first.
+    panel._window = _window(datetime.now(timezone.utc), duration_s=300.0)
+    panel._trajectory = _trajectory_at(ra_deg=200.0, dec_deg=60.0)
+    panel._armed = True
+    panel._last_known_mount_radec = (0.0, 0.0)  # RA=0h DEC=0 -- far from RA=200deg/DEC=60
+
+    goto_calls = []
+    panel._mount_worker.goto = lambda ra_hours, dec_deg: goto_calls.append((ra_hours, dec_deg))
+    start_calls = []
+    panel._mount_worker.start_tracking = lambda *a, **kw: start_calls.append(a)
+
+    panel._on_start_click()
+
+    assert len(goto_calls) == 1
+    ra_hours, dec_deg = goto_calls[0]
+    assert ra_hours == pytest.approx(200.0 / 15.0, abs=0.01)
+    assert dec_deg == pytest.approx(60.0, abs=0.01)
+    assert start_calls == []  # tracking must NOT start yet -- waiting on goto_arrived
+    assert panel._start_pending_after_goto is True
+    assert str(panel._start_button["state"]) == "disabled"
+    assert str(panel._arm_button["state"]) == "disabled"
+
+    # goto_arrived resumes into the deferred start.
+    panel.handle_mount_event(WorkerEvent("goto_arrived", {}))
+    assert len(start_calls) == 1
+    assert panel._start_pending_after_goto is False
+
+
+def test_on_start_click_skips_auto_goto_when_already_close(panel):
+    panel._window = _window(datetime.now(timezone.utc), duration_s=300.0)
+    panel._trajectory = _trajectory_at(ra_deg=200.0, dec_deg=60.0)
+    panel._armed = True
+    # Within AUTO_GOTO_BEFORE_START_THRESHOLD_DEG of the target already.
+    panel._last_known_mount_radec = (200.0 / 15.0, 60.0 + AUTO_GOTO_BEFORE_START_THRESHOLD_DEG / 2.0)
+
+    goto_calls = []
+    panel._mount_worker.goto = lambda *a: goto_calls.append(a)
+    start_calls = []
+    panel._mount_worker.start_tracking = lambda *a, **kw: start_calls.append(a)
+
+    panel._on_start_click()
+
+    assert goto_calls == []
+    assert len(start_calls) == 1
+
+
+def test_on_start_click_skips_auto_goto_comparison_with_no_known_position(panel):
+    # No "position" event has arrived yet -- can't judge divergence, so
+    # this falls back to the original (pre-auto-GOTO) behavior: start
+    # tracking directly, same as before this feature existed.
+    panel._window = _window(datetime.now(timezone.utc), duration_s=60.0)
+    panel._trajectory = object()  # never touched -- _goto_start_radec must not be called in this path
+    panel._armed = True
+    assert panel._last_known_mount_radec is None
+
+    start_calls = []
+    panel._mount_worker.start_tracking = lambda *a, **kw: start_calls.append(a)
+    panel._on_start_click()
+    assert len(start_calls) == 1
+
+
+def test_auto_goto_timeout_reports_failure_and_does_not_start_tracking(panel):
+    panel._window = _window(datetime.now(timezone.utc), duration_s=300.0)
+    panel._trajectory = _trajectory_at(ra_deg=200.0, dec_deg=60.0)
+    panel._armed = True
+    panel._last_known_mount_radec = (0.0, 0.0)
+    panel._mount_worker.goto = lambda *a: None
+    start_calls = []
+    panel._mount_worker.start_tracking = lambda *a, **kw: start_calls.append(a)
+    panel._mount_connected = True
+
+    panel._on_start_click()
+    assert panel._start_pending_after_goto is True
+
+    panel.handle_mount_event(WorkerEvent("goto_timeout", {}))
+
+    assert start_calls == []
+    assert panel._start_pending_after_goto is False
+    assert "did not arrive" in panel._tracking_status_var.get()
+    assert str(panel._start_button["state"]) == "normal"
+
+
+def test_disconnect_clears_a_pending_auto_goto_start(panel):
+    panel._window = _window(datetime.now(timezone.utc), duration_s=300.0)
+    panel._trajectory = _trajectory_at(ra_deg=200.0, dec_deg=60.0)
+    panel._armed = True
+    panel._last_known_mount_radec = (0.0, 0.0)
+    panel._mount_worker.goto = lambda *a: None
+    panel._on_start_click()
+    assert panel._start_pending_after_goto is True
+
+    panel.set_mount_connected(False)
+
+    assert panel._start_pending_after_goto is False
+    assert panel._last_known_mount_radec is None
 
 
 def test_build_tracking_config_falls_back_to_zero_lag_on_invalid_input(panel):
@@ -1161,6 +1328,29 @@ def alignment_panel():
     root.destroy()
 
 
+@pytest.fixture
+def alignment_panel_factory():
+    created = []
+
+    def make(**kwargs):
+        root = tk.Tk()
+        root.withdraw()
+        mount_worker = MountWorker()
+        site_vars = SiteVars.create()
+        site_vars.lat.set("46.18")
+        site_vars.lon.set("6.14")
+        p = AlignmentPanel(
+            root, mount_worker, AxisSigns(ra=1.0, dec=1.0), site_vars, finder_state=FinderState(), **kwargs,
+        )
+        created.append((p, mount_worker, root))
+        return p
+
+    yield make
+    for p, mount_worker, root in created:
+        mount_worker.shutdown()
+        root.destroy()
+
+
 class _MplEvent:
     def __init__(self, xdata, ydata, button=None, inaxes=True):
         self.xdata = xdata
@@ -1444,7 +1634,7 @@ def test_alignment_panel_turning_off_alignment_mode_asks_for_confirmation(alignm
 class _FakeSolveResult:
     def __init__(
         self, ra_deg: float, dec_deg: float, success: bool = True, message: str = "",
-        pixel_scale_arcsec: float = 1.72, field_rotation_deg: float = 0.0,
+        pixel_scale_arcsec: float = 1.72, field_rotation_deg: float = 0.0, flip_parity: bool = False,
     ):
         self.success = success
         self.ra_deg = ra_deg
@@ -1452,6 +1642,7 @@ class _FakeSolveResult:
         self.message = message
         self.pixel_scale_arcsec = pixel_scale_arcsec
         self.field_rotation_deg = field_rotation_deg
+        self.flip_parity = flip_parity
 
 
 def test_polar_alignment_reads_frame_and_scale_from_the_selected_camera(alignment_panel):
@@ -1522,19 +1713,141 @@ def test_polar_alignment_negative_rotation_jogs_west(alignment_panel, monkeypatc
     assert p._polar_rotation_deg == pytest.approx(30.0)  # stored as a positive magnitude
 
 
-def test_polar_alignment_aborts_cleanly_on_a_failed_solve(alignment_panel, monkeypatch):
+def test_polar_alignment_aborts_after_all_retry_attempts_fail(alignment_panel, monkeypatch):
+    # Regression: a single failed solve used to abort the whole 3-point
+    # sequence immediately, forcing the operator to redo all 3 points
+    # from scratch -- e.g. because the frame right after the mount
+    # stopped rotating between points still showed real motion blur.
+    # Now retries POLAR_SOLVE_RETRY_ATTEMPTS times (each re-reading the
+    # live frame fresh) before actually giving up.
     p = alignment_panel
     p.set_connected(True)
     p._finder_state.last_frame = np.zeros((10, 10), dtype=np.uint8)
     p._finder_state.finder_plate_scale_arcsec = 5.0
-    monkeypatch.setattr(
-        p._solvers[p._solver_engine_var.get()], "solve_async",
-        lambda frame, widget, on_done, **kw: on_done(_FakeSolveResult(0.0, 0.0, success=False, message="no stars found")),
-    )
+    call_count = 0
+
+    def fake_solve_async(frame, widget, on_done, **kw):
+        nonlocal call_count
+        call_count += 1
+        on_done(_FakeSolveResult(0.0, 0.0, success=False, message="no stars found"))
+
+    monkeypatch.setattr(p._solvers[p._solver_engine_var.get()], "solve_async", fake_solve_async)
     p._on_polar_start_click()
+
+    assert call_count == POLAR_SOLVE_RETRY_ATTEMPTS
     assert "failed" in p._polar_status_var.get()
     assert "no stars found" in p._polar_status_var.get()
     assert str(p._polar_start_button["state"]) == "normal"
+
+
+def test_polar_alignment_saves_every_failed_attempts_frame_when_out_dir_is_set(alignment_panel_factory, tmp_path, monkeypatch):
+    # Regression: a failed solve attempt used to just discard its frame --
+    # nothing to inspect afterward if a point failed all its retries (as
+    # happened during real-hardware testing). Now each failed attempt's
+    # exact frame is saved as FITS under out_dir/paa_failed_solves/<run>/.
+    p = alignment_panel_factory(out_dir=tmp_path)
+    p.set_connected(True)
+    p._finder_state.last_frame = np.full((10, 10), 7, dtype=np.uint8)
+    p._finder_state.finder_plate_scale_arcsec = 5.0
+
+    def fake_solve_async(frame, widget, on_done, **kw):
+        on_done(_FakeSolveResult(0.0, 0.0, success=False, message="no stars found"))
+
+    monkeypatch.setattr(p._solvers[p._solver_engine_var.get()], "solve_async", fake_solve_async)
+    p._on_polar_start_click()
+
+    run_dir = tmp_path / "paa_failed_solves" / p._polar_run_label
+    saved = sorted(run_dir.glob("point1_attempt*.fits"))
+    assert len(saved) == POLAR_SOLVE_RETRY_ATTEMPTS
+    from astropy.io import fits
+    data = fits.getdata(saved[0])
+    np.testing.assert_array_equal(data, p._finder_state.last_frame)
+    assert str(run_dir) in p._polar_status_var.get()
+
+
+def test_polar_alignment_preview_applies_the_shared_camera_stretch(alignment_panel_factory, monkeypatch):
+    # Regression: _refresh_polar_preview never passed the per-camera
+    # manual stretch through to show_frame_on_canvas, unlike every other
+    # live preview (TransitPanel/FinderCameraPanel/FinderWindow/
+    # CalibrationPanel) -- a gain change was invisible here even after
+    # the stretch feature was added everywhere else.
+    p = alignment_panel_factory()
+    p._finder_state.last_frame = np.full((10, 10), 7, dtype=np.uint8)
+    p._finder_state.finder_plate_scale_arcsec = 5.0
+    p._finder_camera_vars.stretch.set(3.5)
+
+    seen = {}
+
+    def fake_show_frame_on_canvas(canvas, frame, stretch=1.0):
+        seen["stretch"] = stretch
+        return None
+
+    monkeypatch.setattr(gui_panels, "show_frame_on_canvas", fake_show_frame_on_canvas)
+    p._refresh_polar_preview()
+
+    assert seen["stretch"] == 3.5
+
+
+def test_polar_alignment_settle_delay_is_configurable_and_used_between_rotation_and_capture(alignment_panel, monkeypatch):
+    # Regression: the settle delay between stopping the rotation and
+    # capturing the next point used to be a hardcoded 800ms -- reported
+    # live that the very first capture right after a rotation sometimes
+    # still shows motion blur. Now an operator-adjustable field
+    # (_polar_settle_s_var), read into self._polar_settle_s at run start
+    # and used as the actual self.after() delay in _stop_polar_rotation.
+    p = alignment_panel
+    p.set_connected(True)
+    p._finder_state.last_frame = np.zeros((10, 10), dtype=np.uint8)
+    p._finder_state.finder_plate_scale_arcsec = 5.0
+    monkeypatch.setattr(p._mount_worker, "jog_start", lambda *a, **kw: None)
+    monkeypatch.setattr(p._mount_worker, "jog_stop", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        p._solvers[p._solver_engine_var.get()], "solve_async",
+        lambda frame, widget, on_done, **kw: on_done(_FakeSolveResult(0.0, 85.0)),
+    )
+    after_calls = []
+    real_after = p.after
+
+    def fake_after(ms, cb):
+        after_calls.append(ms)
+        return real_after(0, cb)
+
+    monkeypatch.setattr(p, "after", fake_after)
+
+    p._polar_rotation_deg_var.set("30")
+    p._polar_rate_var.set("150")
+    p._polar_settle_s_var.set("2.5")
+    p._on_polar_start_click()
+    p.update()
+
+    assert 2500 in after_calls
+
+
+def test_polar_alignment_retries_on_a_fresh_frame_until_it_succeeds(alignment_panel, monkeypatch):
+    p = alignment_panel
+    p.set_connected(True)
+    p._finder_state.last_frame = np.zeros((10, 10), dtype=np.uint8)
+    p._finder_state.finder_plate_scale_arcsec = 5.0
+    monkeypatch.setattr(p, "after", lambda ms, cb: cb())
+    monkeypatch.setattr(p._mount_worker, "jog_start", lambda *a, **kw: None)
+    monkeypatch.setattr(p._mount_worker, "jog_stop", lambda *a, **kw: None)
+    call_count = 0
+
+    def fake_solve_async(frame, widget, on_done, **kw):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            on_done(_FakeSolveResult(0.0, 0.0, success=False, message="no stars found"))
+        else:
+            on_done(_FakeSolveResult(10.0, 20.0))
+
+    monkeypatch.setattr(p._solvers[p._solver_engine_var.get()], "solve_async", fake_solve_async)
+    p._on_polar_start_click()
+
+    # Point 1 succeeded on its 3rd attempt -- the sequence must have kept
+    # going (rotated + captured point 2) rather than aborting.
+    assert call_count > 3
+    assert "failed" not in p._polar_status_var.get()
 
 
 def test_polar_alignment_full_workflow_computes_a_result(alignment_panel, monkeypatch):
@@ -1570,14 +1883,107 @@ def test_polar_alignment_full_workflow_computes_a_result(alignment_panel, monkey
     assert jog_calls.count(("stop", "e")) == 2
     assert str(p._polar_start_button["state"]) == "normal"
 
-    # The KStars-PAA-style correction overlay (axis / az-corrected point /
-    # true pole, each a (delta_col, delta_row) pixel offset) is populated
-    # once the measurement completes.
+    # The fitted axis's live-view locator dot (delta_col, delta_row pixel
+    # offset) is populated once the measurement completes.
     assert p._polar_overlay is not None
-    assert len(p._polar_overlay) == 3
-    for delta_col, delta_row in p._polar_overlay:
-        assert isinstance(delta_col, float)
-        assert isinstance(delta_row, float)
+    delta_col, delta_row = p._polar_overlay
+    assert isinstance(delta_col, float)
+    assert isinstance(delta_row, float)
+    assert p._polar_last_alignment_result is not None
+
+
+def test_polar_alignment_draws_two_fixed_direction_correction_arrows(alignment_panel, monkeypatch):
+    # Regression: the live-view overlay used to project the correction
+    # into the actual image's pixel space (a to-scale line from the
+    # fitted axis toward the true pole) -- for any real (degree-scale)
+    # error, that target is normally well outside the finder's <2deg
+    # field of view, so the line was mostly invisible/off-canvas ("part
+    # n'importe où", reported live). Fixed-length arrows in image space
+    # were tried next, but real-hardware testing showed an operator can't
+    # reliably map "arrow points toward the top-left of this star field"
+    # to "turn this physical adjuster this way" -- reported live as a
+    # real mis-adjustment (altitude moved the wrong way). Redesigned as a
+    # KStars-PAA-style indicator with two arrows in FIXED screen
+    # directions (up/down for altitude, left/right for azimuth),
+    # independent of the camera's image orientation entirely -- see
+    # _draw_polar_correction_arrows' own docstring.
+    p = alignment_panel
+    p.set_connected(True)
+    p._finder_state.last_frame = np.zeros((10, 10), dtype=np.uint8)
+    p._finder_state.finder_plate_scale_arcsec = 5.0
+    monkeypatch.setattr(p, "after", lambda ms, cb: cb())
+
+    # 3 synthetic solves tracing a circle around a KNOWN, deliberately
+    # off-true-pole axis (47, 88) -- same rotation-matrix construction as
+    # tests/test_polar_alignment.py's own test_fit_rotation_axis_recovers_
+    # a_known_axis (3 equally-spaced RA points at the same declination
+    # always fit back to the true pole exactly, so that shape alone can't
+    # produce a nonzero error to test against; this rotates that trivial
+    # case onto a real off-pole axis instead).
+    def _unit_vector(ra_deg: float, dec_deg: float) -> np.ndarray:
+        ra, dec = math.radians(ra_deg), math.radians(dec_deg)
+        return np.array([math.cos(dec) * math.cos(ra), math.cos(dec) * math.sin(ra), math.sin(dec)])
+
+    def _to_radec(v: np.ndarray) -> tuple[float, float]:
+        v = v / np.linalg.norm(v)
+        dec_deg = math.degrees(math.asin(max(-1.0, min(1.0, v[2]))))
+        ra_deg = math.degrees(math.atan2(v[1], v[0])) % 360.0
+        return ra_deg, dec_deg
+
+    def _rotation_matrix(axis: np.ndarray, angle_deg: float) -> np.ndarray:
+        axis = axis / np.linalg.norm(axis)
+        theta = math.radians(angle_deg)
+        k = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+        return np.eye(3) + math.sin(theta) * k + (1 - math.cos(theta)) * (k @ k)
+
+    true_axis_ra, true_axis_dec = 47.0, 88.0
+    pole = np.array([0.0, 0.0, 1.0])
+    target = _unit_vector(true_axis_ra, true_axis_dec)
+    rot_axis = np.cross(pole, target)
+    rot_angle_deg = math.degrees(math.acos(np.clip(np.dot(pole, target), -1.0, 1.0)))
+    r = _rotation_matrix(rot_axis, rot_angle_deg)
+    solved_points = iter(_to_radec(r @ _unit_vector(phase, 85.0)) for phase in (0.0, 120.0, 240.0))
+    monkeypatch.setattr(
+        p._solvers[p._solver_engine_var.get()], "solve_async",
+        lambda frame, widget, on_done, **kw: on_done(_FakeSolveResult(*next(solved_points))),
+    )
+    monkeypatch.setattr(p._mount_worker, "jog_start", lambda *a, **kw: None)
+    monkeypatch.setattr(p._mount_worker, "jog_stop", lambda *a, **kw: None)
+    p._polar_rotation_deg_var.set("30")
+    p._polar_rate_var.set("150")
+    p._on_polar_start_click()
+
+    assert p._polar_last_alignment_result is not None
+    assert abs(p._polar_last_alignment_result.error_deg) > 1.0  # a real, several-degree error
+
+    result = p._polar_last_alignment_result
+    canvas = p._polar_correction_canvas
+    items = canvas.find_all()
+    # A shaft (line) + an arrowhead (polygon) + a text label per axis.
+    line_items = [i for i in items if canvas.type(i) == "line"]
+    polygon_items = [i for i in items if canvas.type(i) == "polygon"]
+    text_items = [i for i in items if canvas.type(i) == "text"]
+    assert len(line_items) == 2
+    assert len(polygon_items) == 2
+    assert len(text_items) == 2
+    labels = " ".join(canvas.itemcget(i, "text") for i in text_items)
+    assert "ALT" in labels
+    assert "AZ" in labels
+    alt_word = "lower" if result.error_alt_deg > 0 else "raise"
+    az_word = "west" if result.error_az_deg > 0 else "east"
+    assert alt_word in labels
+    assert az_word in labels
+    assert f"{abs(result.error_alt_deg) * 60.0:.1f}" in labels
+    assert f"{abs(result.error_az_deg) * 60.0:.1f}" in labels
+
+    # The whole point of the redesign: arrow direction is a FIXED screen
+    # direction (up/down, left/right), never derived from image pixel
+    # projection -- assert the altitude shaft is vertical and the azimuth
+    # shaft is horizontal, regardless of what the (here, real off-pole)
+    # solve's own field_rotation_deg/flip_parity happen to be.
+    alt_line = [i for i in line_items if abs(canvas.coords(i)[0] - canvas.coords(i)[2]) < 0.01][0]
+    az_line = [i for i in line_items if abs(canvas.coords(i)[1] - canvas.coords(i)[3]) < 0.01][0]
+    assert alt_line != az_line
 
 
 def test_polar_alignment_overlay_is_cleared_at_the_start_of_a_new_run(alignment_panel, monkeypatch):
@@ -1585,7 +1991,7 @@ def test_polar_alignment_overlay_is_cleared_at_the_start_of_a_new_run(alignment_
     p.set_connected(True)
     p._finder_state.last_frame = np.zeros((10, 10), dtype=np.uint8)
     p._finder_state.finder_plate_scale_arcsec = 5.0
-    p._polar_overlay = ((1.0, 2.0), (3.0, 4.0), (5.0, 6.0))  # stale, from a previous run
+    p._polar_overlay = (1.0, 2.0)  # stale, from a previous run
 
     monkeypatch.setattr(
         p._solvers[p._solver_engine_var.get()], "solve_async",
@@ -2597,6 +3003,45 @@ def test_finder_calibrate_passes_the_typed_rotation_through():
         root.destroy()
 
 
+def test_finder_panel_exposure_gain_commit_only_on_slider_release(monkeypatch):
+    # Regression: these sliders used to fire on every drag tick
+    # (command=...), unlike TransitPanel's own exposure/gain scales
+    # (<ButtonRelease-1> only) -- a fast drag queued a burst of
+    # set_exposure_us calls the CameraWorker then worked through one at a
+    # time (see camera/worker.py's _COALESCE_LATEST_ONLY fix), reported
+    # live as the finder's live feed "never" speeding back up after
+    # dragging the exposure down. The worker fix alone already covers
+    # this, but committing only on release is still the right UI (no
+    # reason to push throwaway intermediate values to the real sensor).
+    root = tk.Tk()
+    root.withdraw()
+    finder_worker = CameraWorker()
+    try:
+        p = FinderCameraPanel(root, finder_worker, FinderState())
+        p._connected = True
+        calls = []
+        monkeypatch.setattr(finder_worker, "set_exposure_us", lambda us: calls.append(("exp", us)))
+        monkeypatch.setattr(finder_worker, "set_gain", lambda g: calls.append(("gain", g)))
+
+        # Simulate a drag: several intermediate value changes, no release.
+        for log_val in (4.0, 3.5, 3.0, 2.5, 2.0):
+            p._camera_vars.exposure_log.set(log_val)
+        assert calls == []  # nothing committed mid-drag
+
+        p._finder_exp_scale.event_generate("<ButtonRelease-1>")
+        root.update()
+        assert calls == [("exp", round(10 ** 2.0))]
+
+        calls.clear()
+        p._camera_vars.gain.set(123.0)
+        p._finder_gain_scale.event_generate("<ButtonRelease-1>")
+        root.update()
+        assert calls == [("gain", 123)]
+    finally:
+        finder_worker.shutdown()
+        root.destroy()
+
+
 def test_finder_panel_delta_t_and_perp_nudge_controls_use_live_offsets():
     # The Finder tab got its own delta_t/perp-nudge controls (mirroring
     # TransitPanel's) so the operator doesn't have to look away from the
@@ -2801,3 +3246,180 @@ def test_passes_panel_fetch_and_find_passes_elevation_to_wgs84_latlon():
         assert captured["kwargs"]["elevation_m"] == pytest.approx(1800.0)
     finally:
         root.destroy()
+
+
+def test_passes_panel_has_scheduled_and_live_sub_tabs():
+    # PassesPanel was restructured into a sub-notebook (Scheduled passes /
+    # Live now) -- confirms both exist and the pre-existing widgets
+    # (target picker, tree, etc.) still resolve as instance attributes
+    # regardless of which sub-frame they now live in.
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        p = PassesPanel(root, lambda *a: None)
+        tab_texts = [p._sub_notebook.tab(i, "text") for i in range(len(p._sub_notebook.tabs()))]
+        assert tab_texts == ["Scheduled passes", "Live now"]
+    finally:
+        root.destroy()
+
+
+def test_passes_panel_does_not_fetch_the_live_catalog_on_construction():
+    # Regression: an early version auto-fetched the "visual" group over
+    # the real network as soon as the panel was built -- every test that
+    # constructs a PassesPanel (there are many, throughout this file)
+    # would have silently made a real network call. Loading is manual-
+    # only now (the "Reload catalog + refresh" button), same convention
+    # as "Scheduled passes"' own "Refresh passes".
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        with patch("am5.gui.panels.load_satellite_group_tles") as fake_load:
+            p = PassesPanel(root, lambda *a: None)
+            root.update()
+            fake_load.assert_not_called()
+        assert p._live_satellites == []
+    finally:
+        root.destroy()
+
+
+def test_live_now_reload_populates_tree_and_status(monkeypatch):
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        p = PassesPanel(root, lambda *a: None)
+        ts = load.timescale()
+        satellite = EarthSatellite(_TLE_LINE1, _TLE_LINE2, "ISS (fixture)", ts)
+        site = wgs84.latlon(46.18, 6.14)
+        window = _window(datetime.now(timezone.utc) + timedelta(seconds=120))
+
+        # Bypass the real background thread + network/SGP4 work -- this
+        # test is about _poll_results' handling of "live_list_ready", not
+        # about currently_visible_satellites/current_pass_window
+        # themselves (covered directly in tests/test_ephemeris.py).
+        monkeypatch.setattr(
+            p, "_live_fetch_group_and_refresh",
+            lambda: p._results.put(("live_list_ready", ([satellite], site, [(satellite, 45.0, 180.0, window)]))),
+        )
+        p._on_live_reload_click()
+        for _ in range(50):
+            if p._live_visible:
+                break
+            time.sleep(0.02)
+            p._poll_results()
+
+        assert len(p._live_visible) == 1
+        row = p._live_tree.item("0")["values"]
+        assert row[0] == "ISS (fixture)"
+        assert row[1] == 25544
+        assert row[2] == "45.0"
+        assert row[3] == "180.0"
+        assert "1 satellites in catalog" in p._live_status_var.get() or "1 satellite" in p._live_status_var.get()
+        assert str(p._live_reload_button["state"]) == "normal"
+    finally:
+        root.destroy()
+
+
+def test_live_now_row_click_loads_the_trajectory_like_a_scheduled_pass(monkeypatch):
+    # Selecting a "Live now" row must reach the exact same on_pass_selected
+    # callback a scheduled-pass row selection does -- TransitPanel etc.
+    # don't need to know or care whether the pass was scheduled or live.
+    root = tk.Tk()
+    root.withdraw()
+    selected = []
+    try:
+        p = PassesPanel(root, lambda *a: selected.append(a))
+        ts = load.timescale()
+        satellite = EarthSatellite(_TLE_LINE1, _TLE_LINE2, "ISS (fixture)", ts)
+        site = wgs84.latlon(46.18, 6.14)
+        window = _window(datetime.now(timezone.utc) + timedelta(seconds=120))
+        p._live_site = site
+        p._live_visible = [(satellite, 45.0, 180.0, window)]
+        p._populate_live_tree()
+
+        monkeypatch.setattr(
+            p, "_live_compute_trajectory",
+            lambda sat, win: p._results.put(("live_trajectory_ready", (
+                compute_trajectory(sat, site, win.t_rise, win.t_set, step_s=1.0), win, [], sat.name,
+            ))),
+        )
+        p._live_tree.selection_set("0")
+        root.update()
+        for _ in range(50):
+            if selected:
+                break
+            time.sleep(0.02)
+            p._poll_results()
+
+        assert len(selected) == 1
+        trajectory, out_window, crossings, out_site, satellite_name = selected[0]
+        assert satellite_name == "ISS (fixture)"
+        assert out_site is site
+        assert out_window is window
+    finally:
+        root.destroy()
+
+
+def test_live_now_sky_map_click_selects_the_same_row_as_the_list(monkeypatch):
+    # The sky map is a second way to pick a satellite, not a separate
+    # feature -- clicking a plotted point must drive the SAME tree
+    # selection (and therefore the same on_pass_selected callback) a row
+    # click would, not a parallel path that could disagree with the list.
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        p = PassesPanel(root, lambda *a: None)
+        ts = load.timescale()
+        sat_a = EarthSatellite(_TLE_LINE1, _TLE_LINE2, "ISS (fixture)", ts)
+        sat_b = EarthSatellite(_TLE_LINE1, _TLE_LINE2, "CSS (fixture)", ts)
+        site = wgs84.latlon(46.18, 6.14)
+        window = _window(datetime.now(timezone.utc) + timedelta(seconds=120))
+        p._live_site = site
+        p._live_visible = [(sat_a, 45.0, 180.0, window), (sat_b, 30.0, 90.0, window)]
+        p._populate_live_tree()
+
+        # Bypass the real background trajectory computation the resulting
+        # <<TreeviewSelect>> event triggers (already covered by
+        # test_live_now_row_click_loads_the_trajectory_like_a_scheduled_
+        # pass) -- this test is only about which row ends up selected.
+        monkeypatch.setattr(threading, "Thread", lambda target, args, daemon: _NoStartThread())
+
+        entry_b = next(e for e, _az, _alt in p._live_sky_map._stars if e.satellite is sat_b)
+        p._on_live_map_entry_selected(entry_b)
+        root.update()
+
+        assert p._live_tree.selection() == ("1",)
+    finally:
+        root.destroy()
+
+
+def test_live_now_refresh_tick_skips_work_when_catalog_not_loaded_or_tab_hidden(monkeypatch):
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        p = PassesPanel(root, lambda *a: None)
+        started = []
+        monkeypatch.setattr(threading, "Thread", lambda target, daemon: started.append(target) or _NoStartThread())
+
+        # Catalog never loaded (_live_satellites == []) -- must not spawn
+        # a refresh thread even if we pretend the tab is mapped.
+        monkeypatch.setattr(p._live_tab, "winfo_ismapped", lambda: True)
+        p._on_live_refresh_tick()
+        assert started == []
+
+        # Catalog loaded, but tab not the visible one -- still no work.
+        p._live_satellites = [EarthSatellite(_TLE_LINE1, _TLE_LINE2, "ISS (fixture)", load.timescale())]
+        monkeypatch.setattr(p._live_tab, "winfo_ismapped", lambda: False)
+        p._on_live_refresh_tick()
+        assert started == []
+
+        # Both conditions met -- refresh actually runs.
+        monkeypatch.setattr(p._live_tab, "winfo_ismapped", lambda: True)
+        p._on_live_refresh_tick()
+        assert started == [p._live_refresh_visible_only]
+    finally:
+        root.destroy()
+
+
+class _NoStartThread:
+    def start(self) -> None:
+        pass

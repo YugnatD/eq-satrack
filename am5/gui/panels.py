@@ -26,17 +26,33 @@ from geopy.geocoders import Nominatim
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Circle
-from skyfield.api import wgs84
+from skyfield.api import EarthSatellite, wgs84
 from skyfield.toposlib import GeographicPosition
 from tkintermapview import TkinterMapView
 
-from am5.angles import circular_diff_hours, equatorial_series_to_altaz, equatorial_to_altaz
+from am5.angles import angular_separation_deg, circular_diff_hours, equatorial_series_to_altaz, equatorial_to_altaz
 from am5.clock_sync import ClockSyncStatus, check_clock_sync
 from am5.constants import SIDEREAL_DEG_PER_S
 from am5.constellations import constellations_altaz
-from am5.ephemeris import PassWindow, Trajectory, compute_trajectory, find_passes, load_satellite_tle, meridian_crossings
+from am5.ephemeris import (
+    VISUAL_GROUP,
+    PassWindow,
+    Trajectory,
+    compute_trajectory,
+    current_pass_window,
+    currently_visible_satellites,
+    find_passes,
+    load_satellite_group_tles,
+    load_satellite_tle,
+    meridian_crossings,
+)
 from am5.named_stars import NAMED_STARS, NamedStar
-from am5.polar_alignment import correction_triangle_radec, fit_rotation_axis, polar_alignment_error, project_radec_to_pixel
+from am5.polar_alignment import (
+    PolarAlignmentResult,
+    fit_rotation_axis,
+    polar_alignment_error,
+    project_radec_to_pixel,
+)
 from am5.optics import (
     DEFAULT_FULL_WELL_ELECTRONS,
     OpticalTrain,
@@ -50,6 +66,7 @@ from am5.gui.theme import PALETTE, style_axes
 from am5.gui.worker import MountWorker, WorkerEvent
 from am5.tracker import AxisSigns, LiveOffsets, TrackingConfig, decompose_error
 from camera.finder import MAX_FINDER_EXPOSURE_US, FinderState, downsample_for_display
+from camera.fits_writer import write_fits
 from camera.guiding import BlobDetection, GuidingCalibration, calibrate_from_nudges, detect_brightest_blob
 from camera.platesolve import AstrometryNetSolver, PlateSolver
 from camera.ser_reader import SerReader
@@ -172,17 +189,37 @@ def fit_pgm_to_canvas(pgm: bytes, full_width: int, full_height: int, canvas: tk.
 
 @dataclasses.dataclass
 class CameraControlVars:
-    """Exposure/gain Tk variables, shared between TransitPanel and
-    JogWindow (see am5/gui/app.py) so their two independent slider widgets
-    show and drive the exact same value -- moving one moves the other, via
-    Tk's own built-in mechanism for multiple widgets bound to one Variable,
-    rather than two copies that only agreed at connect time and silently
-    drifted apart afterwards (the bug this was built to fix)."""
+    """Exposure/gain/stretch Tk variables, shared between every live-view
+    surface for ONE camera (TransitPanel + JogWindow + CalibrationPanel
+    for the main camera; FinderCameraPanel + FinderWindow + CalibrationPanel
+    for the finder -- see am5/gui/app.py, which owns one instance per
+    camera and passes the SAME instance to each) so their independent
+    slider widgets show and drive the exact same value -- moving one moves
+    the other, via Tk's own built-in mechanism for multiple widgets bound
+    to one Variable, rather than separate copies that only agreed at
+    connect time and silently drifted apart afterwards (the bug this was
+    built to fix for exposure/gain; stretch shares the same instance for
+    the same reason).
+
+    stretch is deliberately per-CAMERA, not one shared global value: the
+    main and finder cameras have their own separate CameraControlVars
+    instances already (see above), so each gets its own independent
+    stretch, matching how exposure/gain already work."""
 
     exposure_log: tk.DoubleVar  # log10(microseconds); 3.0 = 1000us
     exposure_value: tk.StringVar  # formatted display text, e.g. "1.00 ms"
     gain: tk.DoubleVar
     gain_value: tk.StringVar
+    # Manual, display-only brightness multiplier applied to every live
+    # preview of this camera (see am5.gui.panels._scale_16bit_to_8bit_fixed
+    # for why this is a FIXED, operator-controlled multiplier rather than
+    # an adaptive per-frame auto-stretch -- the latter silently cancels
+    # out real gain changes). 1.0 = no boost, exactly what the sensor
+    # reports (after the fixed 12-bit ADC conversion for a RAW16 camera).
+    # Never touches the real signal blob detection/plate solving/auto-
+    # guide correction work from, only the on-screen canvas.
+    stretch: tk.DoubleVar
+    stretch_value: tk.StringVar  # formatted display text, e.g. "2.5x"
 
     @classmethod
     def create(cls, default_exposure_us: float = 1000.0, default_gain: float = 300.0) -> "CameraControlVars":
@@ -190,6 +227,8 @@ class CameraControlVars:
         exposure_value = tk.StringVar(value=format_exposure_us(default_exposure_us))
         gain = tk.DoubleVar(value=default_gain)
         gain_value = tk.StringVar(value=f"{default_gain:.0f}")
+        stretch = tk.DoubleVar(value=1.0)
+        stretch_value = tk.StringVar(value="1.0x")
 
         # One trace each, registered here rather than per-widget, so the
         # formatted label stays correct regardless of which of the two
@@ -197,7 +236,8 @@ class CameraControlVars:
         # changed the underlying value.
         exposure_log.trace_add("write", lambda *_args: exposure_value.set(format_exposure_us(10 ** exposure_log.get())))
         gain.trace_add("write", lambda *_args: gain_value.set(f"{gain.get():.0f}"))
-        return cls(exposure_log, exposure_value, gain, gain_value)
+        stretch.trace_add("write", lambda *_args: stretch_value.set(f"{stretch.get():.1f}x"))
+        return cls(exposure_log, exposure_value, gain, gain_value, stretch, stretch_value)
 
 
 @dataclasses.dataclass
@@ -234,6 +274,19 @@ class SiteVars:
 # still until the pass actually begins (see Trajectory.interpolate's
 # outside-the-window rate=0 clamp in am5/ephemeris.py).
 MAX_TRACKING_DURATION_S = 20 * 60.0
+# Above this, TransitPanel._on_start_click auto-GOTOs to the pass-start
+# position before actually starting tracking, instead of requiring the
+# operator to click a GOTO button first -- reported live: clicking ARM ->
+# Start tracking straight after picking a "Live now" satellite (am5/gui/
+# panels.py's PassesPanel, a real, arbitrary current sky position, unlike
+# a scheduled pass an operator has usually already pointed toward) left
+# the mount wherever it was previously, and the tracker's own runaway-
+# divergence check (am5/tracker.py's TrackingConfig.runaway_stop_deg,
+# default 10 deg) correctly rejected it outright ("pointing error 79.8 deg
+# exceeds runaway limit"). Well under runaway_stop_deg so the auto-GOTO
+# always fires and completes BEFORE tracking could ever be rejected for
+# this exact reason, not just often enough to help.
+AUTO_GOTO_BEFORE_START_THRESHOLD_DEG = 2.0
 
 # Simulate track's optional "random pointing error" training scenario
 # (mock only): magnitude range per axis (arcmin), randomized independently
@@ -271,6 +324,18 @@ GUIDING_PERP_PULSE_DURATION_S = 0.15
 # CalibrationPanel.handle_camera_event's own comment for the incident
 # this fixes (a high-res main camera froze the whole window).
 MAX_CALIBRATION_PREVIEW_DIM = 480
+# How many fresh-frame plate-solve attempts AlignmentPanel's polar-
+# alignment capture tries per point before aborting the whole 3-point
+# sequence -- same rationale as FinderWindow's own SOLVE_RETRY_ATTEMPTS
+# (am5/gui/finder_window.py): a frame captured right after the mount
+# stops rotating between points often still shows real motion blur, and
+# re-reading FinderState.last_frame/last_main_frame on each retry (kept
+# live at ~10Hz by App._pump_events, not a snapshot taken once) means
+# each retry is naturally later and better-settled than the one that
+# just failed. Before this, ANY single solve failure at ANY of the 3
+# points aborted the entire sequence, forcing the operator to redo all 3
+# points from scratch.
+POLAR_SOLVE_RETRY_ATTEMPTS = 5
 
 
 class ConnectionPanel(ttk.Frame):
@@ -1135,12 +1200,27 @@ class AlignmentSkyMapWidget:
         self._on_star_selected(star)
 
 
+@dataclasses.dataclass(frozen=True)
+class _LiveSatelliteMapEntry:
+    """Duck-types as AlignmentSkyMapWidget's own NamedStar (it only ever
+    reads .name/.magnitude, and treats the object as an opaque, identity-
+    compared token otherwise -- see its set_stars/_on_click/_select) so
+    PassesPanel's "Live now" sub-tab can reuse the exact same zoomable,
+    click-to-select sky map AlignmentPanel already uses for star-picking,
+    instead of building a second bespoke widget for what's mechanically
+    the same interaction (pick one of several plotted alt/az points)."""
+
+    name: str
+    magnitude: float  # synthetic -- see PassesPanel._live_map_entries' own comment
+    satellite: EarthSatellite
+
+
 class PassesPanel(ttk.Frame):
     def __init__(
         self, parent: tk.Misc, on_pass_selected: Callable[[Trajectory, PassWindow, list, GeographicPosition, str], None],
         site_vars: SiteVars | None = None,
     ):
-        super().__init__(parent, padding=10)
+        super().__init__(parent, padding=0)
         self._on_pass_selected = on_pass_selected
         self._results: "queue.Queue[tuple[str, object]]" = queue.Queue()
         # Shared with ConnectionPanel (same instance, owned by App) when
@@ -1152,7 +1232,26 @@ class PassesPanel(ttk.Frame):
         self._crossings_by_pass: dict[int, bool] = {}
         self._selected_iid: str | None = None
 
-        columns_frame = ttk.Frame(self)
+        # Split into sub-tabs -- "Live now" (am5/ephemeris.py's
+        # currently_visible_satellites/current_pass_window) needs its own
+        # target catalog (the whole Celestrak "visual" group, not one
+        # picked satellite) and its own auto-refresh loop, distinct enough
+        # from "Scheduled passes" to be confusing as one flat page. Same
+        # pattern as CalibrationPanel's own _sub_notebook.
+        self._sub_notebook = ttk.Notebook(self)
+        self._sub_notebook.pack(fill="both", expand=True)
+        scheduled_tab = ttk.Frame(self._sub_notebook, padding=10)
+        live_tab = ttk.Frame(self._sub_notebook, padding=10)
+        self._sub_notebook.add(scheduled_tab, text="Scheduled passes")
+        self._sub_notebook.add(live_tab, text="Live now")
+
+        self._build_scheduled_tab(scheduled_tab)
+        self._build_live_now_tab(live_tab)
+
+        self.after(200, self._poll_results)
+
+    def _build_scheduled_tab(self, parent: tk.Misc) -> None:
+        columns_frame = ttk.Frame(parent)
         columns_frame.pack(fill="both", expand=True)
         left = ttk.Frame(columns_frame)
         left.pack(side="left", fill="both", expand=True)
@@ -1208,8 +1307,6 @@ class PassesPanel(ttk.Frame):
         ttk.Label(right, text="Sky track (N up, horizon at rim)").pack(anchor="w")
         self._sky_map = SkyMapWidget(right)
         self._sky_map.widget().pack(fill="both", expand=True)
-
-        self.after(200, self._poll_results)
 
     def _draw_sky_map(self, trajectory: Trajectory, window: PassWindow, crossings: list) -> None:
         self._sky_map.clear()
@@ -1301,6 +1398,23 @@ class PassesPanel(ttk.Frame):
                 elif kind == "error":
                     self._detail_var.set(f"Error: {payload}")
                     self._refresh_button.configure(state="normal")
+                elif kind == "live_list_ready":
+                    self._live_satellites, self._live_site, self._live_visible = payload
+                    self._live_fetch_in_progress = False
+                    self._live_reload_button.configure(state="normal")
+                    self._populate_live_tree()
+                    self._live_status_var.set(
+                        f"{len(self._live_satellites)} satellites in catalog -- {len(self._live_visible)} above "
+                        f"{self._current_live_horizon():.0f} deg right now "
+                        f"(updated {datetime.now().strftime('%H:%M:%S')} local)"
+                    )
+                elif kind == "live_trajectory_ready":
+                    trajectory, window, crossings, satellite_name = payload
+                    self._on_pass_selected(trajectory, window, crossings, self._live_site, satellite_name)
+                elif kind == "live_error":
+                    self._live_fetch_in_progress = False
+                    self._live_reload_button.configure(state="normal")
+                    self._live_status_var.set(f"Error: {payload}")
         except queue.Empty:
             pass
         self.after(200, self._poll_results)
@@ -1328,6 +1442,222 @@ class PassesPanel(ttk.Frame):
         ]
         lines.append(_meridian_detail_line(crossings, window))
         self._detail_var.set("\n".join(lines))
+
+    # -- "Live now" sub-tab: satellites currently above the horizon, for -----
+    # quick tracking-pipeline tests without waiting for a scheduled pass -----
+
+    def _build_live_now_tab(self, parent: tk.Misc) -> None:
+        # Own state, deliberately separate from the "Scheduled passes" tab's
+        # self._satellite/self._site/self._tree/self._selected_iid --
+        # conflating them would mean a click here could stomp the other
+        # tab's selection (or vice versa) since both would share one
+        # "trajectory_ready" queue tag/tree/selected-row.
+        self._live_satellites: list[EarthSatellite] = []  # whole group, loaded once (or on manual reload)
+        # (satellite, alt_deg, az_deg, window) for each currently-visible
+        # entry, indexed the same as the tree's iid -- window is reused
+        # directly on row click instead of recomputing current_pass_window.
+        self._live_visible: list[tuple[EarthSatellite, float, float, PassWindow]] = []
+        self._live_site = None
+        self._live_selected_iid: str | None = None
+        self._live_fetch_in_progress = False
+        self._live_auto_refresh_after_id: str | None = None
+        self._live_tab = parent
+
+        columns_frame = ttk.Frame(parent)
+        columns_frame.pack(fill="both", expand=True)
+        left = ttk.Frame(columns_frame)
+        left.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(columns_frame)
+        right.pack(side="left", fill="both", expand=True, padx=(10, 0))
+
+        controls = ttk.Frame(left)
+        controls.pack(fill="x", pady=(0, 6))
+        ttk.Label(controls, text="horizon").pack(side="left")
+        self._live_horizon_var = tk.StringVar(value="10")
+        ttk.Entry(controls, textvariable=self._live_horizon_var, width=6).pack(side="left", padx=(4, 12))
+        ttk.Label(controls, text="refresh every (s)").pack(side="left")
+        self._live_refresh_s_var = tk.StringVar(value="15")
+        ttk.Entry(controls, textvariable=self._live_refresh_s_var, width=6).pack(side="left", padx=(4, 12))
+        self._live_reload_button = ttk.Button(controls, text="Reload catalog + refresh", command=self._on_live_reload_click)
+        self._live_reload_button.pack(side="left")
+
+        self._live_status_var = tk.StringVar(
+            value=f"Not loaded yet -- click \"Reload catalog\" (Celestrak {VISUAL_GROUP!r} group, ~250 satellites)"
+        )
+        ttk.Label(left, textvariable=self._live_status_var, foreground=PALETTE.fg_dim).pack(anchor="w", pady=(0, 6))
+
+        columns = ("name", "catnr", "elevation", "azimuth", "sets_in")
+        self._live_tree = ttk.Treeview(left, columns=columns, show="headings", height=10)
+        headings = ["Name", "NORAD ID", "Elevation (deg)", "Azimuth (deg)", "Sets in"]
+        for col, label in zip(columns, headings):
+            self._live_tree.heading(col, text=label)
+            self._live_tree.column(col, width=130, anchor="center")
+        self._live_tree.pack(fill="both", expand=True)
+        self._live_tree.bind("<<TreeviewSelect>>", self._on_live_row_selected)
+
+        ttk.Label(
+            left,
+            text="Selecting a row (or a point on the sky map) loads it into the Transit tab exactly like a "
+                 "scheduled pass -- nothing here moves the mount on its own. In Transit: click a GOTO button "
+                 "first (it already targets wherever the satellite actually is right now, not the moment it "
+                 "was selected) and let it converge, THEN Arm/Start tracking -- skipping the GOTO starts "
+                 "tracking from wherever the mount already was, which the runaway-divergence safety check "
+                 "will (correctly) reject as \"diverging, not following\" once it's off by more than a few "
+                 "degrees, exactly as it would for a real pass started without pointing at it first.",
+            foreground=PALETTE.fg_dim, wraplength=380, justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+
+        ttk.Label(right, text="Sky map (N up, horizon at rim) -- click a point to select").pack(anchor="w")
+        # Reuses AlignmentPanel's own zoomable, click-to-select sky map
+        # (see _LiveSatelliteMapEntry's own docstring) instead of
+        # SkyMapWidget (Scheduled passes' own, no interaction) -- picking
+        # one of several currently-visible satellites is the same
+        # interaction as picking one of several stars.
+        self._live_sky_map = AlignmentSkyMapWidget(right, on_star_selected=self._on_live_map_entry_selected)
+        self._live_sky_map.widget().pack(fill="both", expand=True)
+
+        # No auto-fetch on construction -- same convention as "Scheduled
+        # passes"' own "Refresh passes" button (also manual-only), and
+        # avoids every PassesPanel construction (including in tests)
+        # silently making a real network call. Operator clicks "Reload
+        # catalog + refresh" once; after that, only re-checks visibility
+        # (no network) on the timer below, and only while this sub-tab is
+        # actually the one showing.
+        self._schedule_live_refresh()
+
+    def _on_live_reload_click(self) -> None:
+        if self._live_fetch_in_progress:
+            return
+        self._live_fetch_in_progress = True
+        self._live_reload_button.configure(state="disabled")
+        self._live_status_var.set("Loading satellite catalog...")
+        threading.Thread(target=self._live_fetch_group_and_refresh, daemon=True).start()
+
+    def _schedule_live_refresh(self) -> None:
+        try:
+            interval_s = max(2.0, float(self._live_refresh_s_var.get()))
+        except ValueError:
+            interval_s = 15.0
+        self._live_auto_refresh_after_id = self.after(round(interval_s * 1000), self._on_live_refresh_tick)
+
+    def _on_live_refresh_tick(self) -> None:
+        # Gate on the sub-tab actually being visible -- recomputing
+        # visibility for the whole group is cheap (pure SGP4, no network),
+        # but there's still no reason to do it on a timer while the
+        # operator is looking at "Scheduled passes" instead (same
+        # winfo_ismapped() gating this session already applied to the
+        # camera live previews, see e.g. TransitPanel._show_preview_frame).
+        if self._live_tab.winfo_ismapped() and self._live_satellites and not self._live_fetch_in_progress:
+            self._live_fetch_in_progress = True
+            threading.Thread(target=self._live_refresh_visible_only, daemon=True).start()
+        self._schedule_live_refresh()
+
+    def _current_live_site(self) -> GeographicPosition | None:
+        try:
+            lat, lon = float(self._site_vars.lat.get()), float(self._site_vars.lon.get())
+            elevation_m = float(self._site_vars.elevation_m.get())
+        except ValueError:
+            return None
+        return wgs84.latlon(lat, lon, elevation_m=elevation_m)
+
+    def _current_live_horizon(self) -> float:
+        try:
+            return float(self._live_horizon_var.get())
+        except ValueError:
+            return 10.0
+
+    def _live_fetch_group_and_refresh(self) -> None:
+        try:
+            cache_path = TLE_CACHE_DIR / f"tle_group_{VISUAL_GROUP}.tle"
+            satellites = load_satellite_group_tles(VISUAL_GROUP, cache_path, max_age_hours=48.0)
+            site = self._current_live_site()
+            if site is None:
+                self._results.put(("live_error", "Invalid site lat/lon/elevation"))
+                return
+            visible = self._compute_visible_with_windows(satellites, site, self._current_live_horizon())
+            self._results.put(("live_list_ready", (satellites, site, visible)))
+        except Exception as exc:  # noqa: BLE001 - surfaced to the panel, not fatal
+            self._results.put(("live_error", str(exc)))
+
+    def _live_refresh_visible_only(self) -> None:
+        # No network, no re-fetch -- self._live_satellites is already
+        # loaded, just recompute which ones are currently above horizon.
+        try:
+            site = self._current_live_site()
+            if site is None:
+                self._results.put(("live_error", "Invalid site lat/lon/elevation"))
+                return
+            visible = self._compute_visible_with_windows(self._live_satellites, site, self._current_live_horizon())
+            self._results.put(("live_list_ready", (self._live_satellites, site, visible)))
+        except Exception as exc:  # noqa: BLE001
+            self._results.put(("live_error", str(exc)))
+
+    def _compute_visible_with_windows(
+        self, satellites: list[EarthSatellite], site: GeographicPosition, horizon_deg: float,
+    ) -> list[tuple[EarthSatellite, float, float, PassWindow]]:
+        visible = currently_visible_satellites(satellites, site, horizon_deg=horizon_deg)
+        result = []
+        for sat, alt_deg, az_deg in visible:
+            try:
+                window = current_pass_window(sat, site, horizon_deg=horizon_deg)
+            except ValueError:
+                continue  # no set event found in the lookahead -- skip, can't offer a trajectory for it anyway
+            result.append((sat, alt_deg, az_deg, window))
+        return result
+
+    def _on_live_row_selected(self, _event: object) -> None:
+        selection = self._live_tree.selection()
+        if not selection or self._live_site is None:
+            return
+        self._live_selected_iid = selection[0]
+        sat, _alt, _az, window = self._live_visible[int(selection[0])]
+        threading.Thread(target=self._live_compute_trajectory, args=(sat, window), daemon=True).start()
+
+    def _on_live_map_entry_selected(self, entry: "_LiveSatelliteMapEntry") -> None:
+        """Clicking a point on the sky map just drives the tree's own
+        selection -- <<TreeviewSelect>> then does the actual trajectory-
+        loading work via _on_live_row_selected, so there's exactly one
+        code path for "a satellite was picked," regardless of whether it
+        was picked from the list or the map."""
+        for i, (sat, _alt, _az, _window) in enumerate(self._live_visible):
+            if sat is entry.satellite:
+                self._live_tree.selection_set(str(i))
+                return
+
+    def _live_compute_trajectory(self, satellite: EarthSatellite, window: PassWindow) -> None:
+        try:
+            trajectory = compute_trajectory(satellite, self._live_site, window.t_rise, window.t_set, step_s=0.05)
+            crossings = meridian_crossings(trajectory)
+            self._results.put(("live_trajectory_ready", (trajectory, window, crossings, satellite.name)))
+        except Exception as exc:  # noqa: BLE001
+            self._results.put(("live_error", str(exc)))
+
+    def _populate_live_tree(self) -> None:
+        self._live_tree.delete(*self._live_tree.get_children())
+        self._live_selected_iid = None
+        now = datetime.now(timezone.utc)
+        map_entries: list[tuple[_LiveSatelliteMapEntry, float, float]] = []
+        for i, (sat, alt_deg, az_deg, window) in enumerate(self._live_visible):
+            sets_in_s = (window.t_set - now).total_seconds()
+            self._live_tree.insert("", "end", iid=str(i), values=(
+                sat.name, sat.model.satnum, f"{alt_deg:.1f}", f"{az_deg:.1f}",
+                f"{sets_in_s:.0f}s" if sets_in_s > 0 else "now",
+            ))
+            # Synthetic "magnitude": no real brightness data for an
+            # arbitrary satellite (see PassWindow.magnitude_estimate's own
+            # NaN in current_pass_window), so this just scales the marker
+            # by elevation instead -- higher/easier targets draw bigger,
+            # same visual language as a real star's magnitude (brighter =
+            # bigger) even though the underlying quantity is different.
+            map_entries.append((_LiveSatelliteMapEntry(sat.name, -alt_deg / 15.0, sat), az_deg, alt_deg))
+        self._live_sky_map.set_stars(map_entries)
+
+    def destroy(self) -> None:
+        if self._live_auto_refresh_after_id is not None:
+            self.after_cancel(self._live_auto_refresh_after_id)
+            self._live_auto_refresh_after_id = None
+        self._live_sky_map.close()
+        super().destroy()
 
 
 class TransitPanel(ttk.Frame):
@@ -1411,6 +1741,17 @@ class TransitPanel(ttk.Frame):
         self._feedback_enabled_var = feedback_enabled_var if feedback_enabled_var is not None else tk.BooleanVar(value=False)
         self._finder_state = finder_state
         self._armed = False
+        # Latest real mount position, from "position"/"tracking_tick"
+        # events -- used by _on_start_click to decide whether the mount
+        # needs an auto-GOTO before tracking can safely begin. None until
+        # the first such event (nothing to compare against yet).
+        self._last_known_mount_radec: tuple[float, float] | None = None
+        # Set while an auto-triggered GOTO (see _on_start_click) is in
+        # flight -- handle_mount_event's goto_arrived/goto_timeout/
+        # goto_result branches check this to know whether to resume into
+        # _begin_tracking() once the slew finishes, instead of just
+        # re-enabling the buttons the way a manual GOTO-button click does.
+        self._start_pending_after_goto = False
         self._mount_connected = False
         # Set from the "connected" WorkerEvent's own kind field (see
         # MountWorker._handle_connect), not the ConnectionPanel dropdown's
@@ -1498,6 +1839,9 @@ class TransitPanel(ttk.Frame):
         self._jog_goto_button.pack(side="left", padx=(4, 0))
         self._mount_goto_button = ttk.Button(button_row, text="GOTO (mount, auto pier side)", command=self._on_mount_goto_click, state="disabled")
         self._mount_goto_button.pack(side="left", padx=(4, 0))
+
+        self._tracking_status_var = tk.StringVar(value="")
+        ttk.Label(parent, textvariable=self._tracking_status_var, foreground=PALETTE.fg_dim).pack(anchor="w")
 
         training_row = ttk.Frame(parent)
         training_row.pack(anchor="w", pady=(0, 4))
@@ -1661,6 +2005,12 @@ class TransitPanel(ttk.Frame):
             self._simulate_button.configure(state="disabled")
             self._jog_goto_button.configure(state="disabled")
             self._mount_goto_button.configure(state="disabled")
+            # A disconnect mid-auto-GOTO means no goto_arrived/goto_timeout
+            # is ever coming -- without this, the stale flag would silently
+            # fire _begin_tracking() off the NEXT unrelated GOTO's arrival
+            # after reconnecting.
+            self._start_pending_after_goto = False
+            self._last_known_mount_radec = None  # stale after a disconnect -- don't compare against it once reconnected
         elif self._trajectory is not None:
             self._arm_button.configure(state="normal")
             self._simulate_button.configure(state="normal")
@@ -1813,6 +2163,43 @@ class TransitPanel(ttk.Frame):
             return
         if not self._check_pass_timing():
             return
+        # Skip the comparison entirely (straight to _begin_tracking(),
+        # the original behavior) when there's no known mount position yet
+        # to compare against -- also avoids calling _goto_start_radec()
+        # (needs self._trajectory.t_unix) against a trajectory stub that
+        # doesn't have real sample data, which only ever happens in this
+        # no-known-position state in practice/tests.
+        if self._last_known_mount_radec is not None:
+            target_ra_hours, target_dec_deg = self._goto_start_radec()
+            actual_ra_hours, actual_dec_deg = self._last_known_mount_radec
+            error_deg = angular_separation_deg(
+                actual_ra_hours * 15.0, actual_dec_deg, target_ra_hours * 15.0, target_dec_deg,
+            )
+            if error_deg > AUTO_GOTO_BEFORE_START_THRESHOLD_DEG:
+                # Not on target yet -- auto-GOTO there first (native mount
+                # GOTO: no axis-sign calibration dependency, see this
+                # project's own "all GOTO buttons use native mount goto"
+                # convention) instead of starting tracking straight into
+                # what the runaway-divergence check would otherwise
+                # correctly reject. handle_mount_event's goto_arrived/
+                # goto_timeout/goto_result branches resume into
+                # _begin_tracking() (or report failure) once this
+                # resolves -- see AUTO_GOTO_BEFORE_START_THRESHOLD_DEG's
+                # own comment for the real-hardware incident this fixes.
+                self._tracking_status_var.set(
+                    f"{error_deg:.1f} deg off target -- slewing there before starting tracking..."
+                )
+                self._start_pending_after_goto = True
+                self._jog_goto_button.configure(state="disabled")
+                self._mount_goto_button.configure(state="disabled")
+                self._arm_button.configure(state="disabled")
+                self._start_button.configure(state="disabled")
+                self._simulate_button.configure(state="disabled")
+                self._mount_worker.goto(target_ra_hours, target_dec_deg)
+                return
+        self._begin_tracking()
+
+    def _begin_tracking(self) -> None:
         self._redraw_sky_map()  # restore the real pass-time track, in case a rehearsal (Manual GOTO/Simulate) left a "now"-shifted view up
         self._plot_t.clear()
         self._plot_along.clear()
@@ -1824,6 +2211,7 @@ class TransitPanel(ttk.Frame):
         duration_s = max(0.0, (self._window.t_set - datetime.now(timezone.utc)).total_seconds())
         duration_s = min(duration_s, MAX_TRACKING_DURATION_S)
         self._set_active_trajectory(self._trajectory)
+        self._tracking_status_var.set("Tracking started.")
         self._mount_worker.start_tracking(
             self._trajectory, self._axis_signs, self._offsets, csv_path, duration_s, self._build_tracking_config(),
         )
@@ -1984,6 +2372,7 @@ class TransitPanel(ttk.Frame):
             side_text = f"  Pier side: {side}" if side else ""
             self._mount_radec_var.set(f"RA: {event.payload['ra_hours']:.4f}h  DEC: {event.payload['dec_deg']:+.4f} deg{side_text}")
             self._update_mount_marker(event.payload["ra_hours"], event.payload["dec_deg"])
+            self._last_known_mount_radec = (event.payload["ra_hours"], event.payload["dec_deg"])
         elif event.kind == "tracking_tick":
             actual_ra_deg, actual_dec_deg = event.payload["actual_ra_deg"], event.payload["actual_dec_deg"]
             if actual_ra_deg != "":  # only populated every error_log_every ticks, see tracker.py
@@ -2034,16 +2423,40 @@ class TransitPanel(ttk.Frame):
             # (already fixed for jog_goto_result below; this button just
             # used the wrong "done" signal). Wait for goto_arrived/
             # goto_timeout instead.
-            if event.payload.get("code") != 0 and self._mount_connected and self._trajectory is not None:
-                self._jog_goto_button.configure(state="normal")
-                self._mount_goto_button.configure(state="normal")
-                self._arm_button.configure(state="normal")
-                self._simulate_button.configure(state="normal")
-                if self._armed:
-                    self._start_button.configure(state="normal")
+            if event.payload.get("code") != 0:
+                # Rejected outright -- if this was the auto-GOTO-before-
+                # start (see _on_start_click/AUTO_GOTO_BEFORE_START_
+                # THRESHOLD_DEG), tracking never starts; report why
+                # instead of silently going back to the pre-Start state.
+                if self._start_pending_after_goto:
+                    self._start_pending_after_goto = False
+                    self._tracking_status_var.set(
+                        f"GOTO rejected ({event.payload.get('code')}) -- tracking not started. Check the log."
+                    )
+                if self._mount_connected and self._trajectory is not None:
+                    self._jog_goto_button.configure(state="normal")
+                    self._mount_goto_button.configure(state="normal")
+                    self._arm_button.configure(state="normal")
+                    self._simulate_button.configure(state="normal")
+                    if self._armed:
+                        self._start_button.configure(state="normal")
         elif event.kind in ("goto_arrived", "goto_timeout"):
             # The real "native GOTO is done" signals -- see goto_result's
             # own comment above for why that one isn't enough on its own.
+            if self._start_pending_after_goto:
+                self._start_pending_after_goto = False
+                if event.kind == "goto_arrived":
+                    self._begin_tracking()
+                else:
+                    self._tracking_status_var.set("GOTO did not arrive -- check the log, then try Start again.")
+                    if self._mount_connected and self._trajectory is not None:
+                        self._jog_goto_button.configure(state="normal")
+                        self._mount_goto_button.configure(state="normal")
+                        self._arm_button.configure(state="normal")
+                        self._simulate_button.configure(state="normal")
+                        if self._armed:
+                            self._start_button.configure(state="normal")
+                return
             if self._mount_connected and self._trajectory is not None:
                 self._jog_goto_button.configure(state="normal")
                 self._mount_goto_button.configure(state="normal")
@@ -2223,6 +2636,17 @@ class TransitPanel(ttk.Frame):
         self._gain_scale.bind("<ButtonRelease-1>", self._on_gain_release)
         self._camera_interactive_widgets.append(self._gain_scale)
         ttk.Label(controls_frame, textvariable=self._camera_vars.gain_value, width=10).grid(row=1, column=2, sticky="w", pady=(6, 0))
+
+        # Manual, display-only brightness boost -- see CameraControlVars.
+        # stretch's own docstring. No <ButtonRelease-1> commit like
+        # exposure/gain above -- this never touches the real camera,
+        # purely local to this preview, so it just takes effect on the
+        # next preview_frame tick (well under 100ms, not worth a redraw-
+        # on-drag path of its own).
+        ttk.Label(controls_frame, text="Stretch").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self._stretch_scale = ttk.Scale(controls_frame, from_=1.0, to=8.0, variable=self._camera_vars.stretch)
+        self._stretch_scale.grid(row=2, column=1, sticky="we", padx=(8, 8), pady=(6, 0))
+        ttk.Label(controls_frame, textvariable=self._camera_vars.stretch_value, width=10).grid(row=2, column=2, sticky="w", pady=(6, 0))
 
         preview_frame = ttk.LabelFrame(parent, text="Live preview (raw sensor, ~10Hz, not debayered) — drag to select ROI, click then use ← → to nudge", padding=8)
         preview_frame.pack(fill="both", expand=True, pady=(8, 0))
@@ -2610,6 +3034,13 @@ class TransitPanel(ttk.Frame):
             self._camera_vars.gain.set(default)
 
     def _show_preview_frame(self, pgm: bytes, full_width: int, full_height: int) -> None:
+        # Only decode+re-encode when a manual stretch is actually dialed
+        # in (see CameraControlVars.stretch's own docstring) -- the
+        # default (1.0, no boost) path stays exactly as fast as before,
+        # feeding the already-encoded PGM straight through unchanged.
+        stretch = self._camera_vars.stretch.get()
+        if stretch != 1.0:
+            pgm = frame_to_pgm(_scale_16bit_to_8bit_fixed(pgm_to_array(pgm), stretch))
         image = fit_pgm_to_canvas(pgm, full_width, full_height, self._preview_canvas)
         self._preview_image = image  # keep a reference — Tk drops images with none
         self._display_w, self._display_h = image.width(), image.height()
@@ -2744,13 +3175,54 @@ def _normalize_to_8bit_for_preview(frame: np.ndarray) -> np.ndarray:
     that frame's own max, not a fixed 4095/12-bit assumption) since SER's
     PixelDepth field can in principle be any value up to 16, not
     necessarily always our own camera's 12-bit ADC range -- good enough
-    for a quick-look player, not a photometric tool."""
+    for a quick-look player, not a photometric tool.
+
+    SerPlayerPanel-only -- do NOT reuse this for a LIVE camera preview
+    (see _scale_16bit_to_8bit_fixed's own docstring for why)."""
     if frame.dtype == np.uint8:
         return frame
     max_val = int(frame.max())
     if max_val <= 0:
         return np.zeros_like(frame, dtype=np.uint8)
     return (frame.astype(np.float32) * (255.0 / max_val)).astype(np.uint8)
+
+
+# The sensor's real 12-bit ADC range (0-4095) when running RAW16, same
+# constant camera/mock_camera.py's own read_frame uses to build a
+# synthetic 16-bit frame in the first place.
+_CAMERA_ADC_MAX = 4095.0
+
+
+def _scale_16bit_to_8bit_fixed(frame: np.ndarray, stretch: float = 1.0) -> np.ndarray:
+    """frame_to_pgm hardcodes an 8-bit (maxval 255) PGM -- a RAW16 camera
+    frame needs scaling down first. FIXED scale (this project's own real
+    camera's 12-bit ADC range, 0-4095), NOT the per-frame auto-stretch
+    _normalize_to_8bit_for_preview uses for SER playback.
+
+    Regression fix: show_frame_on_canvas used to share that SER-player
+    function, which rescales EVERY frame so its own maximum pixel value
+    always maps to 255. For a uniform gain change (frame' = k * frame,
+    ignoring noise), auto-stretching by that same frame's own max exactly
+    cancels k out algebraically (k*frame / (k*max) == frame/max) -- gain
+    became completely invisible in a live 16-bit preview, which is
+    exactly the reported symptom ("exposure changes a little, gain seems
+    to do nothing, like something behind the scenes is stretching the
+    image to compensate" -- an accurate diagnosis of this exact bug). A
+    FIXED reference point doesn't have this cancellation: a real gain
+    change shows up as a real brightness change, the whole reason a live
+    preview exists -- to dial in exposure/gain by eye.
+
+    `stretch`: an optional MANUAL display-only brightness multiplier
+    (see FinderWindow's own "Preview stretch" slider), applied on top of
+    the fixed scale above -- lets the operator boost on-screen visibility
+    of a faint field by hand when they actually want that, without it
+    silently, automatically canceling out real gain/exposure changes the
+    way the old shared per-frame auto-stretch did. 1.0 (default) = no
+    boost, exactly what the sensor reports -- and purely cosmetic either
+    way, nothing downstream (blob detection, plate solving) sees this,
+    only the on-screen canvas."""
+    base = frame.astype(np.float32) if frame.dtype == np.uint8 else frame.astype(np.float32) * (255.0 / _CAMERA_ADC_MAX)
+    return np.clip(base * stretch, 0, 255).astype(np.uint8)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2761,7 +3233,7 @@ class CanvasFrame:
     y_offset: int
 
 
-def show_frame_on_canvas(canvas: tk.Canvas, frame: np.ndarray) -> CanvasFrame | None:
+def show_frame_on_canvas(canvas: tk.Canvas, frame: np.ndarray, stretch: float = 1.0) -> CanvasFrame | None:
     """Downsamples a (possibly large) camera frame to fit `canvas` and
     draws it centred -- the same fast integer-stride downscale FinderWindow
     uses for its own live view (see camera.finder.downsample_for_display's
@@ -2771,6 +3243,9 @@ def show_frame_on_canvas(canvas: tk.Canvas, frame: np.ndarray) -> CanvasFrame | 
     the returned scale/offsets) and AlignmentPanel's polar-alignment live
     preview (which has no overlays, just the image).
 
+    `stretch`: see _scale_16bit_to_8bit_fixed's own docstring -- a manual,
+    display-only brightness multiplier, 1.0 (default) meaning none.
+
     Returns None if the canvas isn't laid out yet (width/height not
     realized)."""
     cw = canvas.winfo_width()
@@ -2778,7 +3253,7 @@ def show_frame_on_canvas(canvas: tk.Canvas, frame: np.ndarray) -> CanvasFrame | 
     if cw < 2 or ch < 2:
         return None
     gray = frame if frame.ndim == 2 else frame.mean(axis=2).astype(frame.dtype)
-    gray = _normalize_to_8bit_for_preview(gray)
+    gray = _scale_16bit_to_8bit_fixed(gray, stretch)
     dw, dh, scale, display = downsample_for_display(gray, cw, ch)
     header = f"P5\n{dw} {dh}\n255\n".encode()
     photo = tk.PhotoImage(data=header + display.tobytes())
@@ -2970,12 +3445,25 @@ class AlignmentPanel(ttk.Frame):
     def __init__(
         self, parent: tk.Misc, mount_worker: MountWorker, axis_signs: AxisSigns, site_vars: SiteVars,
         finder_state: FinderState,
+        camera_vars: CameraControlVars | None = None, finder_camera_vars: CameraControlVars | None = None,
+        out_dir: Path | None = None,
     ):
         super().__init__(parent, padding=0)
         self._mount_worker = mount_worker
         self._axis_signs = axis_signs
         self._site_vars = site_vars
         self._finder_state = finder_state
+        # Falls back to a private instance for standalone/test use, same
+        # pattern as CalibrationPanel's own camera_vars/finder_camera_vars
+        # params -- see CameraControlVars' own docstring.
+        self._camera_vars = camera_vars or CameraControlVars.create()
+        self._finder_camera_vars = finder_camera_vars or CameraControlVars.create()
+        # Where to save a capture's frame when a plate solve fails all its
+        # retries during the 3-point measurement -- lets the operator
+        # inspect/replay the exact image that didn't solve, instead of it
+        # just being silently discarded. None (tests, standalone use)
+        # disables saving.
+        self._out_dir = out_dir
         self._selected_star: NamedStar | None = None
         self._connected = False
         self._parked = False
@@ -2995,14 +3483,23 @@ class AlignmentPanel(ttk.Frame):
         self._polar_preview_canvas_image_id: int | None = None
         self._polar_preview_after_id: str | None = None
         self._polar_points: list[tuple[float, float]] = []
+        self._polar_solve_attempts_left = 0
         self._polar_rotation_deg = 0.0
         self._polar_rate_x = 0.0
+        self._polar_settle_s = 1.5
         self._polar_direction = "e"
         self._polar_last_solve_result = None
-        # (axis_delta, az_corrected_delta, true_pole_delta) pixel offsets
-        # from the last-solved frame's centre, or None -- see
-        # _update_polar_overlay/_refresh_polar_preview.
-        self._polar_overlay: tuple[tuple[float, float], tuple[float, float], tuple[float, float]] | None = None
+        # Fitted axis's (delta_col, delta_row) pixel offset from the last-
+        # solved frame's centre, or None -- see
+        # _update_polar_overlay/_refresh_polar_preview. Just a locator dot
+        # (_draw_polar_overlay); the actual correction indicator is
+        # _draw_polar_correction_arrows, which doesn't need this at all.
+        self._polar_overlay: tuple[float, float] | None = None
+        # The full PolarAlignmentResult from the last completed 3-point
+        # measurement -- kept so _draw_polar_correction_arrows can label
+        # with the exact same direction words/magnitudes shown in
+        # _polar_result_var, instead of recomputing them.
+        self._polar_last_alignment_result: PolarAlignmentResult | None = None
         # (ra_deg, dec_deg) of the last known mount position, updated by
         # _update_mount_position -- fed to the solver as a hint (see
         # _polar_capture_point). None until the first "position" event.
@@ -3137,8 +3634,25 @@ class AlignmentPanel(ttk.Frame):
         self._polar_rotation_deg_var = tk.StringVar(value="30")
         ttk.Entry(params_row, textvariable=self._polar_rotation_deg_var, width=6).pack(side="left", padx=(4, 12))
         ttk.Label(params_row, text="Rate (x sidereal):").pack(side="left")
-        self._polar_rate_var = tk.StringVar(value="150")
-        ttk.Entry(params_row, textvariable=self._polar_rate_var, width=6).pack(side="left", padx=(4, 0))
+        # Was 150 (~48s for the default 30deg rotation) -- reported too
+        # slow in practice; 1000 brings that down to ~7s, still well
+        # under jog_goto's own 1400x safety margin.
+        self._polar_rate_var = tk.StringVar(value="1000")
+        ttk.Entry(params_row, textvariable=self._polar_rate_var, width=6).pack(side="left", padx=(4, 12))
+        ttk.Label(params_row, text="Settle (s):").pack(side="left")
+        # Was a hardcoded 800ms. Reported live: the first capture right
+        # after a rotation still sometimes shows real motion blur (a
+        # short mechanical settle after the jog stops, on top of
+        # _stop_polar_rotation's own deceleration-ramp rationale) --
+        # confirmed by the saved failed-solve frames from a real PAA run
+        # (see _save_failed_polar_solve_frame), where the very first
+        # attempt's frame had visibly trailed stars while later retries
+        # (naturally later in time, per POLAR_SOLVE_RETRY_ATTEMPTS' own
+        # comment) were clean. An adjustable field instead of guessing a
+        # single new constant -- how long real settling takes depends on
+        # the mount/tripod/payload, not something to hardcode.
+        self._polar_settle_s_var = tk.StringVar(value="1.5")
+        ttk.Entry(params_row, textvariable=self._polar_settle_s_var, width=5).pack(side="left", padx=(4, 0))
 
         self._polar_solver_warning_var = tk.StringVar(value="")
         ttk.Label(
@@ -3158,6 +3672,19 @@ class AlignmentPanel(ttk.Frame):
         ttk.Label(left, textvariable=self._polar_result_var, foreground=PALETTE.accent_ok, justify="left", wraplength=320).pack(
             anchor="w", pady=(4, 0)
         )
+        # Fixed-direction correction indicator (KStars PAA-style: two big
+        # arrows, always up/down and left/right on screen, never tied to
+        # the live star field's own orientation) -- see
+        # _draw_polar_correction_arrows' own docstring for why this
+        # replaced the old live-view overlay (which projected the
+        # correction into the actual image's pixel space, and was
+        # reported live as pointing a direction that didn't match reality
+        # when the operator tried to physically follow it).
+        self._polar_correction_canvas = tk.Canvas(
+            left, width=self.POLAR_CORRECTION_CANVAS_W, height=self.POLAR_CORRECTION_CANVAS_H,
+            bg=PALETTE.bg_alt, highlightthickness=0,
+        )
+        self._polar_correction_canvas.pack(anchor="w", pady=(8, 0))
         self._refresh_polar_preview()
         return tab
 
@@ -3203,21 +3730,37 @@ class AlignmentPanel(ttk.Frame):
         wiring pause/resume to the sub-notebook's tab-changed event."""
         frame, _plate_scale = self._current_frame_and_plate_scale()
         if frame is not None:
-            drawn = show_frame_on_canvas(self._polar_preview_canvas, frame)
+            # Regression fix: this preview never applied the per-camera
+            # manual stretch (see CameraControlVars/_scale_16bit_to_8bit_
+            # fixed's own docstrings for why gain changes are otherwise
+            # invisible on a raw preview) -- every other live view already
+            # does, this one was missed. Picks the same camera_vars
+            # instance as whichever camera _current_frame_and_plate_scale
+            # is currently reading from, so the slider stays in sync with
+            # FinderWindow/FinderCameraPanel/TransitPanel's own.
+            stretch_vars = self._camera_vars if self._polar_camera_var.get() == "main" else self._finder_camera_vars
+            drawn = show_frame_on_canvas(self._polar_preview_canvas, frame, stretch=stretch_vars.stretch.get())
             if drawn is not None:
                 self._polar_preview_image = drawn.photo  # keep a reference -- Tk drops images with none
                 self._draw_polar_overlay(drawn, frame.shape[1], frame.shape[0])
         self._polar_preview_after_id = self.after(200, self._refresh_polar_preview)
 
     def _draw_polar_overlay(self, drawn: CanvasFrame, frame_width: int, frame_height: int) -> None:
-        """Draws the KStars-PAA-style correction triangle computed by
-        _update_polar_overlay on top of the live preview frame
-        show_frame_on_canvas just drew -- axis position, true-pole target,
-        and the two legs (pure azimuth, then pure altitude) connecting
-        them. A no-op until the first 3-point measurement completes."""
+        """Marks the fitted axis position on the live preview -- just a
+        locator dot, no directional claim (see
+        _draw_polar_correction_arrows for the actual alt/az correction
+        indicator, which used to be drawn here as two arrows projected
+        into this image's own pixel space). That projection depended on
+        the solve's WCS rotation/parity to point the right way on screen,
+        and real-hardware testing showed an operator can't reliably map
+        "arrow points toward the top-left of this star field" to "turn
+        this physical adjuster this way" even when the projection itself
+        is correct -- reported live as a real mis-adjustment (moved
+        altitude the wrong way trying to follow it). A no-op until the
+        first 3-point measurement completes."""
         if self._polar_overlay is None:
             return
-        (axis_dc, axis_dr), (az_dc, az_dr), (pole_dc, pole_dr) = self._polar_overlay
+        axis_dc, axis_dr = self._polar_overlay
 
         def to_canvas_xy(delta_col: float, delta_row: float) -> tuple[float, float]:
             full_x = frame_width / 2.0 + delta_col
@@ -3225,34 +3768,104 @@ class AlignmentPanel(ttk.Frame):
             return drawn.x_offset + full_x * drawn.scale, drawn.y_offset + full_y * drawn.scale
 
         axis_xy = to_canvas_xy(axis_dc, axis_dr)
-        az_xy = to_canvas_xy(az_dc, az_dr)
-        pole_xy = to_canvas_xy(pole_dc, pole_dr)
-
         canvas = self._polar_preview_canvas
-        canvas.create_line(*axis_xy, *az_xy, fill=PALETTE.accent_warn, width=2, dash=(4, 2))
-        canvas.create_line(*az_xy, *pole_xy, fill=PALETTE.accent, width=2, dash=(4, 2))
         r = 6
         canvas.create_oval(axis_xy[0] - r, axis_xy[1] - r, axis_xy[0] + r, axis_xy[1] + r, outline=PALETTE.fg, width=2)
         canvas.create_text(axis_xy[0], axis_xy[1] - r - 8, text="axis", fill=PALETTE.fg, font=("", 8))
-        canvas.create_line(pole_xy[0] - r, pole_xy[1], pole_xy[0] + r, pole_xy[1], fill=PALETTE.accent_ok, width=2)
-        canvas.create_line(pole_xy[0], pole_xy[1] - r, pole_xy[0], pole_xy[1] + r, fill=PALETTE.accent_ok, width=2)
-        canvas.create_text(pole_xy[0], pole_xy[1] - r - 8, text="true pole", fill=PALETTE.accent_ok, font=("", 8))
+
+    POLAR_CORRECTION_CANVAS_W = 300
+    POLAR_CORRECTION_CANVAS_H = 130
+
+    def _draw_polar_correction_arrows(self, result: PolarAlignmentResult) -> None:
+        """KStars-PAA-style correction indicator, redesigned after real-
+        hardware testing showed the previous live-view-projected arrows
+        (see _draw_polar_overlay's own docstring) were misread as physical
+        motion directions and caused a real mis-adjustment. This one is
+        deliberately NOT tied to the camera's image orientation at all --
+        two big arrows in FIXED screen directions (altitude: straight up
+        to raise / straight down to lower; azimuth: right to rotate the
+        base east / left to rotate it west), each labelled with the exact
+        same direction word AND magnitude already shown in
+        _polar_result_var, so the arrow is a redundant visual aid, never
+        the sole source of truth. No pixel projection, no WCS, no parity
+        -- just the sign of error_alt_deg/error_az_deg, so there is no
+        class of "wrong screen direction" bug possible here the way there
+        was for the old projected overlay."""
+        canvas = self._polar_correction_canvas
+        canvas.delete("all")
+        w, h = self.POLAR_CORRECTION_CANVAS_W, self.POLAR_CORRECTION_CANVAS_H
+
+        alt_word = "lower" if result.error_alt_deg > 0 else "raise"
+        az_word = "west" if result.error_az_deg > 0 else "east"
+        alt_arrow_up = alt_word == "raise"
+        az_arrow_right = az_word == "east"
+
+        # -- altitude: big vertical arrow, left half --
+        alt_cx = w * 0.27
+        alt_top, alt_bottom = 14, h - 14
+        shaft_top, shaft_bottom = (alt_top + 22, alt_bottom) if alt_arrow_up else (alt_top, alt_bottom - 22)
+        canvas.create_line(alt_cx, shaft_top, alt_cx, shaft_bottom, fill=PALETTE.accent, width=6)
+        if alt_arrow_up:
+            canvas.create_polygon(
+                alt_cx - 16, alt_top + 22, alt_cx + 16, alt_top + 22, alt_cx, alt_top,
+                fill=PALETTE.accent, outline="",
+            )
+        else:
+            canvas.create_polygon(
+                alt_cx - 16, alt_bottom - 22, alt_cx + 16, alt_bottom - 22, alt_cx, alt_bottom,
+                fill=PALETTE.accent, outline="",
+            )
+        canvas.create_text(
+            alt_cx, h - 2, anchor="s", fill=PALETTE.fg, font=("", 10, "bold"),
+            text=f"ALT {alt_word}\n{abs(result.error_alt_deg) * 60.0:.1f}'", justify="center",
+        )
+
+        # -- azimuth: big horizontal arrow, right half --
+        az_cy = h * 0.42
+        az_left, az_right = w * 0.55, w - 14
+        shaft_left, shaft_right = (az_left, az_right - 22) if az_arrow_right else (az_left + 22, az_right)
+        canvas.create_line(shaft_left, az_cy, shaft_right, az_cy, fill=PALETTE.accent_warn, width=6)
+        if az_arrow_right:
+            canvas.create_polygon(
+                az_right - 22, az_cy - 16, az_right - 22, az_cy + 16, az_right, az_cy,
+                fill=PALETTE.accent_warn, outline="",
+            )
+        else:
+            canvas.create_polygon(
+                az_left + 22, az_cy - 16, az_left + 22, az_cy + 16, az_left, az_cy,
+                fill=PALETTE.accent_warn, outline="",
+            )
+        canvas.create_text(
+            (az_left + az_right) / 2.0, az_cy + 30, fill=PALETTE.fg, font=("", 10, "bold"),
+            text=f"AZ {az_word}\n{abs(result.error_az_deg) * 60.0:.1f}'", justify="center",
+        )
 
     def _on_polar_start_click(self) -> None:
         try:
             rotation_deg = float(self._polar_rotation_deg_var.get())
             rate_x = float(self._polar_rate_var.get())
+            settle_s = float(self._polar_settle_s_var.get())
         except ValueError:
-            self._polar_status_var.set("Invalid rotation/rate")
+            self._polar_status_var.set("Invalid rotation/rate/settle")
             return
         if rotation_deg == 0 or rate_x <= 0:
             self._polar_status_var.set("Rotation must be nonzero, rate must be positive")
             return
+        if settle_s < 0:
+            self._polar_status_var.set("Settle delay must not be negative")
+            return
+        self._polar_settle_s = settle_s
         self._polar_start_button.configure(state="disabled")
         self._polar_result_var.set("")
         self._polar_points = []
         self._polar_last_solve_result = None
         self._polar_overlay = None  # stale overlay from a previous run must not linger during a new capture sequence
+        self._polar_last_alignment_result = None
+        # One label per "Run 3-point measurement" click -- groups any
+        # failed-solve frames saved during this run (see
+        # _on_polar_solve_done) into their own directory instead of
+        # colliding with an earlier or later run's files.
+        self._polar_run_label = datetime.now().strftime("%Y%m%d_%H%M%S")
         # Sign of rotation_deg picks the RA jog direction -- negative
         # rotates west instead of east, so a run can be immediately
         # followed by an opposite-direction run to end up roughly back
@@ -3266,7 +3879,16 @@ class AlignmentPanel(ttk.Frame):
         self._polar_capture_point(1)
 
     def _polar_capture_point(self, point_index: int) -> None:
-        self._polar_status_var.set(f"Point {point_index}/3: solving...")
+        self._polar_solve_attempts_left = POLAR_SOLVE_RETRY_ATTEMPTS
+        self._attempt_polar_solve(point_index)
+
+    def _attempt_polar_solve(self, point_index: int) -> None:
+        attempt = POLAR_SOLVE_RETRY_ATTEMPTS - self._polar_solve_attempts_left + 1
+        self._polar_status_var.set(f"Point {point_index}/3: solving (attempt {attempt}/{POLAR_SOLVE_RETRY_ATTEMPTS})...")
+        # Re-read the live frame fresh on EVERY attempt (not captured once
+        # up front) -- see POLAR_SOLVE_RETRY_ATTEMPTS' own comment for why
+        # this alone gives each retry a later, better-settled frame with
+        # no extra delay logic needed.
         frame, fov_arcsec_per_px_scale = self._current_frame_and_plate_scale()
         if frame is None:
             self._polar_status_var.set(
@@ -3281,13 +3903,60 @@ class AlignmentPanel(ttk.Frame):
             return
         hint_ra_deg, hint_dec_deg = (self._last_mount_radec if self._last_mount_radec is not None else (None, None))
         self._current_solver().solve_async(
-            frame.copy(), self, lambda result, idx=point_index: self._on_polar_solve_done(idx, result), fov_deg=fov_deg,
-            hint_ra_deg=hint_ra_deg, hint_dec_deg=hint_dec_deg,
+            frame.copy(), self,
+            lambda result, idx=point_index, attempt=attempt, saved_frame=frame: self._on_polar_solve_done(
+                idx, result, saved_frame, attempt, hint_ra_deg, hint_dec_deg,
+            ),
+            fov_deg=fov_deg, hint_ra_deg=hint_ra_deg, hint_dec_deg=hint_dec_deg,
         )
 
-    def _on_polar_solve_done(self, point_index: int, result) -> None:
+    def _save_failed_polar_solve_frame(
+        self, point_index: int, attempt: int, frame: np.ndarray, hint_ra_deg: float | None, hint_dec_deg: float | None,
+        message: str,
+    ) -> Path | None:
+        """Keeps the exact frame a failed plate-solve attempt was run
+        against, so it can be inspected/replayed offline (through
+        solve-field directly, or through a future detection tweak) instead
+        of just being discarded on every failure -- see this session's
+        real-hardware PAA testing, where a point failed all 5 retries
+        with no saved artifact to look at afterward. Only the raw sensor
+        frame (same one handed to the solver, no stretch/display
+        processing) -- see _refresh_polar_preview's own comment for why
+        the solve input and the display are deliberately different."""
+        if self._out_dir is None:
+            return None
+        run_dir = self._out_dir / "paa_failed_solves" / self._polar_run_label
+        run_dir.mkdir(parents=True, exist_ok=True)
+        path = run_dir / f"point{point_index}_attempt{attempt}.fits"
+        header = {"CAMERA": self._polar_camera_var.get(), "SOLVEMSG": message[:68]}
+        if hint_ra_deg is not None and hint_dec_deg is not None:
+            header["HINTRA"] = hint_ra_deg
+            header["HINTDEC"] = hint_dec_deg
+        write_fits(path, frame, header_extra=header)
+        return path
+
+    def _on_polar_solve_done(
+        self, point_index: int, result, frame: np.ndarray | None = None, attempt: int | None = None,
+        hint_ra_deg: float | None = None, hint_dec_deg: float | None = None,
+    ) -> None:
+        self._polar_solve_attempts_left -= 1
         if not result.success:
-            self._polar_status_var.set(f"Point {point_index}/3 failed: {result.message} -- aborted")
+            saved_path = None
+            if frame is not None and attempt is not None:
+                saved_path = self._save_failed_polar_solve_frame(
+                    point_index, attempt, frame, hint_ra_deg, hint_dec_deg, result.message,
+                )
+            if self._polar_solve_attempts_left > 0:
+                # Retry on whatever frame is freshest by the time this
+                # callback actually runs, instead of aborting the whole
+                # 3-point sequence on a single failed attempt.
+                self._attempt_polar_solve(point_index)
+                return
+            attempts_tried = POLAR_SOLVE_RETRY_ATTEMPTS
+            saved_note = f" -- frames saved to {saved_path.parent}" if saved_path is not None else ""
+            self._polar_status_var.set(
+                f"Point {point_index}/3 failed: {result.message} -- aborted after {attempts_tried} attempts{saved_note}"
+            )
             self._polar_start_button.configure(state="normal")
             return
         self._polar_points.append((result.ra_deg, result.dec_deg))
@@ -3307,9 +3976,11 @@ class AlignmentPanel(ttk.Frame):
 
     def _stop_polar_rotation(self, next_point_index: int) -> None:
         self._mount_worker.jog_stop(self._polar_direction)
-        # Brief settle so the capture isn't taken mid-deceleration-ramp
-        # (see am5/tracker.py's own measured accel/decel timing).
-        self.after(800, lambda: self._polar_capture_point(next_point_index))
+        # Settle so the capture isn't taken mid-deceleration-ramp (see
+        # am5/tracker.py's own measured accel/decel timing) or while the
+        # OTA/tripod is still mechanically vibrating from the stop --
+        # operator-adjustable, see self._polar_settle_s_var's own comment.
+        self.after(round(self._polar_settle_s * 1000), lambda: self._polar_capture_point(next_point_index))
 
     def _finish_polar_alignment(self) -> None:
         lat, lon = self._current_site()
@@ -3332,34 +4003,29 @@ class AlignmentPanel(ttk.Frame):
             f"Altitude: {alt_direction} by {abs(result.error_alt_deg) * 60.0:.1f}'\n"
             f"Azimuth: rotate the base {az_direction} by {abs(result.error_az_deg) * 60.0:.1f}'"
         )
-        self._update_polar_overlay(axis_ra_deg, axis_dec_deg, lat, lon)
+        self._polar_last_alignment_result = result
+        self._update_polar_overlay(axis_ra_deg, axis_dec_deg)
+        self._draw_polar_correction_arrows(result)
         self._polar_start_button.configure(state="normal")
 
-    def _update_polar_overlay(self, axis_ra_deg: float, axis_dec_deg: float, lat: float, lon: float) -> None:
-        """KStars-PAA-style correction overlay: where the mount's fitted
-        axis currently sits vs. where the true pole is, drawn on the live
-        preview as two legs (pure azimuth, then pure altitude -- the only
-        two directions the mount's own adjusters can actually move it in,
-        see correction_triangle_radec's docstring). Projected into the
+    def _update_polar_overlay(self, axis_ra_deg: float, axis_dec_deg: float) -> None:
+        """Where the mount's fitted axis currently sits, projected into the
         LAST captured frame's pixel space using that solve's own WCS
-        (pixel_scale_arcsec/field_rotation_deg) -- static, per the chosen
-        design: it reflects the just-completed measurement, not a live
-        re-solve, so it stays valid exactly as long as the mount hasn't
-        been slewed since (only the alt/az adjusters are expected to move
-        between here and the next run)."""
+        (pixel_scale_arcsec/field_rotation_deg/flip_parity) -- just a
+        locator dot (see _draw_polar_overlay), not a directional claim;
+        the actual correction is _draw_polar_correction_arrows' fixed-
+        direction indicator, which needs no pixel projection at all.
+        Static, per the chosen design: it reflects the just-completed
+        measurement, not a live re-solve, so it stays valid exactly as
+        long as the mount hasn't been slewed since (only the alt/az
+        adjusters are expected to move between here and the next run)."""
         solve = self._polar_last_solve_result
         if solve is None or solve.pixel_scale_arcsec <= 0:
             self._polar_overlay = None
             return
-        when = datetime.now(timezone.utc)
-        (az_ra, az_dec), (pole_ra, pole_dec) = correction_triangle_radec(axis_ra_deg, axis_dec_deg, lat, lon, when)
         center_ra, center_dec = solve.ra_deg, solve.dec_deg
-        scale, rot = solve.pixel_scale_arcsec, solve.field_rotation_deg
-        self._polar_overlay = (
-            project_radec_to_pixel(axis_ra_deg, axis_dec_deg, center_ra, center_dec, scale, rot),
-            project_radec_to_pixel(az_ra, az_dec, center_ra, center_dec, scale, rot),
-            project_radec_to_pixel(pole_ra, pole_dec, center_ra, center_dec, scale, rot),
-        )
+        scale, rot, flip = solve.pixel_scale_arcsec, solve.field_rotation_deg, solve.flip_parity
+        self._polar_overlay = project_radec_to_pixel(axis_ra_deg, axis_dec_deg, center_ra, center_dec, scale, rot, flip)
 
     # -- sky map / star selection --------------------------------------------
 
@@ -3551,11 +4217,23 @@ class CalibrationPanel(ttk.Frame):
         mount_lag_var: tk.DoubleVar | None = None, mount_max_accel_var: tk.DoubleVar | None = None,
         axis_signs: AxisSigns | None = None, finder_state: FinderState | None = None,
         on_finder_calibration_ready: Callable[[], None] | None = None,
+        camera_vars: CameraControlVars | None = None, finder_camera_vars: CameraControlVars | None = None,
     ):
         super().__init__(parent, padding=10)
         self._mount_worker = mount_worker
         self._camera_worker = camera_worker
         self._live_offsets = live_offsets
+        # Shared with TransitPanel/JogWindow and FinderCameraPanel/
+        # FinderWindow (same instances, owned by App) when passed -- only
+        # .stretch/.stretch_value are actually read here (this panel has
+        # no exposure/gain sliders of its own), so its own two previews
+        # apply whatever manual stretch is dialed in elsewhere for that
+        # camera instead of always showing an un-stretched image
+        # regardless of what the operator set on the Transit/Finder tabs.
+        # Falls back to a private instance so this panel still works
+        # standalone (tests).
+        self._camera_vars = camera_vars if camera_vars is not None else CameraControlVars.create()
+        self._finder_camera_vars = finder_camera_vars if finder_camera_vars is not None else CameraControlVars.create()
         # Shared with TransitPanel/FinderCameraPanel (same instance, owned
         # by App) when passed -- a successful "Calibrate camera-to-sky
         # mapping" here is propagated into it (see _calib_dec_measure)
@@ -4044,6 +4722,7 @@ class CalibrationPanel(ttk.Frame):
         this tab."""
         gray = frame if frame.ndim == 2 else frame.mean(axis=2).astype(frame.dtype)
         dw, dh, scale, display = downsample_for_display(gray, MAX_CALIBRATION_PREVIEW_DIM, MAX_CALIBRATION_PREVIEW_DIM)
+        display = _scale_16bit_to_8bit_fixed(display, self._finder_camera_vars.stretch.get())
         self._finder_preview_image = tk.PhotoImage(data=frame_to_pgm(display))
         self._finder_preview_canvas.delete("all")
         self._finder_preview_canvas.create_image(0, 0, anchor="nw", image=self._finder_preview_image)
@@ -4332,7 +5011,11 @@ class CalibrationPanel(ttk.Frame):
         # frame is the already-downsampled display copy from
         # handle_camera_event, and blob is in that SAME (downsampled)
         # coordinate space -- do not pass full-resolution coordinates here.
-        display = frame.copy()
+        # Stretch applied BEFORE the crosshair below, not after -- so the
+        # crosshair itself stays a crisp, un-multiplied reference at
+        # exactly 255, not something that could itself get pushed around
+        # by the multiplier.
+        display = _scale_16bit_to_8bit_fixed(frame, self._camera_vars.stretch.get())
         h, w = display.shape
         if blob.found:
             cx = int(round(min(max(blob.centroid_x, 0), w - 1)))
@@ -4632,9 +5315,20 @@ class FinderCameraPanel(ttk.Frame):
         ttk.Label(exp_row, text="Exp", width=4).pack(side="left")
         self._finder_exp_scale = ttk.Scale(
             exp_row, from_=1.5, to=math.log10(MAX_FINDER_EXPOSURE_US), variable=self._camera_vars.exposure_log, state="disabled",
-            command=lambda _v: self._apply_camera_settings() if self._connected else None,
         )
         self._finder_exp_scale.pack(side="left", fill="x", expand=True, padx=(4, 4))
+        # Commit on release only, same as TransitPanel's own exposure/gain
+        # scales -- was firing on every drag tick, which (before the
+        # CameraWorker command-coalescing fix, camera/worker.py) could
+        # queue a burst of set_exposure_us calls the worker then worked
+        # through one at a time, each blocking a full stale exposure
+        # (reported live as "dragging down from 5s never seems to speed
+        # the feed back up"). The worker fix alone already fixes that, but
+        # committing only on release is still the more sensible UI (no
+        # reason to push a dozen throwaway intermediate values to the
+        # real sensor during a single drag) and keeps this consistent
+        # with the main camera's own controls.
+        self._finder_exp_scale.bind("<ButtonRelease-1>", self._on_exposure_release)
         ttk.Label(exp_row, textvariable=self._camera_vars.exposure_value, width=10).pack(side="left")
 
         gain_row = ttk.Frame(exp_frame)
@@ -4642,10 +5336,25 @@ class FinderCameraPanel(ttk.Frame):
         ttk.Label(gain_row, text="Gain", width=4).pack(side="left")
         self._finder_gain_scale = ttk.Scale(
             gain_row, from_=0, to=570, variable=self._camera_vars.gain, state="disabled",
-            command=lambda _v: self._apply_camera_settings() if self._connected else None,
         )
         self._finder_gain_scale.pack(side="left", fill="x", expand=True, padx=(4, 4))
+        self._finder_gain_scale.bind("<ButtonRelease-1>", self._on_gain_release)
         ttk.Label(gain_row, textvariable=self._camera_vars.gain_value, width=6).pack(side="left")
+
+        # Manual, display-only brightness boost -- see CameraControlVars.
+        # stretch's own docstring. Shared with FinderWindow (same
+        # instance, see App) so the two sliders stay in sync, same
+        # reasoning as exposure/gain above. Not gated on connection state
+        # (unlike exposure/gain, which drive the real camera) -- purely
+        # local to this preview.
+        stretch_row = ttk.Frame(exp_frame)
+        stretch_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(stretch_row, text="Stretch", width=4).pack(side="left")
+        self._finder_stretch_scale = ttk.Scale(
+            stretch_row, from_=1.0, to=8.0, variable=self._camera_vars.stretch,
+        )
+        self._finder_stretch_scale.pack(side="left", fill="x", expand=True, padx=(4, 4))
+        ttk.Label(stretch_row, textvariable=self._camera_vars.stretch_value, width=6).pack(side="left")
 
         # Field calibration ("Calibrate fields") now lives in the
         # Calibration tab (see CalibrationPanel._build_finder_calibration_
@@ -4678,6 +5387,16 @@ class FinderCameraPanel(ttk.Frame):
         gain = round(self._camera_vars.gain.get())
         self._finder_worker.set_exposure_us(exp_us)
         self._finder_worker.set_gain(gain)
+
+    def _on_exposure_release(self, _event: tk.Event) -> None:
+        if not self._connected:
+            return
+        self._finder_worker.set_exposure_us(round(10 ** self._camera_vars.exposure_log.get()))
+
+    def _on_gain_release(self, _event: tk.Event) -> None:
+        if not self._connected:
+            return
+        self._finder_worker.set_gain(round(self._camera_vars.gain.get()))
 
     def _poll_delta_t_display(self) -> None:
         dt, _ = self._live_offsets.snapshot()
@@ -4749,6 +5468,7 @@ class FinderCameraPanel(ttk.Frame):
             return
         gray = frame if frame.ndim == 2 else frame.mean(axis=2).astype(frame.dtype)
         dw, dh, scale, display = downsample_for_display(gray, cw, ch)
+        display = _scale_16bit_to_8bit_fixed(display, self._camera_vars.stretch.get())
         header = f"P5\n{dw} {dh}\n255\n".encode()
         self._photo = tk.PhotoImage(data=header + display.tobytes())
         self._canvas.delete("all")

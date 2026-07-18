@@ -1,8 +1,9 @@
 import tkinter as tk
 
+import numpy as np
 import pytest
 
-from am5.gui.finder_window import FinderWindow
+from am5.gui.finder_window import SOLVE_RETRY_ATTEMPTS, FinderWindow
 from am5.gui.worker import WorkerEvent
 from camera.finder import FinderState
 from camera.worker import CameraEvent, CameraWorker
@@ -62,6 +63,36 @@ def test_sync_click_forwards_the_solved_coordinates(window):
     assert window._synced == [(123.4, 56.7)]
 
 
+def test_exposure_gain_commit_only_on_slider_release(window, monkeypatch):
+    # Regression: same fix as FinderCameraPanel's own (am5/gui/panels.py)
+    # -- these sliders used to fire on every drag tick, queuing a burst of
+    # set_exposure_us calls the CameraWorker then worked through one at a
+    # time, reported live as the exposure "never" coming back down after
+    # a fast drag.
+    window._connected = True
+    calls = []
+    monkeypatch.setattr(window._finder_worker, "set_exposure_us", lambda us: calls.append(("exp", us)))
+    monkeypatch.setattr(window._finder_worker, "set_gain", lambda g: calls.append(("gain", g)))
+
+    for log_val in (4.0, 3.5, 3.0, 2.5, 2.0):
+        window._camera_vars.exposure_log.set(log_val)
+    assert calls == []
+
+    window._exp_scale.event_generate("<ButtonRelease-1>")
+    window.update()
+    # _on_slider_change applies both settings together (single combined
+    # commit path here, unlike FinderCameraPanel's split methods) -- still
+    # exactly one commit, not one per drag tick.
+    assert ("exp", round(10 ** 2.0)) in calls
+    assert len(calls) == 1 or all(name in ("exp", "gain") for name, _ in calls)
+
+    calls.clear()
+    window._camera_vars.gain.set(123.0)
+    window._gain_scale.event_generate("<ButtonRelease-1>")
+    window.update()
+    assert ("gain", 123) in calls
+
+
 def test_failed_solve_clears_any_previous_solve(window):
     _give_it_a_solve(window)
 
@@ -108,3 +139,96 @@ def test_idle_position_polling_does_not_invalidate_a_solved_target(window):
     window.handle_mount_event(WorkerEvent(kind="position", payload={"ra_hours": 1.0, "dec_deg": 2.0}))
     assert window._solved_ra == pytest.approx(123.4)
     assert str(window._sync_btn["state"]) == "normal"
+
+
+def test_position_events_are_cached_as_a_plate_solve_hint(window):
+    assert window._last_mount_radec is None
+    window.handle_mount_event(WorkerEvent(kind="position", payload={"ra_hours": 5.0, "dec_deg": 45.0}))
+    assert window._last_mount_radec == pytest.approx((75.0, 45.0))
+
+    window.handle_mount_event(WorkerEvent(
+        kind="tracking_tick", payload={"actual_ra_deg": 30.0, "actual_dec_deg": -10.0},
+    ))
+    assert window._last_mount_radec == pytest.approx((30.0, -10.0))
+
+    # actual_ra_deg is only populated every error_log_every ticks (see
+    # am5/tracker.py) -- an empty-string tick must not clobber the cache.
+    window.handle_mount_event(WorkerEvent(
+        kind="tracking_tick", payload={"actual_ra_deg": "", "actual_dec_deg": -10.0},
+    ))
+    assert window._last_mount_radec == pytest.approx((30.0, -10.0))
+
+
+def test_solve_passes_the_mounts_last_known_position_as_a_hint(window):
+    # Regression: solve_async used to be called with no hint at all,
+    # forcing ASTAP into a full blind search over its whole configured
+    # search_radius_deg (30 deg by default) instead of a narrow search
+    # around roughly where the mount already believes it's pointing --
+    # confirmed to be why solves were reported as extremely slow.
+    window._latest_frame = np.zeros((10, 10), dtype=np.uint8)
+    window.handle_mount_event(WorkerEvent(kind="position", payload={"ra_hours": 5.0, "dec_deg": 45.0}))
+
+    captured = {}
+    window._solver.solve_async = lambda *a, **kw: captured.update(kw)
+    window._on_solve()
+
+    assert captured["hint_ra_deg"] == pytest.approx(75.0)
+    assert captured["hint_dec_deg"] == pytest.approx(45.0)
+
+
+def test_solve_retries_on_a_fresh_frame_until_it_succeeds(window):
+    # Regression: a single solve attempt used to be it -- if the frame
+    # right after the mount stopped moving still showed real motion
+    # blur/vibration, the operator had to manually retry from scratch.
+    # Now retries automatically, re-reading self._latest_frame fresh on
+    # each attempt (see SOLVE_RETRY_ATTEMPTS' own comment for why that
+    # alone gives each retry more settling time, no extra delay needed).
+    window._latest_frame = np.zeros((5, 5), dtype=np.uint8)
+
+    class _FailedResult:
+        success = False
+        message = "no match"
+
+    class _Result:
+        success = True
+        ra_deg = 10.0
+        dec_deg = 20.0
+        field_rotation_deg = 0.0
+        pixel_scale_arcsec = 1.0
+
+    call_count = 0
+
+    def fake_solve_async(frame, tk_widget, on_done, **kw):
+        nonlocal call_count
+        call_count += 1
+        on_done(_FailedResult() if call_count < 3 else _Result())
+
+    window._solver.solve_async = fake_solve_async
+    window._on_solve()
+
+    assert call_count == 3
+    assert window._solved_ra == pytest.approx(10.0)
+    assert str(window._solve_status_var.get()).startswith("✓")
+
+
+def test_solve_gives_up_after_all_retry_attempts_fail(window):
+    window._latest_frame = np.zeros((5, 5), dtype=np.uint8)
+
+    class _FailedResult:
+        success = False
+        message = "no match"
+
+    call_count = 0
+
+    def fake_solve_async(frame, tk_widget, on_done, **kw):
+        nonlocal call_count
+        call_count += 1
+        on_done(_FailedResult())
+
+    window._solver.solve_async = fake_solve_async
+    window._on_solve()
+
+    assert call_count == SOLVE_RETRY_ATTEMPTS
+    assert window._solved_ra is None
+    assert str(window._solve_status_var.get()).startswith("✗")
+    assert str(window._sync_btn["state"]) == "disabled"

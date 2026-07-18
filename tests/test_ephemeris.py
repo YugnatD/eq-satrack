@@ -5,7 +5,17 @@ import numpy as np
 import pytest
 from skyfield.api import EarthSatellite, load, wgs84
 
-from am5.ephemeris import compute_trajectory, find_next_pass, find_passes, load_iss_tle, load_satellite_tle, meridian_crossings
+from am5.ephemeris import (
+    compute_trajectory,
+    current_pass_window,
+    currently_visible_satellites,
+    find_next_pass,
+    find_passes,
+    load_iss_tle,
+    load_satellite_group_tles,
+    load_satellite_tle,
+    meridian_crossings,
+)
 
 # Fixed, well-formed TLE used only to keep these tests deterministic and
 # network-free — not claimed to reflect the ISS's current orbit.
@@ -76,6 +86,92 @@ def test_find_passes_returns_multiple_in_order(satellite):
 def test_find_passes_empty_list_when_none_found(satellite):
     t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
     assert find_passes(satellite, GENEVA, t0=t0, horizon_deg=89.9, lookahead_hours=1.0) == []
+
+
+def test_load_satellite_group_tles_uses_cache_without_network(tmp_path):
+    # Same cache-hit path as load_iss_tle/load_satellite_tle, but for a
+    # whole named group (see PassesPanel's "Live now" sub-tab, am5/gui/
+    # panels.py) -- returns every satellite in the file, not just the
+    # first, since the whole point is checking many candidates.
+    cache_path = tmp_path / "tle_group_visual.tle"
+    cache_path.write_text(
+        f"ISS (ZARYA)\n{TLE_LINE1}\n{TLE_LINE2}\n"
+        f"CSS (TIANHE)\n{TLE_LINE1}\n{TLE_LINE2}\n"
+    )
+    sats = load_satellite_group_tles("visual", cache_path, max_age_hours=1e9)
+    assert [s.name for s in sats] == ["ISS (ZARYA)", "CSS (TIANHE)"]
+
+
+def test_currently_visible_satellites_filters_by_horizon(satellite):
+    # No second real satellite fixture needed to exercise the filter: the
+    # SAME satellite is definitely above horizon_deg at its own
+    # culmination, and definitely below it well before its own rise --
+    # both facts already established by find_next_pass's own geometry.
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    window = find_next_pass(satellite, GENEVA, t0=t0, horizon_deg=10.0, lookahead_hours=48.0)
+
+    visible_at_culm = currently_visible_satellites([satellite], GENEVA, horizon_deg=10.0, t0=window.t_culminate)
+    assert len(visible_at_culm) == 1
+    sat, alt_deg, az_deg = visible_at_culm[0]
+    assert sat is satellite
+    assert alt_deg == pytest.approx(window.max_elevation_deg, abs=0.5)
+    assert 0.0 <= az_deg < 360.0
+
+    before_rise = window.t_rise - timedelta(hours=1)
+    assert currently_visible_satellites([satellite], GENEVA, horizon_deg=10.0, t0=before_rise) == []
+
+
+def test_currently_visible_satellites_sorted_by_altitude_descending(satellite):
+    # A single satellite obviously "sorts" trivially -- this just confirms
+    # the list shape or a >1 entries wouldn't need any code that isn't
+    # already exercised: currently_visible_satellites always returns
+    # (satellite, alt_deg, az_deg) tuples with alt_deg the SAME value
+    # passed to the horizon filter, so a duplicate-entry list (same
+    # satellite twice) sanity-checks the sort is at least stable/lossless.
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    window = find_next_pass(satellite, GENEVA, t0=t0, horizon_deg=10.0, lookahead_hours=48.0)
+    result = currently_visible_satellites([satellite, satellite], GENEVA, horizon_deg=10.0, t0=window.t_culminate)
+    assert len(result) == 2
+    alts = [alt for _sat, alt, _az in result]
+    assert alts == sorted(alts, reverse=True)
+
+
+def test_current_pass_window_starts_now_and_finds_the_real_set_event(satellite):
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    scheduled = find_next_pass(satellite, GENEVA, t0=t0, horizon_deg=10.0, lookahead_hours=48.0)
+
+    # Ask for the "remaining" window starting mid-pass, at culmination.
+    window = current_pass_window(satellite, GENEVA, horizon_deg=10.0, t0=scheduled.t_culminate)
+    assert window.t_rise == scheduled.t_culminate  # "rise" is just t0 here, by construction
+    assert abs((window.t_set - scheduled.t_set).total_seconds()) < 1.0
+    assert window.t_culminate == scheduled.t_culminate  # already at/past culmination
+    assert math.isnan(window.magnitude_estimate)  # no calibrated magnitude_ref for an arbitrary satellite
+
+    # And compute_trajectory (the existing, unmodified tracking-side
+    # machinery) must accept this window exactly like a scheduled one.
+    trajectory = compute_trajectory(satellite, GENEVA, window.t_rise, window.t_set, step_s=1.0)
+    assert trajectory.t_unix[0] == pytest.approx(window.t_rise.timestamp(), abs=1.0)
+
+
+def test_current_pass_window_before_culmination_finds_the_upcoming_culmination(satellite):
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    scheduled = find_next_pass(satellite, GENEVA, t0=t0, horizon_deg=10.0, lookahead_hours=48.0)
+
+    # Starting shortly after the real rise (still climbing) -- the real
+    # culmination event is still ahead, must be found (not just t0).
+    start = scheduled.t_rise + timedelta(seconds=5)
+    window = current_pass_window(satellite, GENEVA, horizon_deg=10.0, t0=start)
+    assert window.t_rise == start
+    # find_events' own root-finding precision shifts by a few ms depending
+    # on the search window's start -- not a meaningful difference here.
+    assert abs((window.t_culminate - scheduled.t_culminate).total_seconds()) < 1.0
+    assert abs((window.t_set - scheduled.t_set).total_seconds()) < 1.0
+
+
+def test_current_pass_window_raises_when_no_set_event_in_lookahead(satellite):
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    with pytest.raises(ValueError):
+        current_pass_window(satellite, GENEVA, horizon_deg=89.9, t0=t0, lookahead_hours=1.0)
 
 
 def test_compute_trajectory_shapes_and_physical_bounds(satellite):

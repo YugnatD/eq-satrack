@@ -52,6 +52,12 @@ from pathlib import Path
 
 import numpy as np
 
+# See AstrometryNetSolver.solve's own comment at its use site (the
+# --radius flag) for the real-hardware failure this fixes -- a generous,
+# fixed bound on how wrong the mount's own position hint can be, not the
+# camera's field of view.
+HINT_RADIUS_DEG = 10.0
+
 
 def _find_astap() -> str | None:
     """Returns the path to the ASTAP binary, or None if not found."""
@@ -82,6 +88,16 @@ class SolveResult:
     field_rotation_deg: float = 0.0
     pixel_scale_arcsec: float = 0.0
     message: str = ""
+    # True when the solved CD matrix has a POSITIVE determinant -- the
+    # opposite parity from what am5/polar_alignment.py's
+    # project_radec_to_pixel originally assumed (see its own docstring on
+    # flip_parity for the real-hardware bug this fixes: confirmed our
+    # actual finder camera solves with det(CD) > 0). Must be threaded
+    # through to project_radec_to_pixel's own flip_parity parameter for
+    # the polar-alignment overlay to point the correct on-screen
+    # direction -- computed from the real solved matrix here, never
+    # guessed at the call site.
+    flip_parity: bool = False
 
 
 class PlateSolver:
@@ -236,7 +252,16 @@ class AstrometryNetSolver:
     (typically several seconds, can be slower than ASTAP depending on
     which index files are installed), or solve_async() from the UI."""
 
-    def __init__(self, solve_field_path: str | None = None, timeout_s: float = 120.0):
+    def __init__(self, solve_field_path: str | None = None, timeout_s: float = 30.0):
+        # Was 120.0 -- confirmed live on real hardware that a real solve
+        # here is either fast (2-4s, real match found) or doomed (index
+        # files exhausted, no shortcut to detect this early): a genuine
+        # "no solution" attempt measured 97.8s before this fix, so close
+        # to the old 120s cap that 5 retries (POLAR_SOLVE_RETRY_ATTEMPTS/
+        # SOLVE_RETRY_ATTEMPTS) could block for ~10 minutes on one point
+        # that was never going to solve. 30s gives a real solve's typical
+        # few-second runtime a ~10x margin while cutting the failure-path
+        # cost roughly 3-4x, so retries reach a fresher frame sooner.
         import shutil
         self._solve_field = solve_field_path or shutil.which("solve-field")
         self._timeout_s = timeout_s
@@ -278,9 +303,36 @@ class AstrometryNetSolver:
                 "--scale-units", "degwidth",
                 "--scale-low", str(fov_deg * 0.7),
                 "--scale-high", str(fov_deg * 1.3),
+                # Let solve-field itself give up and exit cleanly a few
+                # seconds before our own subprocess timeout below --
+                # avoids a hard SIGKILL mid-search (which on some
+                # astrometry.net builds can leave a helper process
+                # orphaned) and gets a real "no solution" message instead
+                # of a bare TimeoutExpired.
+                "--cpulimit", str(max(5, round(self._timeout_s - 5))),
             ]
             if hint_ra_deg is not None and hint_dec_deg is not None:
-                cmd += ["--ra", str(hint_ra_deg), "--dec", str(hint_dec_deg), "--radius", str(max(fov_deg, 1.0))]
+                # Regression, found on real hardware: this used to be
+                # max(fov_deg, 1.0) -- the camera's own imaging FOV, which
+                # has nothing to do with how far off the *hint* itself can
+                # be. Confirmed live: a PAA point failed all 5 retries
+                # (each a genuinely different, clean, star-rich frame --
+                # not a bad-image problem) because the mount's own
+                # position hint after park+RA-only rotation reads Dec~90
+                # (see AlignmentPanel's own docstring on this), while the
+                # true declination was ~87.5 -- a 2.49deg gap, just
+                # outside the old ~1.83deg (fov_deg) radius, so solve-
+                # field was searching an entirely wrong patch of sky on
+                # every attempt. Re-solving the exact same frame offline
+                # with --radius 5 found the real match in ~1s (vs. never,
+                # at the old radius) -- a wider radius costs essentially
+                # nothing here since --scale-low/high already does the
+                # real work of narrowing the index search. HINT_RADIUS_DEG
+                # is a generous, fixed bound on "how wrong could the
+                # mount's own belief be" (pointing error before a PAA/
+                # sync fix, not the camera's field of view) -- deliberately
+                # NOT derived from fov_deg.
+                cmd += ["--ra", str(hint_ra_deg), "--dec", str(hint_dec_deg), "--radius", str(HINT_RADIUS_DEG)]
             cmd.append(str(fits_path))
 
             env = os.environ.copy()
@@ -341,17 +393,24 @@ def _parse_astrometry_wcs(path: Path) -> SolveResult:
         cd11 = float(header.get("CD1_1", 0.0))
         cd12 = float(header.get("CD1_2", 0.0))
         cd21 = float(header.get("CD2_1", 0.0))
+        cd22 = float(header.get("CD2_2", 0.0))
         pixel_scale_deg = math.sqrt(cd11 ** 2 + cd21 ** 2)
         rotation_deg = math.degrees(math.atan2(cd12, cd11))
+        # See SolveResult.flip_parity's own docstring -- the real parity
+        # of THIS solve's optical path, read from the matrix itself, not
+        # assumed.
+        flip_parity = (cd11 * cd22 - cd12 * cd21) > 0.0
     except Exception:
         pixel_scale_deg = 0.0
         rotation_deg = 0.0
+        flip_parity = False
 
     return SolveResult(
         success=True,
         ra_deg=ra_deg, dec_deg=dec_deg,
         field_rotation_deg=rotation_deg,
         pixel_scale_arcsec=pixel_scale_deg * 3600.0,
+        flip_parity=flip_parity,
     )
 
 
@@ -377,12 +436,15 @@ def _parse_astap_ini(path: Path) -> SolveResult:
         cd11 = float(kv.get("CD1_1", "0"))
         cd12 = float(kv.get("CD1_2", "0"))
         cd21 = float(kv.get("CD2_1", "0"))
-        _cd22 = float(kv.get("CD2_2", "0"))  # noqa: F841
+        cd22 = float(kv.get("CD2_2", "0"))
         pixel_scale_deg = math.sqrt(cd11 ** 2 + cd21 ** 2)
         rotation_deg = math.degrees(math.atan2(cd12, cd11))
+        # See SolveResult.flip_parity's own docstring.
+        flip_parity = (cd11 * cd22 - cd12 * cd21) > 0.0
     except Exception:
         pixel_scale_deg = 0.0
         rotation_deg = 0.0
+        flip_parity = False
 
     return SolveResult(
         success=True,
@@ -390,4 +452,5 @@ def _parse_astap_ini(path: Path) -> SolveResult:
         dec_deg=dec_deg,
         field_rotation_deg=rotation_deg,
         pixel_scale_arcsec=pixel_scale_deg * 3600.0,
+        flip_parity=flip_parity,
     )

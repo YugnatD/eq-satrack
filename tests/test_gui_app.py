@@ -66,6 +66,22 @@ def test_jog_window_starts_hidden_and_show_button_reveals_it(app):
     assert app.jog_window.state() != "withdrawn"
 
 
+def test_ser_player_window_starts_hidden_and_show_button_reveals_it(app):
+    # SER player moved from a Notebook tab to a floating window (same
+    # pattern as Jog control/Finder) -- a plain tab's position in a
+    # wrapping multi-row tab strip isn't stable, so it could land at the
+    # start of a wrapped second row instead of staying visually separate
+    # from the workflow tabs.
+    assert app.ser_player_window.state() == "withdrawn"
+    app._show_ser_player_window()
+    assert app.ser_player_window.state() != "withdrawn"
+
+
+def test_ser_player_is_not_a_notebook_tab(app):
+    tab_texts = [app.notebook.tab(t, "text") for t in app.notebook.tabs()]
+    assert not any("SER" in text for text in tab_texts)
+
+
 def test_calibration_done_event_updates_axis_signs_seen_by_jog_window(app):
     app._pump_events()  # drain startup events first
     app.worker.events.put(WorkerEvent("calibration_done", {"ra_sign": -1.0, "dec_sign": 1.0}))

@@ -222,7 +222,7 @@ def tangent_plane_offset_arcsec(ra_deg, dec_deg, center_ra_deg: float, center_de
 
 def project_radec_to_pixel(
     ra_deg: float, dec_deg: float, center_ra_deg: float, center_dec_deg: float,
-    pixel_scale_arcsec: float, rotation_deg: float,
+    pixel_scale_arcsec: float, rotation_deg: float, flip_parity: bool = False,
 ) -> tuple[float, float]:
     """(delta_col, delta_row) pixel offset of (ra_deg, dec_deg) from a
     solved frame's own centre, given that solve's pixel_scale_arcsec and
@@ -241,8 +241,32 @@ def project_radec_to_pixel(
     project's own pixel layout (see tests/test_polar_alignment.py) --
     getting this wrong would make the polar-alignment overlay point the
     WRONG direction, worse than not drawing it at all, hence the
-    from-scratch verification rather than a guessed formula."""
+    from-scratch verification rather than a guessed formula.
+
+    flip_parity: a real optical path can be mirrored relative to this
+    project's own assumed pixel layout (a plain rotation, no reflection --
+    the CD matrix built in tests/test_polar_alignment.py's own
+    _wcs_matching_this_projects_own_pixel_convention always has a negative
+    determinant). Confirmed on real hardware: our actual finder camera's
+    solved WCS has a POSITIVE determinant (det(CD) ~= +2.18e-7, verified
+    against the real solved point3_attempt5.fits from a live PAA run) --
+    the opposite parity from what this function assumed, which was
+    reported live as the correction-overlay arrows pointing a direction
+    that didn't match reality when the operator tried to follow them
+    physically. SolveResult.flip_parity (camera/platesolve.py) is set from
+    the ACTUAL solved CD matrix's determinant sign, not guessed or
+    hardcoded, and should always be threaded through from there. Derived
+    and verified the same from-scratch way as the base (non-flipped)
+    formula: round-tripped against astropy.wcs with a determinant-flipped
+    CD matrix across several rotations (see
+    test_project_radec_to_pixel_matches_astropy_wcs_for_a_flipped_parity
+    in tests/test_polar_alignment.py) -- negating north_arcsec before the
+    otherwise-unchanged formula reproduces astropy's own pixel mapping to
+    within floating-point precision at every rotation tested, not just
+    rot=0."""
     east_arcsec, north_arcsec = tangent_plane_offset_arcsec(ra_deg, dec_deg, center_ra_deg, center_dec_deg)
+    if flip_parity:
+        north_arcsec = -north_arcsec
     rot = math.radians(rotation_deg)
     delta_col = (east_arcsec * math.cos(rot) + north_arcsec * math.sin(rot)) / pixel_scale_arcsec
     delta_row = (east_arcsec * math.sin(rot) - north_arcsec * math.cos(rot)) / pixel_scale_arcsec

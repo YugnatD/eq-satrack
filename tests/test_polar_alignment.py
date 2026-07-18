@@ -127,6 +127,73 @@ def _wcs_matching_this_projects_own_pixel_convention(crval1, crval2, pixel_scale
     return w
 
 
+def _wcs_with_flipped_parity(crval1, crval2, pixel_scale_deg, rotation_deg) -> WCS:
+    # Same construction as _wcs_matching_this_projects_own_pixel_
+    # convention, but with the second CD row negated -- flips the
+    # matrix's determinant sign (always negative above; always positive
+    # here), matching a real optical path mirrored relative to this
+    # project's originally-assumed convention. Confirmed this is the
+    # real-world case for this project's actual finder camera (see
+    # project_radec_to_pixel's own flip_parity docstring: its real solved
+    # WCS has det(CD) ~= +2.18e-7, not negative).
+    w = WCS(naxis=2)
+    w.wcs.crpix = [1000.5, 500.5]
+    w.wcs.crval = [crval1, crval2]
+    w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    rot = math.radians(rotation_deg)
+    s = pixel_scale_deg
+    w.wcs.cd = [[s * math.cos(rot), s * math.sin(rot)], [-s * math.sin(rot), s * math.cos(rot)]]
+    return w
+
+
+@pytest.mark.parametrize("rotation_deg", [0.0, 15.0, 90.0, -45.0, 180.0, 178.0])
+def test_project_radec_to_pixel_matches_astropy_wcs_for_a_flipped_parity(rotation_deg):
+    # Regression, found on real hardware: project_radec_to_pixel used to
+    # assume a single fixed parity (matching
+    # _wcs_matching_this_projects_own_pixel_convention's always-negative
+    # determinant) -- our actual finder camera's real solved WCS has the
+    # OPPOSITE parity (positive determinant), confirmed by computing
+    # det(CD) from a real solve-field .wcs file produced during live PAA
+    # testing. With the wrong parity assumed, the polar-alignment
+    # overlay's correction arrows pointed a direction that didn't match
+    # reality when the operator tried to physically follow them -- worse
+    # than not drawing an arrow at all. flip_parity=True negates
+    # north_arcsec before the otherwise-unchanged formula; verified here
+    # against astropy.wcs's own authoritative TAN-projection math for a
+    # determinant-flipped CD matrix, at multiple rotations (not just the
+    # trivial rot=0 case, which coincidentally can't distinguish a sign
+    # bug in the rotation-dependent cross terms).
+    pixel_scale_arcsec = 1.72
+    center_ra_deg, center_dec_deg = 30.0, 60.0
+    w = _wcs_with_flipped_parity(center_ra_deg, center_dec_deg, pixel_scale_arcsec / 3600.0, rotation_deg)
+    crpix_x, crpix_y = w.wcs.crpix
+    cd11, cd12 = w.wcs.cd[0]
+    cd21, cd22 = w.wcs.cd[1]
+    assert (cd11 * cd22 - cd12 * cd21) > 0.0  # sanity: this fixture really is the flipped-parity case
+    extracted_rotation_deg = math.degrees(math.atan2(cd12, cd11))
+    extracted_scale_arcsec = math.sqrt(cd11 ** 2 + cd21 ** 2) * 3600.0
+
+    test_ra_deg, test_dec_deg = center_ra_deg + 0.002, center_dec_deg + 0.001
+    px, py = w.all_world2pix([[test_ra_deg, test_dec_deg]], 1)[0]
+    expected_delta_col, expected_delta_row = px - crpix_x, py - crpix_y
+
+    delta_col, delta_row = project_radec_to_pixel(
+        test_ra_deg, test_dec_deg, center_ra_deg, center_dec_deg, extracted_scale_arcsec, extracted_rotation_deg,
+        flip_parity=True,
+    )
+    assert delta_col == pytest.approx(expected_delta_col, abs=0.01)
+    assert delta_row == pytest.approx(expected_delta_row, abs=0.01)
+
+    # And confirm flip_parity actually matters -- the non-flipped call
+    # must NOT match this fixture's expected offsets (except in
+    # degenerate cases), otherwise the parameter would be a no-op.
+    wrong_col, wrong_row = project_radec_to_pixel(
+        test_ra_deg, test_dec_deg, center_ra_deg, center_dec_deg, extracted_scale_arcsec, extracted_rotation_deg,
+        flip_parity=False,
+    )
+    assert (wrong_col, wrong_row) != pytest.approx((expected_delta_col, expected_delta_row), abs=0.01)
+
+
 @pytest.mark.parametrize("rotation_deg", [0.0, 15.0, 90.0, -45.0, 180.0])
 def test_project_radec_to_pixel_matches_astropy_wcs_for_a_small_offset(rotation_deg):
     pixel_scale_arcsec = 1.72
