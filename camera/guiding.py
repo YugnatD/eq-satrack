@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from skimage.registration import phase_cross_correlation
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,57 @@ class GuidingCalibration:
         roughly perpendicular pixel directions (the expected case)."""
         det = self.px_per_ra_arcsec_x * self.px_per_dec_arcsec_y - self.px_per_dec_arcsec_x * self.px_per_ra_arcsec_y
         return 1.0 / max(abs(det), 1e-12) ** 0.5
+
+
+def measure_frame_shift(
+    reference_frame: np.ndarray, live_frame: np.ndarray, downsample: int = 4, max_error: float = 0.3,
+) -> tuple[float, float] | None:
+    """How far the star field in live_frame has apparently shifted since
+    reference_frame, via FFT phase correlation -- the cheap (sub-100ms),
+    no-plate-solve-needed measurement am5.polar_alignment's
+    axis_radec_from_frame_shift needs on every PAA live-estimate refresh
+    tick (am5/gui/panels.py's AlignmentPanel, 5Hz), instead of a real
+    multi-second astrometry.net solve.
+
+    Both frames are downsampled by integer-stride slicing first (same
+    technique and same rationale as camera/finder.py's
+    downsample_for_display -- skimage.transform.resize's interpolation
+    measurably freezes the Tk main thread at this project's real sensor
+    sizes and refresh rates; a plain stride is ~free and phase
+    correlation doesn't need the smoothing).
+
+    Returns (delta_col, delta_row) in FULL-RESOLUTION pixels, in this
+    project's own image convention (column increases right/east, row
+    increases down -- see project_radec_to_pixel's own docstring), ready
+    to hand directly to axis_radec_from_frame_shift. Returns None if
+    phase_cross_correlation's own normalized error exceeds max_error
+    (field out of frame, cloud, nothing left to correlate against) rather
+    than silently returning a meaningless number -- confirmed by manual
+    testing this session that normalization=None (the default
+    normalization='phase' gives an error metric close to 1.0 for BOTH a
+    clean match and pure noise in this project's installed scikit-image
+    0.25.2, useless as a confidence signal) discriminates clearly: ~1e-7
+    for a true match, several tenths to ~1.0 for an unrelated pair.
+
+    skimage.registration.phase_cross_correlation's own returned shift is
+    the NEGATIVE of the actual content displacement (verified by manual
+    script this session: phase_cross_correlation(reference, moving) where
+    moving = shift(reference, +delta) returns ~= -delta) and is in
+    (row, col) order (skimage's own array-axis convention, not this
+    project's [x, y] pixel convention) -- both corrected for here before
+    returning."""
+    ref = np.asarray(reference_frame)[::downsample, ::downsample].astype(np.float64)
+    live = np.asarray(live_frame)[::downsample, ::downsample].astype(np.float64)
+    min_h = min(ref.shape[0], live.shape[0])
+    min_w = min(ref.shape[1], live.shape[1])
+    ref, live = ref[:min_h, :min_w], live[:min_h, :min_w]
+
+    shift, error, _diffphase = phase_cross_correlation(ref, live, upsample_factor=10, normalization=None)
+    if error > max_error:
+        return None
+    delta_row_px = -shift[0] * downsample
+    delta_col_px = -shift[1] * downsample
+    return delta_col_px, delta_row_px
 
 
 def calibrate_from_nudges(

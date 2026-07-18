@@ -136,6 +136,27 @@ def test_currently_visible_satellites_sorted_by_altitude_descending(satellite):
     assert alts == sorted(alts, reverse=True)
 
 
+def test_currently_visible_satellites_skips_one_broken_entry_instead_of_aborting(satellite, capsys):
+    # Regression, found by code audit: a single satellite raising during
+    # altaz computation (e.g. a malformed/degenerate TLE, realistic in a
+    # ~150-250 entry real Celestrak group fetch) used to abort the WHOLE
+    # scan -- one bad entry should never take down the rest of the list.
+    class _BrokenSatellite:
+        name = "BROKEN (fixture)"
+
+        def __sub__(self, other):
+            raise RuntimeError("boom -- simulated degenerate TLE")
+
+    t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    window = find_next_pass(satellite, GENEVA, t0=t0, horizon_deg=10.0, lookahead_hours=48.0)
+    result = currently_visible_satellites(
+        [_BrokenSatellite(), satellite], GENEVA, horizon_deg=10.0, t0=window.t_culminate,
+    )
+    assert len(result) == 1
+    assert result[0][0] is satellite
+    assert "BROKEN (fixture)" in capsys.readouterr().err
+
+
 def test_current_pass_window_starts_now_and_finds_the_real_set_event(satellite):
     t0 = datetime(2024, 1, 1, tzinfo=timezone.utc)
     scheduled = find_next_pass(satellite, GENEVA, t0=t0, horizon_deg=10.0, lookahead_hours=48.0)

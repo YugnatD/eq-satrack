@@ -603,6 +603,135 @@ def test_disconnect_clears_a_pending_auto_goto_start(panel):
     assert panel._last_known_mount_radec is None
 
 
+def test_selecting_a_different_pass_mid_auto_goto_cancels_the_pending_start(panel):
+    # Regression, found by code audit: a pending auto-GOTO-before-start
+    # (see _on_start_click) used to survive a mid-slew pass switch --
+    # set_trajectory (called whenever a different pass/satellite is
+    # picked, including from the new "Live now" sub-tab) overwrote
+    # self._trajectory/self._window and cleared self._armed, but left
+    # self._start_pending_after_goto True. When the ORIGINAL GOTO (aimed
+    # at the first pass's position) later arrived, handle_mount_event
+    # resumed straight into _begin_tracking() on the NEW trajectory, with
+    # the mount only ever having been pointed at the old one.
+    panel._window = _window(datetime.now(timezone.utc), duration_s=300.0)
+    panel._trajectory = _trajectory_at(ra_deg=200.0, dec_deg=60.0)
+    panel._armed = True
+    panel._last_known_mount_radec = (0.0, 0.0)  # far from pass A's target -- triggers the auto-GOTO
+    panel._mount_worker.goto = lambda *a: None
+    start_calls = []
+    panel._mount_worker.start_tracking = lambda *a, **kw: start_calls.append(a)
+
+    panel._on_start_click()
+    assert panel._start_pending_after_goto is True
+
+    # Operator picks a different pass (B) while A's auto-GOTO is still
+    # converging -- e.g. a row click in PassesPanel, wired to this same
+    # set_trajectory call via App._on_pass_selected.
+    window_b = _window(datetime.now(timezone.utc), duration_s=300.0)
+    trajectory_b = _trajectory_at(ra_deg=10.0, dec_deg=-20.0)
+    panel.set_trajectory(trajectory_b, window_b, [], wgs84.latlon(46.18, 6.14), satellite_name="B")
+    assert panel._start_pending_after_goto is False
+    assert panel._armed is False
+
+    # The ORIGINAL goto (aimed at pass A) now arrives.
+    panel.handle_mount_event(WorkerEvent("goto_arrived", {}))
+
+    # Tracking must NOT have silently started on trajectory B using a
+    # mount position that was only ever GOTO'd toward A.
+    assert start_calls == []
+
+
+def test_goto_arrival_rechecks_pass_timing_before_starting(panel):
+    # Regression, found by code audit: the deferred auto-GOTO resume path
+    # used to call _begin_tracking() unconditionally on goto_arrived, with
+    # no re-check of _check_pass_timing() -- only the SYNCHRONOUS
+    # _on_start_click path re-verified the pass hadn't already ended. A
+    # slow auto-GOTO converging right as a short pass window closes could
+    # silently start a zero-duration tracking run with no error shown.
+    already_over = _window(datetime.now(timezone.utc) - timedelta(seconds=120), duration_s=60.0)
+    panel._window = already_over
+    panel._trajectory = _trajectory_at(ra_deg=200.0, dec_deg=60.0)
+    panel._armed = True
+    panel._mount_connected = True
+    start_calls = []
+    panel._mount_worker.start_tracking = lambda *a, **kw: start_calls.append(a)
+    panel._start_pending_after_goto = True
+
+    with patch("am5.gui.panels.messagebox.showerror") as showerror:
+        panel.handle_mount_event(WorkerEvent("goto_arrived", {}))
+        showerror.assert_called_once()
+
+    assert start_calls == []
+    assert panel._start_pending_after_goto is False
+    assert str(panel._start_button["state"]) == "normal"
+
+
+def test_on_simulate_click_auto_gotos_first_when_far_off_target(panel):
+    # Regression, found by code audit: _on_simulate_click had none of the
+    # auto-GOTO-before-start divergence check _on_start_click gained --
+    # Simulate calls start_tracking() too and is subject to the exact
+    # same runaway-divergence check, so it could reproduce the same
+    # "pointing error exceeds runaway limit" incident.
+    panel._window = _window(datetime.now(timezone.utc), duration_s=300.0)
+    panel._trajectory = _trajectory_at(ra_deg=200.0, dec_deg=60.0)
+    panel._last_known_mount_radec = (0.0, 0.0)  # far from RA=200deg/DEC=60
+
+    goto_calls = []
+    panel._mount_worker.goto = lambda ra_hours, dec_deg: goto_calls.append((ra_hours, dec_deg))
+    start_calls = []
+    panel._mount_worker.start_tracking = lambda *a, **kw: start_calls.append(a)
+
+    panel._on_simulate_click()
+
+    assert len(goto_calls) == 1
+    ra_hours, dec_deg = goto_calls[0]
+    assert ra_hours == pytest.approx(200.0 / 15.0, abs=0.01)
+    assert dec_deg == pytest.approx(60.0, abs=0.01)
+    assert start_calls == []  # simulate must NOT start yet -- waiting on goto_arrived
+    assert panel._simulate_pending_after_goto is True
+    assert str(panel._simulate_button["state"]) == "disabled"
+
+    panel.handle_mount_event(WorkerEvent("goto_arrived", {}))
+    assert len(start_calls) == 1
+    assert panel._simulate_pending_after_goto is False
+
+
+def test_on_simulate_click_skips_auto_goto_when_already_close(panel):
+    panel._window = _window(datetime.now(timezone.utc), duration_s=300.0)
+    panel._trajectory = _trajectory_at(ra_deg=200.0, dec_deg=60.0)
+    panel._last_known_mount_radec = (200.0 / 15.0, 60.0 + AUTO_GOTO_BEFORE_START_THRESHOLD_DEG / 2.0)
+
+    goto_calls = []
+    panel._mount_worker.goto = lambda *a: goto_calls.append(a)
+    start_calls = []
+    panel._mount_worker.start_tracking = lambda *a, **kw: start_calls.append(a)
+
+    panel._on_simulate_click()
+
+    assert goto_calls == []
+    assert len(start_calls) == 1
+
+
+def test_selecting_a_different_pass_mid_auto_goto_cancels_the_pending_simulate(panel):
+    panel._window = _window(datetime.now(timezone.utc), duration_s=300.0)
+    panel._trajectory = _trajectory_at(ra_deg=200.0, dec_deg=60.0)
+    panel._last_known_mount_radec = (0.0, 0.0)
+    panel._mount_worker.goto = lambda *a: None
+    start_calls = []
+    panel._mount_worker.start_tracking = lambda *a, **kw: start_calls.append(a)
+
+    panel._on_simulate_click()
+    assert panel._simulate_pending_after_goto is True
+
+    window_b = _window(datetime.now(timezone.utc), duration_s=300.0)
+    trajectory_b = _trajectory_at(ra_deg=10.0, dec_deg=-20.0)
+    panel.set_trajectory(trajectory_b, window_b, [], wgs84.latlon(46.18, 6.14), satellite_name="B")
+    assert panel._simulate_pending_after_goto is False
+
+    panel.handle_mount_event(WorkerEvent("goto_arrived", {}))
+    assert start_calls == []
+
+
 def test_build_tracking_config_falls_back_to_zero_lag_on_invalid_input(panel):
     panel._mount_lag_var = tk.StringVar(value="not-a-number")  # simulate a bad manual edit
     config = panel._build_tracking_config()
@@ -2004,6 +2133,134 @@ def test_polar_alignment_overlay_is_cleared_at_the_start_of_a_new_run(alignment_
     assert p._polar_overlay is None
 
 
+def test_polar_alignment_completing_3_points_auto_starts_the_live_estimate(alignment_panel, monkeypatch):
+    p = alignment_panel
+    p.set_connected(True)
+    frame = np.zeros((10, 10), dtype=np.uint8)
+    p._finder_state.last_frame = frame
+    p._finder_state.finder_plate_scale_arcsec = 5.0
+    monkeypatch.setattr(p, "after", lambda ms, cb: cb())
+    solved_points = iter([(0.0, 85.0), (120.0, 85.0), (240.0, 85.0)])
+    monkeypatch.setattr(
+        p._solvers[p._solver_engine_var.get()], "solve_async",
+        lambda frame, widget, on_done, **kw: on_done(_FakeSolveResult(*next(solved_points))),
+    )
+    monkeypatch.setattr(p._mount_worker, "jog_start", lambda *a, **kw: None)
+    monkeypatch.setattr(p._mount_worker, "jog_stop", lambda *a, **kw: None)
+
+    p._polar_rotation_deg_var.set("30")
+    p._polar_rate_var.set("150")
+    p._on_polar_start_click()
+
+    assert p._polar_live_estimate_active is True
+    assert p._polar_reference_frame is frame
+    assert p._polar_live_axis_ra_deg is not None and p._polar_live_axis_dec_deg is not None
+    assert str(p._polar_resolve_button["state"]) == "normal"
+
+
+def test_refresh_polar_preview_updates_the_live_estimate_from_a_measured_shift(alignment_panel, monkeypatch):
+    p = alignment_panel
+    p.set_connected(True)
+    reference_frame = np.zeros((10, 10), dtype=np.uint8)
+    live_frame = np.ones((10, 10), dtype=np.uint8)
+    p._finder_state.last_frame = live_frame
+    p._finder_state.finder_plate_scale_arcsec = 5.0
+    p._polar_last_solve_result = _FakeSolveResult(10.0, 88.0, pixel_scale_arcsec=1.72, field_rotation_deg=0.0, flip_parity=False)
+    p._polar_reference_frame = reference_frame
+    p._polar_live_axis_ra_deg, p._polar_live_axis_dec_deg = 10.0, 88.0
+    p._polar_live_estimate_active = True
+    # Cancel the real preview timer this fixture already scheduled at
+    # construction time, so the manual call below is the only tick.
+    if p._polar_preview_after_id is not None:
+        p.after_cancel(p._polar_preview_after_id)
+
+    monkeypatch.setattr("am5.gui.panels.measure_frame_shift", lambda ref, live, **kw: (3.0, -2.0))
+    monkeypatch.setattr(p, "after", lambda ms, cb: None)  # don't reschedule another real tick
+
+    p._refresh_polar_preview()
+
+    assert "live estimate" in p._polar_result_var.get()
+    assert p._polar_reference_frame is live_frame  # advanced to this tick's frame
+    assert (p._polar_live_axis_ra_deg, p._polar_live_axis_dec_deg) != (10.0, 88.0)
+
+
+def test_refresh_polar_preview_reports_when_the_live_estimate_loses_correlation(alignment_panel, monkeypatch):
+    p = alignment_panel
+    p.set_connected(True)
+    p._finder_state.last_frame = np.ones((10, 10), dtype=np.uint8)
+    p._finder_state.finder_plate_scale_arcsec = 5.0
+    p._polar_last_solve_result = _FakeSolveResult(10.0, 88.0)
+    p._polar_reference_frame = np.zeros((10, 10), dtype=np.uint8)
+    p._polar_live_axis_ra_deg, p._polar_live_axis_dec_deg = 10.0, 88.0
+    p._polar_live_estimate_active = True
+    if p._polar_preview_after_id is not None:
+        p.after_cancel(p._polar_preview_after_id)
+
+    monkeypatch.setattr("am5.gui.panels.measure_frame_shift", lambda ref, live, **kw: None)
+    monkeypatch.setattr(p, "after", lambda ms, cb: None)
+
+    p._refresh_polar_preview()
+
+    assert "Re-solve" in p._polar_status_var.get()
+    assert (p._polar_live_axis_ra_deg, p._polar_live_axis_dec_deg) == (10.0, 88.0)  # unchanged -- no shift applied
+
+
+def test_resolve_button_recalibrates_the_live_estimates_reference_frame(alignment_panel, monkeypatch):
+    p = alignment_panel
+    p.set_connected(True)
+    old_frame = np.zeros((10, 10), dtype=np.uint8)
+    new_frame = np.full((10, 10), 7, dtype=np.uint8)
+    p._finder_state.last_frame = new_frame
+    p._finder_state.finder_plate_scale_arcsec = 5.0
+    p._polar_reference_frame = old_frame
+    p._polar_live_axis_ra_deg, p._polar_live_axis_dec_deg = 10.0, 88.0
+    p._polar_live_estimate_active = True
+    p._polar_resolve_button.configure(state="normal")
+    monkeypatch.setattr(p, "after", lambda ms, cb: cb())
+    monkeypatch.setattr(
+        p._solvers[p._solver_engine_var.get()], "solve_async",
+        lambda frame, widget, on_done, **kw: on_done(_FakeSolveResult(11.0, 87.5)),
+    )
+
+    p._on_resolve_click()
+
+    assert p._polar_reference_frame is new_frame
+    assert p._polar_last_solve_result.ra_deg == 11.0
+    # The axis estimate itself is untouched by a Re-solve -- only the
+    # frame/WCS reference future ticks correlate against is refreshed.
+    assert (p._polar_live_axis_ra_deg, p._polar_live_axis_dec_deg) == (10.0, 88.0)
+    assert str(p._polar_resolve_button["state"]) == "normal"
+    assert "Re-solved" in p._polar_status_var.get()
+
+
+def test_resolve_button_disabled_until_a_reference_frame_exists(alignment_panel):
+    assert str(alignment_panel._polar_resolve_button["state"]) == "disabled"
+
+
+def test_starting_a_new_3_point_run_resets_the_live_estimate(alignment_panel, monkeypatch):
+    p = alignment_panel
+    p.set_connected(True)
+    p._finder_state.last_frame = np.zeros((10, 10), dtype=np.uint8)
+    p._finder_state.finder_plate_scale_arcsec = 5.0
+    p._polar_reference_frame = np.ones((10, 10), dtype=np.uint8)  # stale, from a previous run
+    p._polar_live_estimate_active = True
+    p._polar_live_axis_ra_deg, p._polar_live_axis_dec_deg = 10.0, 88.0
+    p._polar_resolve_button.configure(state="normal")
+    monkeypatch.setattr(
+        p._solvers[p._solver_engine_var.get()], "solve_async",
+        lambda frame, widget, on_done, **kw: on_done(_FakeSolveResult(0.0, 0.0, success=False, message="no stars")),
+    )
+    p._polar_rotation_deg_var.set("30")
+    p._polar_rate_var.set("150")
+
+    p._on_polar_start_click()
+
+    assert p._polar_live_estimate_active is False
+    assert p._polar_reference_frame is None
+    assert p._polar_live_axis_ra_deg is None and p._polar_live_axis_dec_deg is None
+    assert str(p._polar_resolve_button["state"]) == "disabled"
+
+
 def _pass_trajectory(n: int = 20) -> Trajectory:
     # A simple rise-to-set arc: azimuth sweeps 90->270 while altitude rises
     # then falls back to the horizon -- enough for set_pass_track to have
@@ -3244,6 +3501,38 @@ def test_passes_panel_fetch_and_find_passes_elevation_to_wgs84_latlon():
                 with patch("am5.gui.panels.find_passes", side_effect=Exception("stop before propagating")):
                     p._fetch_and_find(46.5, 7.0, 1800.0, 10.0, 48.0, 25544, -1.8)
         assert captured["kwargs"]["elevation_m"] == pytest.approx(1800.0)
+    finally:
+        root.destroy()
+
+
+def test_refresh_passes_always_forces_a_fresh_tle_fetch():
+    # "Refresh passes" is a deliberate manual action -- it should always
+    # try for a genuinely fresh TLE (the ISS does real station-keeping
+    # burns that can invalidate a several-hours-old one) instead of
+    # silently reusing whatever's cached as long as it's under the usual
+    # 24h staleness bar used elsewhere.
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        p = PassesPanel(root, lambda *a: None)
+        captured = {}
+        with patch("am5.gui.panels.load_satellite_tle", side_effect=lambda *a, **kw: captured.update(kwargs=kw) or object()):
+            with patch("am5.gui.panels.find_passes", side_effect=Exception("stop before propagating")):
+                p._fetch_and_find(46.18, 6.14, 0.0, 10.0, 48.0, 25544, -1.8)
+        assert captured["kwargs"]["max_age_hours"] == 0.0
+    finally:
+        root.destroy()
+
+
+def test_reload_live_catalog_always_forces_a_fresh_tle_fetch():
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        p = PassesPanel(root, lambda *a: None)
+        captured = {}
+        with patch("am5.gui.panels.load_satellite_group_tles", side_effect=lambda *a, **kw: captured.update(kwargs=kw) or []):
+            p._live_fetch_group_and_refresh()
+        assert captured["kwargs"]["max_age_hours"] == 0.0
     finally:
         root.destroy()
 

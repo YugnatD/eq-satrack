@@ -232,3 +232,34 @@ def test_solve_gives_up_after_all_retry_attempts_fail(window):
     assert window._solved_ra is None
     assert str(window._solve_status_var.get()).startswith("✗")
     assert str(window._sync_btn["state"]) == "disabled"
+
+
+def test_disconnect_mid_retry_does_not_crash_the_next_attempt(window):
+    # Regression, found by code audit: _attempt_solve had no None-check
+    # on self._latest_frame (unlike _on_solve's own initial guard) -- a
+    # camera disconnect between retry attempts sets self._latest_frame =
+    # None (handle_camera_event's "disconnected" branch), and since
+    # retries re-enter directly via _on_solve_attempt_done -> _attempt_
+    # solve (never back through _on_solve's guard), the next attempt used
+    # to crash with AttributeError: 'NoneType' object has no attribute
+    # 'copy'.
+    window._latest_frame = np.zeros((5, 5), dtype=np.uint8)
+
+    class _FailedResult:
+        success = False
+        message = "no match"
+
+    call_count = 0
+
+    def fake_solve_async(frame, tk_widget, on_done, **kw):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            window._latest_frame = None  # simulate a disconnect between attempts
+        on_done(_FailedResult())
+
+    window._solver.solve_async = fake_solve_async
+    window._on_solve()  # must not raise
+
+    assert call_count == 1  # aborted on the None frame instead of attempting a 2nd retry
+    assert "disconnected" in window._solve_status_var.get().lower()

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from camera.guiding import GuidingCalibration, calibrate_from_nudges, detect_brightest_blob
+from camera.guiding import GuidingCalibration, calibrate_from_nudges, detect_brightest_blob, measure_frame_shift
 
 
 def _synthetic_frame(cx: float, cy: float, width: int = 200, height: int = 150, peak: float = 200.0, sigma: float = 3.0) -> np.ndarray:
@@ -68,3 +68,64 @@ def test_pixel_to_sky_raises_on_degenerate_matrix():
     calib = GuidingCalibration(px_per_ra_arcsec_x=1.0, px_per_ra_arcsec_y=1.0, px_per_dec_arcsec_x=2.0, px_per_dec_arcsec_y=2.0)
     with pytest.raises(ValueError):
         calib.pixel_to_sky(5.0, 5.0)
+
+
+def _synthetic_star_field(width: int = 240, height: int = 200, seed: int = 3) -> np.ndarray:
+    # A handful of point sources (not just one blob) plus noise -- phase
+    # correlation needs real image texture to lock onto, unlike
+    # detect_brightest_blob's single-source case above.
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:height, 0:width]
+    field = rng.normal(20.0, 3.0, size=(height, width))
+    for cx, cy, peak in [(40, 30, 180.0), (150, 60, 220.0), (90, 140, 150.0), (200, 170, 190.0), (60, 100, 160.0)]:
+        field += peak * np.exp(-(((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * 2.5**2)))
+    return np.clip(field, 0, 255).astype(np.uint8)
+
+
+def test_measure_frame_shift_recovers_a_known_pixel_shift():
+    reference = _synthetic_star_field()
+    # np.roll shifts array CONTENT by (+3 rows, -5 cols) -- the star field
+    # itself moved that much, which is what measure_frame_shift's own
+    # (delta_col, delta_row) return should report (in this project's
+    # column=x/row=y convention, not skimage's row/col array order).
+    live = np.roll(reference, shift=(3, -5), axis=(0, 1))
+
+    delta_col, delta_row = measure_frame_shift(reference, live, downsample=1)
+
+    assert delta_col == pytest.approx(-5.0, abs=0.5)
+    assert delta_row == pytest.approx(3.0, abs=0.5)
+
+
+def test_measure_frame_shift_survives_downsampling():
+    reference = _synthetic_star_field()
+    live = np.roll(reference, shift=(-8, 12), axis=(0, 1))
+
+    result = measure_frame_shift(reference, live, downsample=4)
+
+    assert result is not None
+    delta_col, delta_row = result
+    assert delta_col == pytest.approx(12.0, abs=2.0)
+    assert delta_row == pytest.approx(-8.0, abs=2.0)
+
+
+def test_measure_frame_shift_returns_none_for_unrelated_frames():
+    # A frame with no star field in common at all -- e.g. the live view
+    # has drifted the star field out of frame, or a cloud rolled through
+    # -- must not silently report a meaningless shift.
+    reference = _synthetic_star_field(seed=3)
+    rng = np.random.default_rng(99)
+    unrelated = np.clip(rng.normal(20.0, 3.0, size=reference.shape), 0, 255).astype(np.uint8)
+
+    assert measure_frame_shift(reference, unrelated, downsample=1) is None
+
+
+def test_measure_frame_shift_handles_mismatched_frame_sizes():
+    reference = _synthetic_star_field(width=240, height=200)
+    live = np.roll(reference, shift=(2, -1), axis=(0, 1))[:180, :220]  # smaller live frame, as if the camera ROI changed
+
+    result = measure_frame_shift(reference, live, downsample=1)
+
+    assert result is not None
+    delta_col, delta_row = result
+    assert delta_col == pytest.approx(-1.0, abs=0.5)
+    assert delta_row == pytest.approx(2.0, abs=0.5)

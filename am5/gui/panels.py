@@ -49,6 +49,7 @@ from am5.ephemeris import (
 from am5.named_stars import NAMED_STARS, NamedStar
 from am5.polar_alignment import (
     PolarAlignmentResult,
+    axis_radec_from_frame_shift,
     fit_rotation_axis,
     polar_alignment_error,
     project_radec_to_pixel,
@@ -67,7 +68,7 @@ from am5.gui.worker import MountWorker, WorkerEvent
 from am5.tracker import AxisSigns, LiveOffsets, TrackingConfig, decompose_error
 from camera.finder import MAX_FINDER_EXPOSURE_US, FinderState, downsample_for_display
 from camera.fits_writer import write_fits
-from camera.guiding import BlobDetection, GuidingCalibration, calibrate_from_nudges, detect_brightest_blob
+from camera.guiding import BlobDetection, GuidingCalibration, calibrate_from_nudges, detect_brightest_blob, measure_frame_shift
 from camera.platesolve import AstrometryNetSolver, PlateSolver
 from camera.ser_reader import SerReader
 from camera.worker import CameraEvent, CameraWorker, frame_to_pgm, pgm_to_array
@@ -1355,7 +1356,15 @@ class PassesPanel(ttk.Frame):
     ) -> None:
         try:
             cache_path = TLE_CACHE_DIR / f"tle_{catnr}.tle"  # per-satellite -- see load_satellite_tle's docstring
-            satellite = load_satellite_tle(catnr, cache_path, max_age_hours=48.0)
+            # max_age_hours=0.0 -- "Refresh passes" is a deliberate manual
+            # action, so it should always try for a genuinely fresh TLE
+            # (the ISS does real station-keeping burns that can invalidate
+            # a several-hours-old TLE) rather than silently reusing
+            # whatever's cached as long as it's under the usual 24h
+            # staleness bar. Falls back to the existing cache (with a
+            # warning) if the network fetch itself fails -- see
+            # load_satellite_tle's own docstring.
+            satellite = load_satellite_tle(catnr, cache_path, max_age_hours=0.0)
             site = wgs84.latlon(lat, lon, elevation_m=elevation_m)
             passes = find_passes(satellite, site, horizon_deg=horizon, lookahead_hours=lookahead, magnitude_ref=magnitude_ref)
             self._results.put(("passes_ready", (satellite, site, passes)))
@@ -1569,7 +1578,11 @@ class PassesPanel(ttk.Frame):
     def _live_fetch_group_and_refresh(self) -> None:
         try:
             cache_path = TLE_CACHE_DIR / f"tle_group_{VISUAL_GROUP}.tle"
-            satellites = load_satellite_group_tles(VISUAL_GROUP, cache_path, max_age_hours=48.0)
+            # max_age_hours=0.0 -- "Reload catalog" is a deliberate manual
+            # action, same reasoning as PassesPanel._fetch_and_find's own
+            # comment: always try for a fresh fetch instead of silently
+            # reusing an up-to-24h-old cache.
+            satellites = load_satellite_group_tles(VISUAL_GROUP, cache_path, max_age_hours=0.0)
             site = self._current_live_site()
             if site is None:
                 self._results.put(("live_error", "Invalid site lat/lon/elevation"))
@@ -1752,6 +1765,11 @@ class TransitPanel(ttk.Frame):
         # _begin_tracking() once the slew finishes, instead of just
         # re-enabling the buttons the way a manual GOTO-button click does.
         self._start_pending_after_goto = False
+        # Same mechanism as _start_pending_after_goto, for _on_simulate_
+        # click -- see that method's own comment for the incident this
+        # fixes (Simulate is subject to the exact same runaway-divergence
+        # check as Start but never had the same auto-GOTO protection).
+        self._simulate_pending_after_goto = False
         self._mount_connected = False
         # Set from the "connected" WorkerEvent's own kind field (see
         # MountWorker._handle_connect), not the ConnectionPanel dropdown's
@@ -2010,6 +2028,7 @@ class TransitPanel(ttk.Frame):
             # fire _begin_tracking() off the NEXT unrelated GOTO's arrival
             # after reconnecting.
             self._start_pending_after_goto = False
+            self._simulate_pending_after_goto = False
             self._last_known_mount_radec = None  # stale after a disconnect -- don't compare against it once reconnected
         elif self._trajectory is not None:
             self._arm_button.configure(state="normal")
@@ -2044,6 +2063,20 @@ class TransitPanel(ttk.Frame):
         # delta_t/perp controls write to, so this clears it there too.
         self._offsets.reset()
         self._armed = False
+        # Regression fix: a pending auto-GOTO-before-start (see
+        # _on_start_click/AUTO_GOTO_BEFORE_START_THRESHOLD_DEG) used to
+        # survive a mid-slew pass switch -- the in-flight GOTO was aimed
+        # at the OLD trajectory's start position, but nothing cleared
+        # _start_pending_after_goto here, so when that GOTO's own
+        # goto_arrived later fired, handle_mount_event resumed straight
+        # into _begin_tracking() on THIS (new) trajectory, with the mount
+        # only ever having been pointed at the old one -- exactly the
+        # silent-divergence hazard the auto-GOTO feature exists to
+        # prevent. Clearing it here means that stale goto_arrived just
+        # falls through to the ordinary (non-resuming) button-re-enable
+        # branch instead.
+        self._start_pending_after_goto = False
+        self._simulate_pending_after_goto = False  # same reasoning -- see the comment above
         self._start_button.configure(state="disabled")
         if self._mount_connected:
             self._arm_button.configure(state="normal")
@@ -2229,6 +2262,36 @@ class TransitPanel(ttk.Frame):
         cause (tube/cable clearance) without waiting for the actual pass."""
         if self._trajectory is None or self._window is None:
             return
+        # Regression fix, found by code audit: _on_start_click gained an
+        # auto-GOTO-before-starting check (AUTO_GOTO_BEFORE_START_
+        # THRESHOLD_DEG's own comment) after a real "pointing error 79.8
+        # deg exceeds runaway limit" incident -- Simulate calls
+        # start_tracking() too and is subject to the exact same
+        # runaway_stop_deg check, but never had the same protection, so
+        # the same incident was fully reachable through this button
+        # instead (e.g. picking a far-off "Live now" satellite and
+        # clicking Simulate before ever doing a GOTO).
+        if self._last_known_mount_radec is not None:
+            target_ra_hours, target_dec_deg = self._goto_start_radec()
+            actual_ra_hours, actual_dec_deg = self._last_known_mount_radec
+            error_deg = angular_separation_deg(
+                actual_ra_hours * 15.0, actual_dec_deg, target_ra_hours * 15.0, target_dec_deg,
+            )
+            if error_deg > AUTO_GOTO_BEFORE_START_THRESHOLD_DEG:
+                self._tracking_status_var.set(
+                    f"{error_deg:.1f} deg off target -- slewing there before simulating..."
+                )
+                self._simulate_pending_after_goto = True
+                self._jog_goto_button.configure(state="disabled")
+                self._mount_goto_button.configure(state="disabled")
+                self._arm_button.configure(state="disabled")
+                self._start_button.configure(state="disabled")
+                self._simulate_button.configure(state="disabled")
+                self._mount_worker.goto(target_ra_hours, target_dec_deg)
+                return
+        self._begin_simulate()
+
+    def _begin_simulate(self) -> None:
         self._redraw_sky_map(rehearsal_now=datetime.now(timezone.utc))
         now = datetime.now(timezone.utc).timestamp()
         shift_s = now - float(self._trajectory.t_unix[0])
@@ -2249,6 +2312,7 @@ class TransitPanel(ttk.Frame):
         # outside its real active window. See _active_trajectory's own
         # comment for the full incident.
         self._set_active_trajectory(shifted)
+        self._tracking_status_var.set("Simulate started.")
         self._mount_worker.start_tracking(
             shifted, self._axis_signs, self._offsets, csv_path, duration_s, self._build_tracking_config(),
         )
@@ -2433,6 +2497,11 @@ class TransitPanel(ttk.Frame):
                     self._tracking_status_var.set(
                         f"GOTO rejected ({event.payload.get('code')}) -- tracking not started. Check the log."
                     )
+                if self._simulate_pending_after_goto:
+                    self._simulate_pending_after_goto = False
+                    self._tracking_status_var.set(
+                        f"GOTO rejected ({event.payload.get('code')}) -- simulate not started. Check the log."
+                    )
                 if self._mount_connected and self._trajectory is not None:
                     self._jog_goto_button.configure(state="normal")
                     self._mount_goto_button.configure(state="normal")
@@ -2445,10 +2514,42 @@ class TransitPanel(ttk.Frame):
             # own comment above for why that one isn't enough on its own.
             if self._start_pending_after_goto:
                 self._start_pending_after_goto = False
-                if event.kind == "goto_arrived":
+                # Regression fix: this used to call _begin_tracking()
+                # unconditionally on arrival, without re-running
+                # _check_pass_timing() (only _on_start_click's own
+                # SYNCHRONOUS path did that) -- a slow auto-GOTO
+                # converging right as a short "Live now" pass window
+                # closes could silently start a zero-duration tracking
+                # run with no error shown. Also re-check _armed as a
+                # defensive backstop (set_trajectory already clears this
+                # flag on a mid-slew pass switch, but re-checking here
+                # costs nothing and protects against any other path that
+                # might disarm without going through set_trajectory).
+                if event.kind == "goto_arrived" and self._armed and self._trajectory is not None and self._check_pass_timing():
                     self._begin_tracking()
                 else:
-                    self._tracking_status_var.set("GOTO did not arrive -- check the log, then try Start again.")
+                    if event.kind == "goto_timeout":
+                        self._tracking_status_var.set("GOTO did not arrive -- check the log, then try Start again.")
+                    elif not self._armed or self._trajectory is None:
+                        self._tracking_status_var.set("Selection changed while the GOTO was converging -- tracking not started.")
+                    # else: _check_pass_timing() already reported "Pass already over" itself.
+                    if self._mount_connected and self._trajectory is not None:
+                        self._jog_goto_button.configure(state="normal")
+                        self._mount_goto_button.configure(state="normal")
+                        self._arm_button.configure(state="normal")
+                        self._simulate_button.configure(state="normal")
+                        if self._armed:
+                            self._start_button.configure(state="normal")
+                return
+            if self._simulate_pending_after_goto:
+                self._simulate_pending_after_goto = False
+                if event.kind == "goto_arrived" and self._trajectory is not None:
+                    self._begin_simulate()
+                else:
+                    if event.kind == "goto_timeout":
+                        self._tracking_status_var.set("GOTO did not arrive -- check the log, then try Simulate again.")
+                    else:
+                        self._tracking_status_var.set("Selection changed while the GOTO was converging -- simulate not started.")
                     if self._mount_connected and self._trajectory is not None:
                         self._jog_goto_button.configure(state="normal")
                         self._mount_goto_button.configure(state="normal")
@@ -3504,6 +3605,21 @@ class AlignmentPanel(ttk.Frame):
         # _update_mount_position -- fed to the solver as a hint (see
         # _polar_capture_point). None until the first "position" event.
         self._last_mount_radec: tuple[float, float] | None = None
+        # Live FFT-correlation estimate (see _update_live_polar_estimate):
+        # the raw frame future ticks are correlated against, and the
+        # running best axis estimate that correlation updates -- both set
+        # from the point-3 solve (_finish_polar_alignment) or a manual
+        # Re-solve (_on_resolve_click), and advanced every tick rather
+        # than held fixed (see axis_radec_from_frame_shift's own
+        # docstring: incremental tick-to-tick accumulation against a
+        # steadily-advancing reference is the accurate regime for this
+        # flat local approximation -- a single large jump against a
+        # stale/distant reference is not, confirmed numerically this
+        # session).
+        self._polar_reference_frame: np.ndarray | None = None
+        self._polar_live_estimate_active = False
+        self._polar_live_axis_ra_deg: float | None = None
+        self._polar_live_axis_dec_deg: float | None = None
 
         sub_notebook = ttk.Notebook(self)
         sub_notebook.pack(fill="both", expand=True)
@@ -3661,11 +3777,21 @@ class AlignmentPanel(ttk.Frame):
         ).pack(anchor="w", pady=(0, 6))
         self._update_solver_warning()
 
+        start_row = ttk.Frame(left)
+        start_row.pack(anchor="w")
         self._polar_start_button = ttk.Button(
-            left, text="Run 3-point measurement", command=self._on_polar_start_click,
+            start_row, text="Run 3-point measurement", command=self._on_polar_start_click,
             state="normal" if self._current_solver().available else "disabled",
         )
-        self._polar_start_button.pack(anchor="w")
+        self._polar_start_button.pack(side="left")
+        # Recalibrates the live FFT estimate's reference frame against a
+        # real plate solve without redoing the full 3-rotation sequence --
+        # see _on_resolve_click. Disabled until there's a reference frame
+        # to recalibrate (i.e. before the first successful 3-point run).
+        self._polar_resolve_button = ttk.Button(
+            start_row, text="Re-solve", command=self._on_resolve_click, state="disabled",
+        )
+        self._polar_resolve_button.pack(side="left", padx=(6, 0))
         self._polar_status_var = tk.StringVar(value="Not run this session")
         ttk.Label(left, textvariable=self._polar_status_var, justify="left", wraplength=320).pack(anchor="w", pady=(6, 0))
         self._polar_result_var = tk.StringVar(value="")
@@ -3743,7 +3869,53 @@ class AlignmentPanel(ttk.Frame):
             if drawn is not None:
                 self._polar_preview_image = drawn.photo  # keep a reference -- Tk drops images with none
                 self._draw_polar_overlay(drawn, frame.shape[1], frame.shape[0])
+            if self._polar_live_estimate_active:
+                self._update_live_polar_estimate(frame)
         self._polar_preview_after_id = self.after(200, self._refresh_polar_preview)
+
+    def _update_live_polar_estimate(self, frame: np.ndarray) -> None:
+        """Cheap live update of the polar-alignment error estimate, run
+        every _refresh_polar_preview tick once a 3-point measurement (or a
+        Re-solve) has produced a reference frame -- see this class's own
+        _polar_reference_frame/_polar_live_estimate_active docstring and
+        camera.guiding.measure_frame_shift/
+        am5.polar_alignment.axis_radec_from_frame_shift for the actual
+        math. Advances self._polar_reference_frame to THIS tick's frame
+        on every successful correlation (not just at start) -- that
+        incremental accumulation, not a single comparison against the
+        original point-3 photo, is what keeps this accurate over an
+        extended fine-tuning session (see axis_radec_from_frame_shift's
+        docstring)."""
+        solve = self._polar_last_solve_result
+        if (
+            solve is None or solve.pixel_scale_arcsec <= 0 or self._polar_reference_frame is None
+            or self._polar_live_axis_ra_deg is None or self._polar_live_axis_dec_deg is None
+        ):
+            return
+        shift = measure_frame_shift(self._polar_reference_frame, frame)
+        if shift is None:
+            self._polar_status_var.set("Live estimate unavailable (star field out of frame?) -- click Re-solve")
+            return
+        delta_col, delta_row = shift
+        self._polar_live_axis_ra_deg, self._polar_live_axis_dec_deg = axis_radec_from_frame_shift(
+            self._polar_live_axis_ra_deg, self._polar_live_axis_dec_deg, delta_col, delta_row,
+            solve.pixel_scale_arcsec, solve.field_rotation_deg, solve.flip_parity,
+        )
+        self._polar_reference_frame = frame
+        lat, lon = self._current_site()
+        if lat is None or lon is None:
+            return
+        result = polar_alignment_error(self._polar_live_axis_ra_deg, self._polar_live_axis_dec_deg, lat, lon, datetime.now(timezone.utc))
+        self._polar_last_alignment_result = result
+        alt_direction = "lower" if result.error_alt_deg > 0 else "raise"
+        az_direction = "west" if result.error_az_deg > 0 else "east"
+        self._polar_status_var.set("Live estimate active -- turn the alt/az adjusters; click Re-solve to recalibrate on drift.")
+        self._polar_result_var.set(
+            f"~Total error: {result.error_deg * 60.0:.1f}' (live estimate)\n"
+            f"Altitude: {alt_direction} by {abs(result.error_alt_deg) * 60.0:.1f}'\n"
+            f"Azimuth: rotate the base {az_direction} by {abs(result.error_az_deg) * 60.0:.1f}'"
+        )
+        self._draw_polar_correction_arrows(result)
 
     def _draw_polar_overlay(self, drawn: CanvasFrame, frame_width: int, frame_height: int) -> None:
         """Marks the fitted axis position on the live preview -- just a
@@ -3861,6 +4033,11 @@ class AlignmentPanel(ttk.Frame):
         self._polar_last_solve_result = None
         self._polar_overlay = None  # stale overlay from a previous run must not linger during a new capture sequence
         self._polar_last_alignment_result = None
+        self._polar_live_estimate_active = False
+        self._polar_reference_frame = None
+        self._polar_live_axis_ra_deg = None
+        self._polar_live_axis_dec_deg = None
+        self._polar_resolve_button.configure(state="disabled")
         # One label per "Run 3-point measurement" click -- groups any
         # failed-solve frames saved during this run (see
         # _on_polar_solve_done) into their own directory instead of
@@ -3882,9 +4059,24 @@ class AlignmentPanel(ttk.Frame):
         self._polar_solve_attempts_left = POLAR_SOLVE_RETRY_ATTEMPTS
         self._attempt_polar_solve(point_index)
 
+    def _on_resolve_click(self) -> None:
+        """Recalibrates the live FFT estimate's reference frame against a
+        real plate solve, without redoing the full 3-rotation sequence --
+        for when the estimate has drifted too far to trust (e.g. the star
+        field has moved close to the edge of frame after a lot of
+        adjuster turning). See _attempt_polar_solve/_on_polar_solve_done's
+        own point_index == 0 handling."""
+        self._polar_resolve_button.configure(state="disabled")
+        self._polar_solve_attempts_left = POLAR_SOLVE_RETRY_ATTEMPTS
+        self._attempt_polar_solve(0)
+
     def _attempt_polar_solve(self, point_index: int) -> None:
         attempt = POLAR_SOLVE_RETRY_ATTEMPTS - self._polar_solve_attempts_left + 1
-        self._polar_status_var.set(f"Point {point_index}/3: solving (attempt {attempt}/{POLAR_SOLVE_RETRY_ATTEMPTS})...")
+        # point_index 0 is the special "Re-solve" case (_on_resolve_click)
+        # -- a single-point recalibration of the live estimate, not part
+        # of the 3-point sequence.
+        label = "Re-solve" if point_index == 0 else f"Point {point_index}/3"
+        self._polar_status_var.set(f"{label}: solving (attempt {attempt}/{POLAR_SOLVE_RETRY_ATTEMPTS})...")
         # Re-read the live frame fresh on EVERY attempt (not captured once
         # up front) -- see POLAR_SOLVE_RETRY_ATTEMPTS' own comment for why
         # this alone gives each retry a later, better-settled frame with
@@ -3954,17 +4146,29 @@ class AlignmentPanel(ttk.Frame):
                 return
             attempts_tried = POLAR_SOLVE_RETRY_ATTEMPTS
             saved_note = f" -- frames saved to {saved_path.parent}" if saved_path is not None else ""
+            if point_index == 0:
+                self._polar_status_var.set(f"Re-solve failed: {result.message} -- aborted after {attempts_tried} attempts{saved_note}")
+                self._polar_resolve_button.configure(state="normal")
+                return
             self._polar_status_var.set(
                 f"Point {point_index}/3 failed: {result.message} -- aborted after {attempts_tried} attempts{saved_note}"
             )
             self._polar_start_button.configure(state="normal")
             return
-        self._polar_points.append((result.ra_deg, result.dec_deg))
-        # Kept for the overlay: only the LAST (point 3) solve's WCS is
-        # relevant, since that's the frame still showing in the live view
-        # once the sequence finishes -- naturally ends up holding point
-        # 3's result by the time _finish_polar_alignment runs.
+        # Kept for the overlay: only the LAST successfully solved frame's
+        # WCS is relevant, since that's the frame still showing in the
+        # live view -- naturally ends up holding point 3's (or a later
+        # Re-solve's) result. Also the live-estimate's reference frame
+        # (see _update_live_polar_estimate) -- any successful solve, not
+        # just point 3, is a good fresh anchor to correlate future ticks
+        # against.
         self._polar_last_solve_result = result
+        self._polar_reference_frame = frame
+        if point_index == 0:
+            self._polar_status_var.set("Re-solved -- live estimate recalibrated.")
+            self._polar_resolve_button.configure(state="normal")
+            return
+        self._polar_points.append((result.ra_deg, result.dec_deg))
         if point_index >= 3:
             self._finish_polar_alignment()
             return
@@ -4007,6 +4211,12 @@ class AlignmentPanel(ttk.Frame):
         self._update_polar_overlay(axis_ra_deg, axis_dec_deg)
         self._draw_polar_correction_arrows(result)
         self._polar_start_button.configure(state="normal")
+        # Auto-start the live FFT-correlation estimate now that point 3's
+        # solve/frame are available as a reference -- see
+        # _update_live_polar_estimate.
+        self._polar_live_axis_ra_deg, self._polar_live_axis_dec_deg = axis_ra_deg, axis_dec_deg
+        self._polar_live_estimate_active = True
+        self._polar_resolve_button.configure(state="normal")
 
     def _update_polar_overlay(self, axis_ra_deg: float, axis_dec_deg: float) -> None:
         """Where the mount's fitted axis currently sits, projected into the

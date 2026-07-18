@@ -61,7 +61,7 @@ def main() -> None:
     parser.add_argument("--lookahead-hours", type=float, default=24.0, help="how far ahead to search for the next pass")
     parser.add_argument("--lead-s", type=float, default=10.0, help="start tracking this many seconds before AOS")
     parser.add_argument("--tle-cache", default="logs/iss.tle", help="local TLE cache path")
-    parser.add_argument("--tle-max-age-hours", type=float, default=48.0, help="refetch the TLE if the cache is older than this")
+    parser.add_argument("--tle-max-age-hours", type=float, default=24.0, help="refetch the TLE if the cache is older than this")
     parser.add_argument("--loop-hz", type=float, default=20.0, help="tracking loop rate")
     parser.add_argument("--watchdog-timeout", type=float, default=5.0, help="seconds of silence before auto :Q#")
     parser.add_argument("--out-dir", default="logs", help="directory for CSV telemetry")

@@ -271,3 +271,77 @@ def project_radec_to_pixel(
     delta_col = (east_arcsec * math.cos(rot) + north_arcsec * math.sin(rot)) / pixel_scale_arcsec
     delta_row = (east_arcsec * math.sin(rot) - north_arcsec * math.cos(rot)) / pixel_scale_arcsec
     return delta_col, delta_row
+
+
+def offset_radec_by_east_north(ra_deg: float, dec_deg: float, east_arcsec: float, north_arcsec: float) -> tuple[float, float]:
+    """(ra_deg, dec_deg) obtained by moving (ra_deg, dec_deg) by
+    (east_arcsec, north_arcsec) on the sky. The FLAT/small-angle inverse
+    of tangent_plane_offset_arcsec -- deliberately NOT the exact gnomonic
+    inverse that function's own docstring insists on for ITS use cases
+    (large separations near the pole, where the flat approximation
+    measurably distorts positions). Here the offsets are always small
+    (PAA's live correlation-based estimate, am5/gui/panels.py's
+    AlignmentPanel -- a fraction of a degree to at most a couple degrees
+    of alt/az adjustment), and a LOCAL linearization at (ra_deg, dec_deg)
+    is accurate to a small fraction of an arcsec at that scale regardless
+    of how close (ra_deg, dec_deg) itself is to the pole (the curvature
+    that matters for accuracy is over the SIZE of the offset being
+    applied, not the absolute declination) -- verified by round-tripping
+    through tangent_plane_offset_arcsec itself in
+    tests/test_polar_alignment.py, not against astropy.wcs (this is an
+    intentionally different, approximate contract from that function's
+    own exact one)."""
+    dec_rad = math.radians(dec_deg)
+    new_dec_deg = dec_deg + north_arcsec / 3600.0
+    new_ra_deg = ra_deg + (east_arcsec / 3600.0) / max(math.cos(dec_rad), 1e-6)
+    return new_ra_deg % 360.0, new_dec_deg
+
+
+def axis_radec_from_frame_shift(
+    prev_axis_ra_deg: float, prev_axis_dec_deg: float, delta_col: float, delta_row: float,
+    pixel_scale_arcsec: float, rotation_deg: float, flip_parity: bool = False,
+) -> tuple[float, float]:
+    """Updates a previously-fitted polar-alignment axis (prev_axis_ra_deg,
+    prev_axis_dec_deg -- am5.gui.panels.AlignmentPanel's own 3-point
+    fit_rotation_axis result) given how much the star field has visibly
+    shifted (delta_col, delta_row pixels, this project's own image
+    convention -- see project_radec_to_pixel's own docstring) between a
+    reference frame (the fit's own last solved frame) and a later live
+    frame, WITHOUT a fresh plate solve. Lets AlignmentPanel show a live-
+    updating alt/az correction estimate while the operator turns the
+    mount's altitude/azimuth adjusters, refreshed by cheap image
+    correlation (camera/guiding.py's measure_frame_shift) instead of a
+    real (multi-second) astrometry.net solve on every tick.
+
+    Physical reasoning (rigid body): turning the alt/az adjusters
+    physically rotates the WHOLE mount assembly -- RA axis, DEC axis,
+    OTA, and camera -- together, by some rotation R. Since the mechanical
+    axis is rigidly part of that same assembly, its own sky position
+    moves by exactly that same R. But because the CAMERA also rotates by
+    R, a star that hasn't actually moved appears, in the new frame, to
+    have shifted by -R relative to where it was in the old frame (turning
+    the camera towards a star makes it move toward frame centre, i.e. the
+    apparent shift is the negation of the camera's own real rotation). So
+    the axis's own new position is the OLD axis position rotated by the
+    NEGATION of the star field's own observed apparent shift, not by the
+    shift itself -- getting this sign backwards would show the operator
+    an estimate correcting exactly the wrong way, the same class of bug
+    already found and fixed once this session for the (unrelated)
+    correction-arrow overlay.
+
+    delta_col/delta_row -> (east_arcsec, north_arcsec) is the algebraic
+    inverse of project_radec_to_pixel's own (east_arcsec, north_arcsec)
+    -> (delta_col, delta_row) linear step (rotation-then-scale by a
+    matrix that is its own inverse up to the scale factor, since
+    [[cos,sin],[sin,-cos]] squares to the identity) -- so this reuses
+    that function's exact same trig, just solved for the other pair of
+    unknowns, rather than a separately-derived formula. flip_parity must
+    be undone in the same order project_radec_to_pixel applies it
+    (negate north AFTER recovering it from the linear inverse, mirroring
+    that function negating it BEFORE the same linear step)."""
+    rot = math.radians(rotation_deg)
+    east_arcsec = pixel_scale_arcsec * (delta_col * math.cos(rot) + delta_row * math.sin(rot))
+    north_arcsec = pixel_scale_arcsec * (delta_col * math.sin(rot) - delta_row * math.cos(rot))
+    if flip_parity:
+        north_arcsec = -north_arcsec
+    return offset_radec_by_east_north(prev_axis_ra_deg, prev_axis_dec_deg, -east_arcsec, -north_arcsec)

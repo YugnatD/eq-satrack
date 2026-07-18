@@ -91,8 +91,24 @@ def pgm_to_array(pgm: bytes) -> np.ndarray:
     """Inverse of frame_to_pgm -- decodes a binary PGM (P5) back into a 2D
     uint8 array, e.g. for camera/guiding.py's blob detection to run on a
     "preview_frame" event's payload without needing a second, un-throttled
-    frame path from the camera."""
-    header, _, body = pgm.partition(b"255\n")
+    frame path from the camera.
+
+    Regression fix, found by code audit: this used to split on the FIRST
+    occurrence of the maxval line's literal bytes (partition(b"255\\n")),
+    which can also occur INSIDE the dimensions line itself whenever the
+    frame's width or height is exactly 255 (e.g. "P5\\n640 255\\n255\\n" --
+    partition matches the height's own "255\\n" first), corrupting the
+    header/body split (header.split() then yields 2 tokens instead of 3,
+    raising ValueError, or worse silently misparsing for other digit
+    sequences ending in "255"). frame_to_pgm's header format is fixed at
+    exactly 3 newline-terminated lines (magic, dimensions, maxval) before
+    the raw pixel body -- find the newline that ends the THIRD line
+    directly instead of searching for the maxval value's own bytes, so
+    this works for any width/height."""
+    first_nl = pgm.index(b"\n")
+    second_nl = pgm.index(b"\n", first_nl + 1)
+    third_nl = pgm.index(b"\n", second_nl + 1)
+    header, body = pgm[:second_nl], pgm[third_nl + 1:]  # header = magic + dimensions lines only; maxval line is skipped (fixed at 255, never parsed)
     _, width_s, height_s = header.split()
     width, height = int(width_s), int(height_s)
     return np.frombuffer(body, dtype=np.uint8).reshape(height, width)
@@ -253,14 +269,32 @@ class CameraWorker:
             # a real correctness bug) -- just drop a coalescable command
             # if a newer one of the same name is still coming later in
             # this same batch.
+            #
+            # Regression fix: dropping was previously keyed only on "is a
+            # newer same-name command anywhere later in this batch",
+            # ignoring what's BETWEEN the two -- a one-shot command (e.g.
+            # start_recording) landing between two set_roi calls changes
+            # guard state (_handle_set_roi refuses while recording is
+            # active), so silently dropping the EARLIER set_roi lost a
+            # real operator action, and the later one then got refused
+            # too (both changes gone), contradicting this loop's own
+            # promise that one-shot commands are never reordered/dropped
+            # relative to coalesced ones. Fix: a one-shot command LOCKS IN
+            # every coalescible command seen so far in this batch -- none
+            # of them may be dropped once a one-shot command has been
+            # seen after them, only a later occurrence of the SAME name
+            # with no one-shot command in between may still coalesce it
+            # away.
+            keep = [True] * len(pending)
             last_index_by_name: dict[str, int] = {}
             for i, (name, _payload) in enumerate(pending):
                 if name in _COALESCE_LATEST_ONLY:
+                    if name in last_index_by_name:
+                        keep[last_index_by_name[name]] = False
                     last_index_by_name[name] = i
-            to_run = [
-                (name, payload) for i, (name, payload) in enumerate(pending)
-                if name not in _COALESCE_LATEST_ONLY or last_index_by_name[name] == i
-            ]
+                else:
+                    last_index_by_name.clear()
+            to_run = [(name, payload) for i, (name, payload) in enumerate(pending) if keep[i]]
             for name, payload in to_run:
                 handler = handlers.get(name)
                 if handler is not None:

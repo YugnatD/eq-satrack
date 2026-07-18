@@ -317,6 +317,17 @@ class FinderWindow(tk.Toplevel):
         self._attempt_solve()
 
     def _attempt_solve(self) -> None:
+        # Regression fix, found by code audit: unlike _on_solve's own
+        # initial None-check, this had none of its own -- a camera
+        # disconnect BETWEEN retry attempts (handle_camera_event's
+        # "disconnected" branch sets self._latest_frame = None) crashed
+        # the next _attempt_solve() call with an AttributeError, since
+        # retries re-enter here directly (via _on_solve_attempt_done),
+        # never back through _on_solve's guard.
+        if self._latest_frame is None:
+            self._solve_status_var.set("Camera disconnected mid-solve -- aborted")
+            self._solve_btn.configure(state="normal" if self._solver.available else "disabled")
+            return
         attempt = SOLVE_RETRY_ATTEMPTS - self._solve_attempts_left + 1
         self._solve_status_var.set(f"Solving (attempt {attempt}/{SOLVE_RETRY_ATTEMPTS})…")
         # Re-read self._latest_frame fresh on EVERY attempt (not captured

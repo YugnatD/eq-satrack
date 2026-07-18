@@ -7,10 +7,13 @@ from astropy.wcs import WCS
 
 from am5.angles import angular_separation_deg, equatorial_to_altaz
 from am5.polar_alignment import (
+    axis_radec_from_frame_shift,
     correction_triangle_radec,
     fit_rotation_axis,
+    offset_radec_by_east_north,
     polar_alignment_error,
     project_radec_to_pixel,
+    tangent_plane_offset_arcsec,
     true_pole_radec,
 )
 
@@ -296,3 +299,75 @@ def test_correction_triangle_is_idempotent_once_azimuth_is_already_corrected():
     (az_ra2, az_dec2), _pole2 = correction_triangle_radec(az_ra, az_dec, lat_deg, lon_deg, when)
     assert az_ra2 == pytest.approx(az_ra, abs=1e-4)
     assert az_dec2 == pytest.approx(az_dec, abs=1e-4)
+
+
+@pytest.mark.parametrize("east_arcsec,north_arcsec", [(0.0, 0.0), (3.0, -2.0), (30.0, -20.0), (60.0, 45.0)])
+def test_offset_radec_by_east_north_round_trips_through_tangent_plane_offset(east_arcsec, north_arcsec):
+    # offset_radec_by_east_north is the flat/small-angle inverse of
+    # tangent_plane_offset_arcsec -- applying an (east, north) offset and
+    # then measuring it back with the (exact) forward function should
+    # recover the same (east, north) to a tight tolerance at the offset
+    # sizes this is actually used for: a single live-estimate refresh
+    # tick's own star-field shift (a fraction of an arcmin at 5Hz, not a
+    # whole re-solve-sized jump -- see axis_radec_from_frame_shift's own
+    # docstring for why large single-shot offsets near the pole are a
+    # fundamentally different, much less accurate, regime for this flat
+    # approximation).
+    center_ra_deg, center_dec_deg = 47.0, 88.0
+    new_ra_deg, new_dec_deg = offset_radec_by_east_north(center_ra_deg, center_dec_deg, east_arcsec, north_arcsec)
+    measured_east, measured_north = tangent_plane_offset_arcsec(new_ra_deg, new_dec_deg, center_ra_deg, center_dec_deg)
+    assert measured_east == pytest.approx(east_arcsec, abs=0.4)
+    assert measured_north == pytest.approx(north_arcsec, abs=0.4)
+
+
+@pytest.mark.parametrize("flip_parity", [False, True])
+def test_axis_radec_from_frame_shift_tracks_axis_through_many_small_incremental_ticks(flip_parity):
+    # axis_radec_from_frame_shift is meant to be called every ~200ms
+    # (AlignmentPanel's own preview-refresh cadence) against the
+    # IMMEDIATELY PREVIOUS live frame, accumulating many small updates
+    # while the operator slowly turns the alt/az adjusters -- not fed one
+    # big single-shot rotation. This mirrors that real usage: apply a
+    # realistic *total* rotation (comparable to an actual PAA fine-tuning
+    # adjustment) split over many small ticks, re-deriving each tick's
+    # pixel shift from the true simulated rotation and feeding it through
+    # axis_radec_from_frame_shift exactly as AlignmentPanel would, then
+    # checking the accumulated estimate still tracks the true axis
+    # closely. (A single large one-shot call, by contrast, is a
+    # fundamentally less accurate regime for this flat local
+    # approximation -- see the module's own docstring -- which is why
+    # the plan pairs this with a manual "Re-solve" against a real plate
+    # solve rather than trusting the live estimate indefinitely.)
+    pixel_scale_arcsec = 1.68
+    rotation_deg = -12.3
+    axis_ra0, axis_dec0 = 47.0, 88.0
+    center_ra0, center_dec0 = 47.3, 87.85  # a nearby but distinct reference-frame centre, as in a real PAA session
+
+    rot_axis = np.array([0.4, -0.5, 0.3])
+    total_angle_deg = 0.25  # 15', a realistic PAA fine-tuning adjustment
+    n_ticks = 60
+
+    true_axis_ra, true_axis_dec = axis_ra0, axis_dec0
+    true_center_ra, true_center_dec = center_ra0, center_dec0
+    est_axis_ra, est_axis_dec = axis_ra0, axis_dec0
+    prev_center_ra, prev_center_dec = center_ra0, center_dec0
+
+    for _ in range(n_ticks):
+        R = _rotation_matrix(rot_axis, total_angle_deg / n_ticks)
+        true_axis_ra, true_axis_dec = _to_radec(R @ _unit_vector(true_axis_ra, true_axis_dec))
+        true_center_ra, true_center_dec = _to_radec(R @ _unit_vector(true_center_ra, true_center_dec))
+
+        delta_col, delta_row = project_radec_to_pixel(
+            prev_center_ra, prev_center_dec, true_center_ra, true_center_dec, pixel_scale_arcsec, rotation_deg, flip_parity,
+        )
+        est_axis_ra, est_axis_dec = axis_radec_from_frame_shift(
+            est_axis_ra, est_axis_dec, delta_col, delta_row, pixel_scale_arcsec, rotation_deg, flip_parity,
+        )
+        prev_center_ra, prev_center_dec = true_center_ra, true_center_dec
+
+    assert angular_separation_deg(est_axis_ra, est_axis_dec, true_axis_ra, true_axis_dec) * 3600.0 < 5.0
+
+
+def test_axis_radec_from_frame_shift_is_a_no_op_for_zero_shift():
+    axis_ra, axis_dec = axis_radec_from_frame_shift(47.0, 88.0, 0.0, 0.0, 1.68, -12.3, flip_parity=True)
+    assert axis_ra == pytest.approx(47.0, abs=1e-9)
+    assert axis_dec == pytest.approx(88.0, abs=1e-9)

@@ -42,6 +42,21 @@ def test_frame_to_pgm_scales_a_16bit_frame_by_the_fixed_adc_range_not_corrupt_it
     np.testing.assert_array_equal(decoded, np.array([[0, 255]], dtype=np.uint8))
 
 
+@pytest.mark.parametrize("height,width", [(255, 640), (640, 255), (1255, 10), (10, 1255), (255, 255)])
+def test_pgm_round_trip_survives_a_255_frame_dimension(height, width):
+    # Regression, found by code audit: pgm_to_array used to split the PGM
+    # header with partition(b"255\n"), matching the FIRST occurrence of
+    # those bytes -- for a frame whose height (or width) is exactly 255
+    # (or otherwise makes "255\n" appear inside the dimensions line, e.g.
+    # 1255), the header's own dimensions line was matched instead of the
+    # real maxval line, splitting the header/body in the wrong place and
+    # raising ValueError (or worse, silently corrupting the body).
+    frame = (np.arange(height * width) % 256).astype(np.uint8).reshape(height, width)
+    decoded = pgm_to_array(frame_to_pgm(frame))
+    assert decoded.shape == (height, width)
+    np.testing.assert_array_equal(decoded, frame)
+
+
 def _wait_for(worker: CameraWorker, kind: str, timeout: float = 5.0) -> CameraEvent:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -107,13 +122,52 @@ def test_a_burst_of_exposure_changes_settles_on_the_latest_value_quickly(worker)
     deadline = time.monotonic() + 8.0
     frame_times = []
     while time.monotonic() < deadline and len(frame_times) < 4:
-        event = _wait_for(worker, "preview_frame", timeout=8.0)
+        _wait_for(worker, "preview_frame", timeout=8.0)
         frame_times.append(time.monotonic())
     assert len(frame_times) >= 4
     # The last few intervals must be fast (matching the final 50ms
     # exposure), not still working through multi-second stale values.
     late_intervals = [b - a for a, b in zip(frame_times[-3:], frame_times[-2:])]
     assert all(interval < 1.0 for interval in late_intervals)
+
+
+def test_a_one_shot_command_locks_in_an_earlier_coalesced_command_instead_of_dropping_it(worker, tmp_path):
+    # Regression, found by code audit: coalescing used to drop a
+    # coalescible command (e.g. set_roi) as soon as ANY newer same-name
+    # command was anywhere later in the same drained batch, regardless of
+    # what came between them. A one-shot command with real side effects
+    # (start_recording) landing between two set_roi calls changed guard
+    # state (_handle_set_roi refuses once recording is active) -- so the
+    # EARLIER set_roi got silently dropped (never applied at all, not
+    # even before recording started), and the LATER one then got refused
+    # too, losing both ROI changes and contradicting this loop's own
+    # comment that one-shot commands are never reordered/dropped relative
+    # to coalesced ones. Now a one-shot command "locks in" every
+    # coalescible command queued before it in the same batch.
+    worker.connect("mock", mock_seed=1)
+    _wait_for(worker, "connected")
+    worker.set_exposure_us(5_000_000)
+    _wait_for(worker, "preview_frame", timeout=6.0)  # worker now blocked in a long read_frame()
+
+    # These three land in the same drained batch (queued while the
+    # worker is blocked in the 5s read above).
+    worker.set_roi(0, 0, 64, 32)
+    path = tmp_path / "test.ser"
+    worker.start_recording(path)
+    worker.set_roi(0, 0, 128, 64)
+
+    _wait_for(worker, "recording_started", timeout=10.0)
+    log_event = _wait_for(worker, "log", timeout=10.0)
+    assert "ROI change refused while recording is active" in log_event.payload["message"]
+
+    # The FIRST set_roi (before start_recording) must have actually been
+    # applied -- confirmed via the next preview_frame's own dimensions,
+    # not the mock's untouched 640x480 default.
+    frame_event = _wait_for(worker, "preview_frame", timeout=10.0)
+    assert (frame_event.payload["width"], frame_event.payload["height"]) == (64, 32)
+
+    worker.stop_recording()
+    _wait_for(worker, "recording_stopped", timeout=10.0)
 
 
 def test_stats_report_positive_fps(worker):

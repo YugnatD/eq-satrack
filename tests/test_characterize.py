@@ -1,6 +1,5 @@
 import csv
 import io
-import time
 
 from am5.mock_mount import MockConfig, MockMount
 from am5.mount import Mount

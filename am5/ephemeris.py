@@ -36,7 +36,7 @@ def _age_hours(path: Path) -> float:
     return (datetime.now(timezone.utc).timestamp() - path.stat().st_mtime) / 3600.0
 
 
-def load_satellite_tle(catnr: int, cache_path: Path, max_age_hours: float = 48.0) -> EarthSatellite:
+def load_satellite_tle(catnr: int, cache_path: Path, max_age_hours: float = 24.0) -> EarthSatellite:
     """Load a satellite's TLE (by NORAD catalog number) from `cache_path`,
     refetching from Celestrak if the cache is missing or older than
     `max_age_hours`. Falls back to a stale cache (with a warning) if the
@@ -63,12 +63,12 @@ def load_satellite_tle(catnr: int, cache_path: Path, max_age_hours: float = 48.0
     return satellites[0]
 
 
-def load_iss_tle(cache_path: Path, max_age_hours: float = 48.0) -> EarthSatellite:
+def load_iss_tle(cache_path: Path, max_age_hours: float = 24.0) -> EarthSatellite:
     """ISS-specific convenience wrapper over load_satellite_tle."""
     return load_satellite_tle(ISS_CATNR, cache_path, max_age_hours)
 
 
-def load_satellite_group_tles(group: str, cache_path: Path, max_age_hours: float = 48.0) -> list[EarthSatellite]:
+def load_satellite_group_tles(group: str, cache_path: Path, max_age_hours: float = 24.0) -> list[EarthSatellite]:
     """Same cache-first/fetch-fallback logic as load_satellite_tle, but for
     a whole named Celestrak GROUP (e.g. VISUAL_GROUP) instead of one
     CATNR -- returns every satellite in the group instead of just the
@@ -113,7 +113,20 @@ def currently_visible_satellites(
     t = ts.from_datetime(t0)
     visible = []
     for sat in satellites:
-        alt, az, _ = (sat - site).at(t).altaz()
+        # Regression fix, found by code audit: this used to have no
+        # per-satellite fault isolation -- a real Celestrak "visual" group
+        # fetch (~150-250 entries) can include a malformed/degenerate TLE,
+        # and any exception here used to abort the WHOLE scan, which
+        # propagates up through PassesPanel's "Live now" refresh handlers
+        # as a generic "live_error", leaving the entire list empty/erroring
+        # on every subsequent auto-refresh tick until a manual catalog
+        # reload happens to no longer include the offending entry. One bad
+        # satellite should never take down the whole live view.
+        try:
+            alt, az, _ = (sat - site).at(t).altaz()
+        except Exception as exc:  # noqa: BLE001 - isolate one bad satellite, don't abort the whole scan
+            print(f"[warn] skipping {sat.name!r} in currently_visible_satellites: {exc}", file=sys.stderr)
+            continue
         if alt.degrees > horizon_deg:
             visible.append((sat, float(alt.degrees), float(az.degrees)))
     visible.sort(key=lambda entry: entry[1], reverse=True)
